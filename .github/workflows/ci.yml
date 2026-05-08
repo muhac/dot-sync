@@ -1,8 +1,7 @@
-name: Test dot-sync
+name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -23,15 +22,26 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
-      - name: Check dot-sync
-        run: cargo check
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
 
-      - name: Test dot-sync
-        run: cargo test
+      - name: Format
+        run: cargo fmt --check
 
-      - name: Run dot-sync help
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Smoke test dot-sync
         run: cargo run --quiet --bin dot-sync -- --help
 
-      - name: Run ds help
+      - name: Smoke test ds
         run: cargo run --quiet --bin ds -- --help

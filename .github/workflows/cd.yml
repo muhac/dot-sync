@@ -1,0 +1,156 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Package binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="nightly"
+          fi
+
+          archive="dot-sync-${version}-${TARGET}.${ARCHIVE_EXT}"
+          mkdir -p dist package
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            cp "target/${TARGET}/release/dot-sync.exe" package/
+            cp "target/${TARGET}/release/ds.exe" package/
+          else
+            cp "target/${TARGET}/release/dot-sync" package/
+            cp "target/${TARGET}/release/ds" package/
+          fi
+
+          if [[ "${ARCHIVE_EXT}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path package/* -DestinationPath dist/${archive}"
+          else
+            tar -C package -czf "dist/${archive}" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dot-sync-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum dot-sync-* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            release_title="${GITHUB_REF_NAME}"
+            release_notes="Release ${GITHUB_REF_NAME}"
+            if gh release view "${release_tag}" >/dev/null 2>&1; then
+              gh release upload "${release_tag}" dist/* --clobber
+            else
+              gh release create "${release_tag}" dist/* \
+                --title "${release_title}" \
+                --notes "${release_notes}"
+            fi
+            exit 0
+          fi
+
+          release_tag="nightly"
+          release_title="nightly"
+          release_notes="Nightly build from main at ${GITHUB_SHA}."
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${release_tag}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${release_tag}" --force
+
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            while IFS= read -r asset; do
+              [[ -z "${asset}" ]] && continue
+              gh release delete-asset "${release_tag}" "${asset}" --yes
+            done < <(gh release view "${release_tag}" --json assets --jq '.assets[].name')
+            gh release edit "${release_tag}" \
+              --title "${release_title}" \
+              --notes "${release_notes}" \
+              --prerelease
+          else
+            gh release create "${release_tag}" \
+              --title "${release_title}" \
+              --notes "${release_notes}" \
+              --prerelease
+          fi
+
+          gh release upload "${release_tag}" dist/*

@@ -1,0 +1,7 @@
+targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - project_doc_max_bytes
