@@ -5,6 +5,61 @@ use assert_cmd::Command;
 use assert_fs::TempDir;
 use predicates::prelude::*;
 
+struct Fixture {
+    dir: TempDir,
+}
+
+impl Fixture {
+    fn load(format: &str, case: &str) -> Self {
+        let dir = TempDir::new().unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(format)
+            .join(case);
+        copy_fixture_dir(&root, dir.path());
+        Self { dir }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn read(&self, path: &str) -> String {
+        read_file(&self.path().join(path))
+    }
+
+    fn command(&self) -> Command {
+        dot_sync_in(self.path())
+    }
+
+    fn command_in(&self, relative_cwd: &str) -> Command {
+        dot_sync_in(self.path().join(relative_cwd))
+    }
+
+    fn assert_file_eq(&self, actual: &str, expected: &str) {
+        assert_eq!(
+            normalize_newlines(&self.read(actual)),
+            normalize_newlines(&self.read(expected)),
+            "{actual} did not match {expected}",
+        );
+    }
+}
+
+fn copy_fixture_dir(source: &Path, destination: &Path) {
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            fs::create_dir_all(&destination_path).unwrap();
+            copy_fixture_dir(&source_path, &destination_path);
+        } else {
+            write_file(&destination_path, &read_file(&source_path));
+        }
+    }
+}
+
 fn write_file(path: &Path, content: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -20,27 +75,6 @@ fn normalize_newlines(content: &str) -> String {
     content.replace("\r\n", "\n")
 }
 
-fn write_config(dir: &TempDir, sync_paths: &[&str]) {
-    let sync = sync_paths
-        .iter()
-        .map(|path| format!("      - {path}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    write_file(
-        &dir.path().join(".sync.yaml"),
-        &format!(
-            r#"targets:
-  codex:
-    format: toml
-    source: source.toml
-    target: target.toml
-    sync:
-{sync}
-"#
-        ),
-    );
-}
-
 fn dot_sync_in(cwd: impl Into<PathBuf>) -> Command {
     let mut command = Command::cargo_bin("dot-sync").unwrap();
     command.current_dir(cwd.into());
@@ -49,43 +83,29 @@ fn dot_sync_in(cwd: impl Into<PathBuf>) -> Command {
 
 #[test]
 fn sync_discovers_config_in_current_directory() {
-    let dir = TempDir::new().unwrap();
-    write_file(
-        &dir.path().join(".sync.yaml"),
-        include_str!("fixtures/codex_basic/.sync.yaml"),
-    );
-    write_file(
-        &dir.path().join("source.toml"),
-        include_str!("fixtures/codex_basic/source.toml"),
-    );
+    let fixture = Fixture::load("toml", "codex_basic_sync");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["sync", "codex"])
         .assert()
         .success()
         .stdout(predicate::str::contains("codex Sync apply"))
+        .stdout(predicate::str::contains("Update target: tui.theme"))
         .stdout(predicate::str::contains(
             "Update target: project_doc_max_bytes",
         ));
 
-    assert_eq!(
-        read_file(&dir.path().join("target.toml")),
-        normalize_newlines(include_str!("fixtures/codex_basic/target.expected.toml"))
-    );
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn sync_discovers_config_from_parent_directory() {
-    let dir = TempDir::new().unwrap();
-    let nested = dir.path().join("nested/worktree");
-    fs::create_dir_all(&nested).unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
+    let fixture = Fixture::load("toml", "parent_discovery");
+    fs::create_dir_all(fixture.path().join("nested/worktree")).unwrap();
 
-    dot_sync_in(nested)
+    fixture
+        .command_in("nested/worktree")
         .args(["sync", "codex"])
         .assert()
         .success()
@@ -93,159 +113,132 @@ fn sync_discovers_config_from_parent_directory() {
             "Update target: project_doc_max_bytes",
         ));
 
-    assert_eq!(
-        read_file(&dir.path().join("target.toml")),
-        "project_doc_max_bytes = 65536\n"
-    );
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn push_preserves_unmanaged_target_fields() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
-    write_file(
-        &dir.path().join("target.toml"),
-        r#"[projects."/secret"]
-trust_level = "trusted"
-"#,
-    );
+    let fixture = Fixture::load("toml", "preserve_unmanaged_target");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "codex"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
             "Update target: project_doc_max_bytes",
-        ));
+        ))
+        .stdout(predicate::str::contains("Update target: tui.theme"));
 
-    let target = read_file(&dir.path().join("target.toml"));
-    assert!(target.contains("project_doc_max_bytes = 65536"));
-    assert!(target.contains(r#"[projects."/secret"]"#));
-    assert!(target.contains(r#"trust_level = "trusted""#));
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn pull_rewrites_source_in_sync_order() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["tui.theme", "notice.hide_rate_limit_model_nudge"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        r#"[notice]
-hide_rate_limit_model_nudge = true
+    let fixture = Fixture::load("toml", "pull_canonical_order");
 
-[tui]
-theme = "old"
-"#,
-    );
-    write_file(
-        &dir.path().join("target.toml"),
-        r#"[notice]
-hide_rate_limit_model_nudge = true
-
-[tui]
-theme = "monokai"
-"#,
-    );
-
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["pull", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Update source: tui.theme"));
+        .stdout(predicate::str::contains("Update source: tui.theme"))
+        .stdout(predicate::str::contains(
+            "Update source: project_doc_max_bytes",
+        ));
 
-    let source = read_file(&dir.path().join("source.toml"));
-    let tui_index = source.find("[tui]").unwrap();
-    let notice_index = source.find("[notice]").unwrap();
-    assert!(tui_index < notice_index);
-    assert!(source.contains(r#"theme = "monokai""#));
+    fixture.assert_file_eq("source.toml", "source.expected.toml");
+}
+
+#[test]
+fn pull_reports_removed_source_fields_missing_from_target() {
+    let fixture = Fixture::load("toml", "pull_removes_missing_target_field");
+
+    fixture
+        .command()
+        .args(["pull", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Remove source: project_doc_fallback_filenames",
+        ));
+
+    fixture.assert_file_eq("source.toml", "source.expected.toml");
+}
+
+#[test]
+fn sync_uses_target_values_and_fills_missing_target_fields() {
+    let fixture = Fixture::load("toml", "sync_target_wins_and_fills");
+
+    fixture
+        .command()
+        .args(["sync", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Update source: tui.theme"))
+        .stdout(predicate::str::contains(
+            "Update target: project_doc_fallback_filenames",
+        ));
+
+    fixture.assert_file_eq("source.toml", "source.expected.toml");
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn sync_bootstraps_missing_target_file() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
+    let fixture = Fixture::load("toml", "missing_target_bootstrap");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["sync", "codex"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
             "Update target: project_doc_max_bytes",
+        ))
+        .stdout(predicate::str::contains(
+            "Update target: project_doc_fallback_filenames",
         ));
 
-    assert_eq!(
-        read_file(&dir.path().join("target.toml")),
-        "project_doc_max_bytes = 65536\n"
-    );
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn push_preserves_inline_table_fields() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["settings.theme"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        r#"[settings]
-theme = "new"
-"#,
-    );
-    write_file(
-        &dir.path().join("target.toml"),
-        r#"settings = { theme = "old", local = "keep" }
-"#,
-    );
+    let fixture = Fixture::load("toml", "inline_table_preservation");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "codex"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Update target: settings.theme"));
 
-    let target = read_file(&dir.path().join("target.toml"));
-    assert!(target.contains(r#"theme = "new""#));
-    assert!(target.contains(r#"local = "keep""#));
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn push_handles_quoted_path_segments() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &[r#"plugins."github@openai-curated".enabled"#]);
-    write_file(
-        &dir.path().join("source.toml"),
-        r#"[plugins."github@openai-curated"]
-enabled = true
-"#,
-    );
-    write_file(&dir.path().join("target.toml"), "");
+    let fixture = Fixture::load("toml", "quoted_path_plugin");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "codex"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            "Update target: plugins.\"github@openai-curated\".enabled",
+        ));
 
-    let target = read_file(&dir.path().join("target.toml"));
-    assert!(target.contains(r#"[plugins."github@openai-curated"]"#));
-    assert!(target.contains("enabled = true"));
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn dry_run_reports_changes_without_writing_files() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
-    write_file(&dir.path().join("target.toml"), "");
+    let fixture = Fixture::load("toml", "dry_run_no_write");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "codex", "--dry-run"])
         .assert()
         .success()
@@ -253,43 +246,55 @@ fn dry_run_reports_changes_without_writing_files() {
             "Would update target: project_doc_max_bytes",
         ));
 
-    assert_eq!(read_file(&dir.path().join("target.toml")), "");
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
 
 #[test]
 fn backup_creates_timestamped_copy_before_writing() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
-    write_file(&dir.path().join("target.toml"), "old = true\n");
+    let fixture = Fixture::load("toml", "backup_write");
+    let original_target = fixture.read("target.toml");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "codex", "--backup"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            "Update target: project_doc_max_bytes",
+        ));
 
-    let backup_count = fs::read_dir(dir.path())
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
+    let backups = fs::read_dir(fixture.path())
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
-        .count();
-    assert_eq!(backup_count, 1);
-    assert!(read_file(&dir.path().join("target.toml")).contains("project_doc_max_bytes = 65536"));
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
+fn multiple_targets_process_all_when_name_is_omitted() {
+    let fixture = Fixture::load("toml", "multiple_targets");
+
+    fixture
+        .command()
+        .args(["push"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex Push apply"))
+        .stdout(predicate::str::contains("tooling Push apply"));
+
+    fixture.assert_file_eq("codex-target.toml", "codex-target.expected.toml");
+    fixture.assert_file_eq("tooling-target.toml", "tooling-target.expected.toml");
 }
 
 #[test]
 fn unknown_target_exits_with_error() {
-    let dir = TempDir::new().unwrap();
-    write_config(&dir, &["project_doc_max_bytes"]);
-    write_file(
-        &dir.path().join("source.toml"),
-        "project_doc_max_bytes = 65536\n",
-    );
+    let fixture = Fixture::load("toml", "codex_basic_sync");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["push", "missing"])
         .assert()
         .failure()
@@ -298,10 +303,10 @@ fn unknown_target_exits_with_error() {
 
 #[test]
 fn malformed_config_exits_with_parse_error() {
-    let dir = TempDir::new().unwrap();
-    write_file(&dir.path().join(".sync.yaml"), "targets: [");
+    let fixture = Fixture::load("toml", "malformed_config");
 
-    dot_sync_in(dir.path())
+    fixture
+        .command()
         .args(["sync"])
         .assert()
         .failure()

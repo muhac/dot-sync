@@ -1,0 +1,13 @@
+targets:
+  codex:
+    format: toml
+    source: codex-source.toml
+    target: codex-target.toml
+    sync:
+      - tui.theme
+  tooling:
+    format: toml
+    source: tooling-source.toml
+    target: tooling-target.toml
+    sync:
+      - editor.tab_width
