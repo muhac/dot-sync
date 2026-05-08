@@ -1,22 +1,22 @@
 # .sync (`dot-sync`, `ds`)
 
-`.sync` manages app-owned structured configuration files without taking over
-the whole file. Use `dot-sync` in scripts and docs, or `ds` as the short
-interactive command.
+`.sync` keeps selected fields in structured config files aligned without taking
+ownership of the whole file. Use `dot-sync` in scripts and docs, or `ds` as the
+short interactive command.
 
-The dotfiles repository already handles ordinary dotfiles well with symlinks.
-`.sync` is for configuration files that applications also edit themselves,
-such as Codex TOML config or Claude JSON settings. These files often mix stable
-preferences with local state, trust records, counters, paths, accounts, or other
-private data. Managing the whole file directly can leak local information into
-Git and create noisy diffs.
+Many config files are not cleanly owned by one source. They can mix stable
+preferences with secrets, local machine paths, generated state, account data,
+trust records, counters, caches, timestamps, or other fields that change often.
+Committing or copying the whole file is risky: it can leak private information,
+clobber local state, and create noisy diffs.
 
-The goal is to sync only explicitly selected fields between the repository and
-the real app config, while leaving every other field untouched.
+`.sync` is for partial config sync. You keep a small managed fragment containing
+only the fields you care about, then sync those fields into or out of the real
+application config while leaving every other field untouched.
 
 ## Concepts
 
-- `source`: repo-managed sync fragment.
+- `source`: managed sync fragment.
 - `target`: real app config used by the application.
 - `sync`: fields that move both ways.
 - `deny`: fields that must never be managed.
@@ -27,7 +27,7 @@ Example:
 targets:
   codex:
     format: toml
-    source: dotfiles/codex/.codex/config.sync.toml
+    source: sync/codex.toml
     target: ~/.codex/config.toml
     sync:
       - project_doc_fallback_filenames
@@ -99,8 +99,8 @@ The conflict rule is fixed:
 - fields outside `sync` are not touched.
 - fields matching `deny` must not appear in `source`.
 
-This keeps app-written local state safe while still allowing repo-managed
-preferences to be shared across machines.
+This keeps app-written local state safe while still allowing managed preferences
+to be shared across machines, environments, or projects.
 
 The direction names mirror deployment-style workflows: `pull` brings the
 current target state back into the repo source, and `push` applies the repo
@@ -115,21 +115,12 @@ directory. Paths in `source` are resolved relative to that file. Paths in
 V1 fully supports TOML targets. JSON targets are part of the format abstraction
 but are not implemented yet.
 
-## Installer Integration
+## Binary Names
 
-The published installer downloads the prebuilt `dot-sync` binary from GitHub
-Pages into a temporary directory when `dot-sync` is not already available on
-`PATH`, then runs:
+The canonical command is `dot-sync`. The shorter `ds` command is also provided
+for interactive use.
 
 ```sh
 dot-sync push codex --backup
+ds push codex --backup
 ```
-
-This applies repo-managed Codex fields from
-`dotfiles/codex/.codex/config.sync.toml` into the real
-`~/.codex/config.toml` while preserving local-only state such as model provider
-tokens, trusted project paths, counters, and other app-owned fields.
-
-The temporary binary is removed when the installer exits. Set
-`DOWNLOAD_DOT_SYNC=0` to skip the fallback download, or `RUN_DOT_SYNC=0` to skip
-the config push during remote install.
