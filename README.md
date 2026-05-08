@@ -1,30 +1,33 @@
 # .sync — surgical config sync
 
-> Sync only the parts of your config that matter.
-> 
-> Keep your preferences. Ignore secrets, local state, and noise.
+Sync only the parts of your config that matter.
 
-`.sync` keeps selected fields in structured config files aligned without taking
-ownership of the whole file. Use `dot-sync` in scripts and docs, or `ds` as the
-short interactive command.
+Keep your preferences. Ignore secrets, local state, and noise.
 
-Many config files are not cleanly owned by one source. They can mix stable
-preferences with secrets, local machine paths, generated state, account data,
-trust records, counters, caches, timestamps, or other fields that change often.
-Committing or copying the whole file is risky: it can leak private information,
-clobber local state, and create noisy diffs.
+## Use cases
 
-`.sync` is for partial config sync. You keep a small managed fragment containing
-only the fields you care about, then sync those fields into or out of the real
-application config while leaving every other field untouched.
+### AI tool configs
+
+Sync your Codex or Claude settings across machines, without leaking API keys or local trust state.
+
+### Noisy config files
+
+Many tools write back to their own config files (timestamps, caches, counters).
+`.sync` lets you keep only the stable parts in Git.
+
+### Multi-machine setup
+
+Keep your environment consistent across machines, while preserving local paths, accounts, and secrets.
 
 ## Quick start
-
-CLI: `dot-sync` (alias: `ds`)
 
 ```sh
 dot-sync sync  # or: ds sync
 ```
+
+`.sync` keeps selected fields in structured config files aligned without taking
+ownership of the whole file. Use `dot-sync` in scripts and docs, or `ds` as the
+short interactive command.
 
 ## Configuration
 
