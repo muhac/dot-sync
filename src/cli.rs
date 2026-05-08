@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "dotctl")]
+#[command(name = "ds")]
 #[command(about = "Sync selected fields between repo config fragments and app configs")]
 pub struct Cli {
     #[command(subcommand)]
@@ -12,7 +12,7 @@ pub struct Cli {
 pub enum Command {
     /// Pull selected fields from target into source.
     Pull {
-        /// Target name from dotctl.yaml. Omit to process all targets.
+        /// Target name from dot.sync.yaml. Omit to process all targets.
         name: Option<String>,
 
         /// Show planned changes without writing files.
@@ -26,7 +26,7 @@ pub enum Command {
 
     /// Push selected fields from source into target.
     Push {
-        /// Target name from dotctl.yaml. Omit to process all targets.
+        /// Target name from dot.sync.yaml. Omit to process all targets.
         name: Option<String>,
 
         /// Show planned changes without writing files.
@@ -40,7 +40,7 @@ pub enum Command {
 
     /// Pull from target to source, then fill target from source.
     Sync {
-        /// Target name from dotctl.yaml. Omit to process all targets.
+        /// Target name from dot.sync.yaml. Omit to process all targets.
         name: Option<String>,
 
         /// Show planned changes without writing files.

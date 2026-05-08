@@ -186,7 +186,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotctl"
+name = "dot-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",

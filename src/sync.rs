@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 
-use crate::config::{DotctlConfig, TargetConfig};
+use crate::config::{DotSyncConfig, TargetConfig};
 use crate::document::{AnyDocument, Document};
 use crate::path::FieldPath;
 
@@ -34,7 +34,7 @@ enum Destination {
 }
 
 pub fn run(
-    config: &DotctlConfig,
+    config: &DotSyncConfig,
     name: Option<&str>,
     direction: Direction,
     options: SyncOptions,
@@ -48,7 +48,7 @@ pub fn run(
 }
 
 fn select_targets<'a>(
-    config: &'a DotctlConfig,
+    config: &'a DotSyncConfig,
     name: Option<&str>,
 ) -> Result<Vec<&'a TargetConfig>> {
     if let Some(name) = name {

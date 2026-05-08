@@ -22,7 +22,7 @@ struct RawTargetConfig {
 }
 
 #[derive(Debug)]
-pub struct DotctlConfig {
+pub struct DotSyncConfig {
     pub targets: BTreeMap<String, TargetConfig>,
 }
 
@@ -36,7 +36,7 @@ pub struct TargetConfig {
     pub deny: Vec<String>,
 }
 
-impl DotctlConfig {
+impl DotSyncConfig {
     pub fn load_from_current_dir() -> Result<Self> {
         let cwd = env::current_dir().context("failed to read current directory")?;
         let config_path = find_config(&cwd)?;
@@ -46,7 +46,7 @@ impl DotctlConfig {
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let root = path
             .parent()
-            .ok_or_else(|| anyhow!("dotctl.yaml has no parent directory"))?
+            .ok_or_else(|| anyhow!("dot.sync.yaml has no parent directory"))?
             .to_path_buf();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
@@ -73,12 +73,17 @@ impl DotctlConfig {
 fn find_config(start: &Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
-        let candidate = dir.join("dotctl.yaml");
-        if candidate.is_file() {
-            return Ok(candidate);
+        for filename in ["dot.sync.yaml", "dotctl.yaml"] {
+            let candidate = dir.join(filename);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
         if !dir.pop() {
-            bail!("could not find dotctl.yaml from {}", start.display());
+            bail!(
+                "could not find dot.sync.yaml or dotctl.yaml from {}",
+                start.display()
+            );
         }
     }
 }
@@ -104,11 +109,25 @@ fn resolve_path(root: &Path, value: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn resolves_relative_paths_from_root() {
         let root = Path::new("/repo");
         let path = resolve_path(root, "dotfiles/codex/config.toml").unwrap();
         assert_eq!(path, PathBuf::from("/repo/dotfiles/codex/config.toml"));
+    }
+
+    #[test]
+    fn finds_dot_sync_config_before_legacy_dotctl_config() {
+        let dir = tempdir().unwrap();
+        let new_config = dir.path().join("dot.sync.yaml");
+        let legacy_config = dir.path().join("dotctl.yaml");
+        fs::write(&new_config, "targets: {}\n").unwrap();
+        fs::write(&legacy_config, "targets: {}\n").unwrap();
+
+        let found = find_config(dir.path()).unwrap();
+
+        assert_eq!(found, new_config);
     }
 }

@@ -8,12 +8,12 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
-use crate::config::DotctlConfig;
+use crate::config::DotSyncConfig;
 use crate::sync::{Direction, SyncOptions, run};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let loaded = DotctlConfig::load_from_current_dir()?;
+    let loaded = DotSyncConfig::load_from_current_dir()?;
 
     match cli.command {
         Command::Pull {

@@ -1,4 +1,4 @@
-name: Test dotctl
+name: Test dot-sync
 
 on:
   push:
@@ -24,11 +24,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Check dotctl
+      - name: Check dot-sync
         run: cargo check
 
-      - name: Test dotctl
+      - name: Test dot-sync
         run: cargo test
 
-      - name: Run dotctl help
+      - name: Run ds help
         run: cargo run --quiet -- --help
