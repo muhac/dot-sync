@@ -1,0 +1,54 @@
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(name = "dot-sync")]
+#[command(about = "Sync selected fields between structured config files")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Pull selected fields from target into source.
+    Pull {
+        /// Target name from .sync.yaml. Omit to process all targets.
+        name: Option<String>,
+
+        /// Show planned changes without writing files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Create a timestamped backup before writing.
+        #[arg(long)]
+        backup: bool,
+    },
+
+    /// Push selected fields from source into target.
+    Push {
+        /// Target name from .sync.yaml. Omit to process all targets.
+        name: Option<String>,
+
+        /// Show planned changes without writing files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Create a timestamped backup before writing.
+        #[arg(long)]
+        backup: bool,
+    },
+
+    /// Pull from target to source, then fill target from source.
+    Sync {
+        /// Target name from .sync.yaml. Omit to process all targets.
+        name: Option<String>,
+
+        /// Show planned changes without writing files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Create a timestamped backup before writing.
+        #[arg(long)]
+        backup: bool,
+    },
+}

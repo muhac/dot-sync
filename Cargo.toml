@@ -1,0 +1,24 @@
+[package]
+name = "dot-sync"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dot-sync"
+path = "src/main.rs"
+
+[[bin]]
+name = "ds"
+path = "src/bin/ds.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
