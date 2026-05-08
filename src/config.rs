@@ -69,17 +69,12 @@ impl DotSyncConfig {
 fn find_config(start: &Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
-        for filename in ["dot.sync.yaml", "dotctl.yaml"] {
-            let candidate = dir.join(filename);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
+        let candidate = dir.join(".sync.yaml");
+        if candidate.is_file() {
+            return Ok(candidate);
         }
         if !dir.pop() {
-            bail!(
-                "could not find dot.sync.yaml or dotctl.yaml from {}",
-                start.display()
-            );
+            bail!("could not find .sync.yaml from {}", start.display());
         }
     }
 }
@@ -115,16 +110,14 @@ mod tests {
     }
 
     #[test]
-    fn finds_dot_sync_config_before_legacy_dotctl_config() {
+    fn finds_sync_config() {
         let dir = tempdir().unwrap();
-        let new_config = dir.path().join("dot.sync.yaml");
-        let legacy_config = dir.path().join("dotctl.yaml");
-        fs::write(&new_config, "targets: {}\n").unwrap();
-        fs::write(&legacy_config, "targets: {}\n").unwrap();
+        let config = dir.path().join(".sync.yaml");
+        fs::write(&config, "targets: {}\n").unwrap();
 
         let found = find_config(dir.path()).unwrap();
 
-        assert_eq!(found, new_config);
+        assert_eq!(found, config);
     }
 
     #[test]
