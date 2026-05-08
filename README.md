@@ -27,7 +27,7 @@ Example:
 targets:
   codex:
     format: toml
-    source: sync/codex.toml
+    source: codex.sync.toml
     target: ~/.codex/config.toml
     sync:
       - project_doc_fallback_filenames
