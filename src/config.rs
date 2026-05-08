@@ -105,8 +105,8 @@ mod tests {
     #[test]
     fn resolves_relative_paths_from_root() {
         let root = Path::new("/repo");
-        let path = resolve_path(root, "dotfiles/codex/config.toml").unwrap();
-        assert_eq!(path, PathBuf::from("/repo/dotfiles/codex/config.toml"));
+        let path = resolve_path(root, "profiles/codex.sync.toml").unwrap();
+        assert_eq!(path, PathBuf::from("/repo/profiles/codex.sync.toml"));
     }
 
     #[test]

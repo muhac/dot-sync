@@ -119,5 +119,5 @@ This keeps app-written local state safe while still allowing managed preferences
 to be shared across machines, environments, or projects.
 
 The direction names mirror deployment-style workflows: `pull` brings the
-current target state back into the repo source, and `push` applies the repo
-source to the target environment.
+current target state back into the managed source, and `push` applies the
+managed source to the target environment.
