@@ -30,5 +30,8 @@ jobs:
       - name: Test dot-sync
         run: cargo test
 
+      - name: Run dot-sync help
+        run: cargo run --quiet --bin dot-sync -- --help
+
       - name: Run ds help
-        run: cargo run --quiet -- --help
+        run: cargo run --quiet --bin ds -- --help

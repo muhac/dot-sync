@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "ds")]
+#[command(name = "dot-sync")]
 #[command(about = "Sync selected fields between repo config fragments and app configs")]
 pub struct Cli {
     #[command(subcommand)]

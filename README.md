@@ -1,10 +1,11 @@
-# dot-sync
+# .sync (`dot-sync`, `ds`)
 
-`ds` manages app-owned structured configuration files without taking over
-the whole file.
+`.sync` manages app-owned structured configuration files without taking over
+the whole file. Use `dot-sync` in scripts and docs, or `ds` as the short
+interactive command.
 
 The dotfiles repository already handles ordinary dotfiles well with symlinks.
-`ds` is for configuration files that applications also edit themselves,
+`.sync` is for configuration files that applications also edit themselves,
 such as Codex TOML config or Claude JSON settings. These files often mix stable
 preferences with local state, trust records, counters, paths, accounts, or other
 private data. Managing the whole file directly can leak local information into
@@ -44,18 +45,18 @@ targets:
 ## Commands
 
 ```sh
-ds pull codex
-ds push codex
-ds sync codex
+dot-sync pull codex
+dot-sync push codex
+dot-sync sync codex
 ```
 
-The target name is optional. If omitted, `ds` operates on all configured
+The target name is optional. If omitted, `dot-sync` operates on all configured
 targets.
 
 ```sh
-ds pull
-ds push
-ds sync
+dot-sync pull
+dot-sync push
+dot-sync sync
 ```
 
 All commands support `--dry-run` to show planned changes without writing either
@@ -63,9 +64,9 @@ file. Real writes do not create backups by default; pass `--backup` to create a
 timestamped backup before writing.
 
 ```sh
-ds pull codex --dry-run
-ds push codex --backup
-ds sync --dry-run
+dot-sync pull codex --dry-run
+dot-sync push codex --backup
+dot-sync sync --dry-run
 ```
 
 `pull` reads from `target` and updates `source`.
@@ -107,7 +108,7 @@ source to the target environment.
 
 ## Configuration
 
-`ds` reads `dot.sync.yaml` from the current directory or the nearest parent
+`dot-sync` reads `dot.sync.yaml` from the current directory or the nearest parent
 directory. Paths in `source` are resolved relative to that file. Paths in
 `target` may use `~` for the current user's home directory.
 
@@ -116,12 +117,12 @@ but are not implemented yet.
 
 ## Installer Integration
 
-The published installer downloads the prebuilt `ds` binary from GitHub
-Pages into a temporary directory when `ds` is not already available on
+The published installer downloads the prebuilt `dot-sync` binary from GitHub
+Pages into a temporary directory when `dot-sync` is not already available on
 `PATH`, then runs:
 
 ```sh
-ds push codex --backup
+dot-sync push codex --backup
 ```
 
 This applies repo-managed Codex fields from
@@ -130,5 +131,5 @@ This applies repo-managed Codex fields from
 tokens, trusted project paths, counters, and other app-owned fields.
 
 The temporary binary is removed when the installer exits. Set
-`DOWNLOAD_DOTCTL=0` to skip the fallback download, or `RUN_DOTCTL=0` to skip
+`DOWNLOAD_DOT_SYNC=0` to skip the fallback download, or `RUN_DOT_SYNC=0` to skip
 the config push during remote install.
