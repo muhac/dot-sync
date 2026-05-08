@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "dot-sync")]
-#[command(about = "Sync selected fields between repo config fragments and app configs")]
+#[command(about = "Sync selected fields between structured config files")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
