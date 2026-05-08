@@ -17,8 +17,6 @@ struct RawTargetConfig {
     source: String,
     target: String,
     sync: Vec<String>,
-    #[serde(default)]
-    deny: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -33,7 +31,6 @@ pub struct TargetConfig {
     pub source: PathBuf,
     pub target: PathBuf,
     pub sync: Vec<String>,
-    pub deny: Vec<String>,
 }
 
 impl DotSyncConfig {
@@ -61,7 +58,6 @@ impl DotSyncConfig {
                 source: resolve_path(&root, &raw_target.source)?,
                 target: resolve_path(&root, &raw_target.target)?,
                 sync: raw_target.sync,
-                deny: raw_target.deny,
             };
             targets.insert(name, target);
         }

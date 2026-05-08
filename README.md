@@ -19,7 +19,6 @@ application config while leaving every other field untouched.
 - `source`: managed sync fragment.
 - `target`: real app config used by the application.
 - `sync`: fields that move both ways.
-- `deny`: fields that must never be managed.
 
 Example:
 
@@ -37,9 +36,6 @@ targets:
       - tui.status_line
       - tui.theme
       - plugins."github@openai-curated".enabled
-    deny:
-      - projects
-      - tui.model_availability_nux
 ```
 
 ## Commands
@@ -97,7 +93,6 @@ The conflict rule is fixed:
 - `target` wins for fields that exist in both files.
 - `source` fills missing `sync` fields in `target`.
 - fields outside `sync` are not touched.
-- fields matching `deny` must not appear in `source`.
 
 This keeps app-written local state safe while still allowing managed preferences
 to be shared across machines, environments, or projects.

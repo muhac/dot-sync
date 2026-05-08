@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
@@ -82,8 +82,6 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     )?;
 
     let sync_paths = parse_paths(&target.sync)?;
-    let deny_paths = parse_paths(&target.deny)?;
-    validate_denied_paths(&source, &deny_paths)?;
 
     let changes = match direction {
         Direction::Pull => pull(&mut source, &target_doc, &sync_paths, &target.format)?,
@@ -290,15 +288,6 @@ fn parse_paths(raw_paths: &[String]) -> Result<Vec<ParsedPath>> {
             })
         })
         .collect()
-}
-
-fn validate_denied_paths(source: &dyn Document, deny_paths: &[ParsedPath]) -> Result<()> {
-    for path in deny_paths {
-        if source.contains(&path.path) {
-            bail!("source contains denied path: {}", path.raw);
-        }
-    }
-    Ok(())
 }
 
 fn same_item(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
@@ -647,19 +636,6 @@ hide_rate_limit_model_nudge = true
     }
 
     #[test]
-    fn deny_paths_fail_validation() {
-        let source = toml_from(
-            r#"
-[tui.model_availability_nux]
-"gpt-5.5" = 3
-"#,
-        );
-        let err =
-            validate_denied_paths(&source, &parsed(&["tui.model_availability_nux"])).unwrap_err();
-        assert!(err.to_string().contains("denied path"));
-    }
-
-    #[test]
     fn push_requires_existing_source() {
         let dir = tempdir().unwrap();
         let target = TargetConfig {
@@ -668,7 +644,6 @@ hide_rate_limit_model_nudge = true
             source: dir.path().join("missing.toml"),
             target: dir.path().join("target.toml"),
             sync: vec!["project_doc_max_bytes".to_string()],
-            deny: Vec::new(),
         };
 
         let err = run_target(
