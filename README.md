@@ -1,4 +1,8 @@
-# .sync (`dot-sync`, `ds`)
+# .sync — surgical config sync
+
+> Sync only the parts of your config that matter.
+> 
+> Keep your preferences. Ignore secrets, local state, and noise.
 
 `.sync` keeps selected fields in structured config files aligned without taking
 ownership of the whole file. Use `dot-sync` in scripts and docs, or `ds` as the
@@ -13,6 +17,23 @@ clobber local state, and create noisy diffs.
 `.sync` is for partial config sync. You keep a small managed fragment containing
 only the fields you care about, then sync those fields into or out of the real
 application config while leaving every other field untouched.
+
+## Quick start
+
+CLI: `dot-sync` (alias: `ds`)
+
+```sh
+dot-sync sync  # or: ds sync
+```
+
+## Configuration
+
+`dot-sync` reads `.sync.yaml` from the current directory or the nearest parent
+directory. Paths in `source` are resolved relative to that file. Paths in
+`target` may use `~` for the current user's home directory.
+
+**Supporting formats:**
+- **TOML** (Format-preserving via `toml_edit`)
 
 ## Concepts
 
@@ -100,22 +121,3 @@ to be shared across machines, environments, or projects.
 The direction names mirror deployment-style workflows: `pull` brings the
 current target state back into the repo source, and `push` applies the repo
 source to the target environment.
-
-## Configuration
-
-`dot-sync` reads `dot.sync.yaml` from the current directory or the nearest parent
-directory. Paths in `source` are resolved relative to that file. Paths in
-`target` may use `~` for the current user's home directory.
-
-V1 fully supports TOML targets. JSON targets are part of the format abstraction
-but are not implemented yet.
-
-## Binary Names
-
-The canonical command is `dot-sync`. The shorter `ds` command is also provided
-for interactive use.
-
-```sh
-dot-sync push codex --backup
-ds push codex --backup
-```
