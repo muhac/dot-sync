@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use toml_edit::{DocumentMut, Item, Table};
+use anyhow::{bail, Context, Result};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::path::FieldPath;
 
@@ -111,13 +111,17 @@ impl Document for TomlDocument {
 }
 
 fn get_from_table<'a>(table: &'a Table, segments: &[String]) -> Option<&'a Item> {
+    get_from_table_like(table, segments)
+}
+
+fn get_from_table_like<'a>(table: &'a dyn TableLike, segments: &[String]) -> Option<&'a Item> {
     let (first, rest) = segments.split_first()?;
     let item = table.get(first)?;
     if rest.is_empty() {
         return Some(item);
     }
-    let table = item.as_table()?;
-    get_from_table(table, rest)
+    let table = item.as_table_like()?;
+    get_from_table_like(table, rest)
 }
 
 fn set_in_table(table: &mut Table, segments: &[String], item: Item) -> Result<()> {
@@ -130,20 +134,49 @@ fn set_in_table(table: &mut Table, segments: &[String], item: Item) -> Result<()
         return Ok(());
     }
 
-    let child = match table.get_mut(first) {
-        Some(existing) if existing.as_table().is_some() => existing,
-        _ => {
-            let mut child = Table::new();
-            child.set_implicit(true);
-            table.insert(first, Item::Table(child));
-            table.get_mut(first).expect("inserted table")
-        }
+    if !matches!(table.get(first), Some(existing) if existing.as_table_like().is_some()) {
+        let mut child = Table::new();
+        child.set_implicit(true);
+        table.insert(first, Item::Table(child));
+    }
+
+    let child = table.get_mut(first).expect("inserted table");
+    set_in_child(child, rest, item)
+}
+
+fn set_in_inline_table(table: &mut InlineTable, segments: &[String], item: Item) -> Result<()> {
+    let Some((first, rest)) = segments.split_first() else {
+        bail!("path must not be empty");
     };
 
-    let child_table = child
-        .as_table_mut()
-        .expect("child was checked or inserted as table");
-    set_in_table(child_table, rest, item)
+    if rest.is_empty() {
+        let value = match item.into_value() {
+            Ok(value) => value,
+            Err(item) => bail!("cannot insert {} into inline table", item.type_name()),
+        };
+        table.insert(first, value);
+        return Ok(());
+    }
+
+    if !matches!(TableLike::get(table, first), Some(existing) if existing.as_table_like().is_some())
+    {
+        TableLike::insert(
+            table,
+            first,
+            Item::Value(Value::InlineTable(InlineTable::new())),
+        );
+    }
+
+    let child = TableLike::get_mut(table, first).expect("inserted inline table");
+    set_in_child(child, rest, item)
+}
+
+fn set_in_child(child: &mut Item, segments: &[String], item: Item) -> Result<()> {
+    match child {
+        Item::Table(table) => set_in_table(table, segments, item),
+        Item::Value(Value::InlineTable(table)) => set_in_inline_table(table, segments, item),
+        _ => unreachable!("child was checked or inserted as table-like"),
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +210,26 @@ mod tests {
             doc.get(&path).unwrap().as_value().unwrap().as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn preserves_inline_table_fields_when_setting_nested_values() {
+        let mut doc = TomlDocument {
+            doc: r#"settings = { theme = "old", local = "keep" }"#.parse().unwrap(),
+        };
+        let path = FieldPath::parse("settings.theme").unwrap();
+
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("old")
+        );
+
+        doc.set(&path, value("new")).unwrap();
+
+        let settings_path = FieldPath::parse("settings").unwrap();
+        let settings_item = doc.get(&settings_path).unwrap();
+        let settings = settings_item.as_inline_table().unwrap();
+        assert_eq!(settings.get("theme").unwrap().as_str(), Some("new"));
+        assert_eq!(settings.get("local").unwrap().as_str(), Some("keep"));
     }
 }

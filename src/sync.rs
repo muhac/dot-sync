@@ -78,7 +78,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     let mut target_doc = AnyDocument::load(
         &target.format,
         &target.target,
-        matches!(direction, Direction::Push),
+        matches!(direction, Direction::Push | Direction::Sync),
     )?;
 
     let sync_paths = parse_paths(&target.sync)?;
@@ -633,6 +633,36 @@ hide_rate_limit_model_nudge = true
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "canonical source order");
+    }
+
+    #[test]
+    fn sync_bootstraps_missing_target_file() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.toml");
+        let target_path = dir.path().join("target.toml");
+        fs::write(&source, "project_doc_max_bytes = 65536\n").unwrap();
+        let target = TargetConfig {
+            name: "codex".to_string(),
+            format: "toml".to_string(),
+            source,
+            target: target_path.clone(),
+            sync: vec!["project_doc_max_bytes".to_string()],
+        };
+
+        run_target(
+            &target,
+            Direction::Sync,
+            SyncOptions {
+                dry_run: false,
+                backup: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target_path).unwrap(),
+            "project_doc_max_bytes = 65536\n"
+        );
     }
 
     #[test]
