@@ -25,12 +25,19 @@ pub struct SyncOptions {
 struct Change {
     path: String,
     destination: Destination,
+    action: Action,
 }
 
 #[derive(Debug)]
 enum Destination {
     Source,
     Target,
+}
+
+#[derive(Debug)]
+enum Action {
+    Update,
+    Remove,
 }
 
 pub fn run(
@@ -129,7 +136,17 @@ fn pull(
         changes.push(Change {
             path: path.raw.clone(),
             destination: Destination::Source,
+            action: Action::Update,
         });
+    }
+    for path in paths {
+        if canonical_source.get(&path.path).is_none() && source.contains(&path.path) {
+            changes.push(Change {
+                path: path.raw.clone(),
+                destination: Destination::Source,
+                action: Action::Remove,
+            });
+        }
     }
     if source_needs_canonical_rewrite
         && !changes
@@ -139,6 +156,7 @@ fn pull(
         changes.push(Change {
             path: "canonical source order".to_string(),
             destination: Destination::Source,
+            action: Action::Update,
         });
     }
     replace_with_canonical_source(source, canonical_source, paths)?;
@@ -165,6 +183,7 @@ fn push(
         changes.push(Change {
             path: path.raw.clone(),
             destination: Destination::Target,
+            action: Action::Update,
         });
     }
     Ok(changes)
@@ -194,6 +213,7 @@ fn sync(
             changes.push(Change {
                 path: path.raw.clone(),
                 destination: Destination::Source,
+                action: Action::Update,
             });
         }
 
@@ -203,6 +223,7 @@ fn sync(
                 changes.push(Change {
                     path: path.raw.clone(),
                     destination: Destination::Target,
+                    action: Action::Update,
                 });
             }
         }
@@ -215,6 +236,7 @@ fn sync(
         changes.push(Change {
             path: "canonical source order".to_string(),
             destination: Destination::Source,
+            action: Action::Update,
         });
     }
     replace_with_canonical_source(source, canonical_source, paths)?;
@@ -302,10 +324,11 @@ fn report_changes(
             Destination::Source => "source",
             Destination::Target => "target",
         };
-        let prefix = if options.dry_run {
-            "Would update"
-        } else {
-            "Update"
+        let prefix = match (options.dry_run, &change.action) {
+            (true, Action::Update) => "Would update",
+            (true, Action::Remove) => "Would remove",
+            (false, Action::Update) => "Update",
+            (false, Action::Remove) => "Remove",
         };
         println!("  {prefix} {destination}: {}", change.path);
     }
@@ -472,6 +495,34 @@ hide_rate_limit_model_nudge = true
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "canonical source order");
+    }
+
+    #[test]
+    fn pull_reports_removed_source_fields_missing_from_target() {
+        let mut source = toml_from(
+            r#"
+project_doc_max_bytes = 65536
+project_doc_fallback_filenames = ["AGENTS.md"]
+"#,
+        );
+        let target = toml_from("project_doc_max_bytes = 65536\n");
+
+        let changes = pull(
+            &mut source,
+            &target,
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            "toml",
+        )
+        .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "project_doc_fallback_filenames");
+        assert!(matches!(changes[0].action, Action::Remove));
+        assert!(
+            source
+                .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
+                .is_none()
+        );
     }
 
     #[test]

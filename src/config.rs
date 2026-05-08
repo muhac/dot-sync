@@ -46,11 +46,11 @@ impl DotSyncConfig {
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let root = path
             .parent()
-            .ok_or_else(|| anyhow!("dot.sync.yaml has no parent directory"))?
+            .ok_or_else(|| anyhow!("config path has no parent directory: {}", path.display()))?
             .to_path_buf();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let raw: RawConfig = serde_yaml::from_str(&content)
+        let raw: RawConfig = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
         let mut targets = BTreeMap::new();
@@ -129,5 +129,12 @@ mod tests {
         let found = find_config(dir.path()).unwrap();
 
         assert_eq!(found, new_config);
+    }
+
+    #[test]
+    fn load_from_path_reports_actual_path_without_parent() {
+        let err = DotSyncConfig::load_from_path(Path::new("/")).unwrap_err();
+
+        assert!(err.to_string().contains("config path has no parent directory: /"));
     }
 }
