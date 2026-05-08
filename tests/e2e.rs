@@ -16,6 +16,10 @@ fn read_file(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
+fn normalize_newlines(content: &str) -> String {
+    content.replace("\r\n", "\n")
+}
+
 fn write_config(dir: &TempDir, sync_paths: &[&str]) {
     let sync = sync_paths
         .iter()
@@ -66,7 +70,7 @@ fn sync_discovers_config_in_current_directory() {
 
     assert_eq!(
         read_file(&dir.path().join("target.toml")),
-        include_str!("fixtures/codex_basic/target.expected.toml")
+        normalize_newlines(include_str!("fixtures/codex_basic/target.expected.toml"))
     );
 }
 
