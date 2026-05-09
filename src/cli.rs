@@ -10,6 +10,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Show configuration and file health without syncing.
+    Status {
+        /// Target name from .sync.yaml. Omit to inspect all targets.
+        name: Option<String>,
+    },
+
     /// Pull selected fields from target into source.
     Pull {
         /// Target name from .sync.yaml. Omit to process all targets.

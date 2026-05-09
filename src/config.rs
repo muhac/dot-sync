@@ -21,6 +21,7 @@ struct RawTargetConfig {
 
 #[derive(Debug)]
 pub struct DotSyncConfig {
+    pub path: PathBuf,
     pub targets: BTreeMap<String, TargetConfig>,
 }
 
@@ -62,7 +63,10 @@ impl DotSyncConfig {
             targets.insert(name, target);
         }
 
-        Ok(Self { targets })
+        Ok(Self {
+            path: path.to_path_buf(),
+            targets,
+        })
     }
 }
 

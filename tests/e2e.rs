@@ -91,9 +91,9 @@ fn sync_discovers_config_in_current_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains("codex Sync apply"))
-        .stdout(predicate::str::contains("Update target: tui.theme"))
+        .stdout(predicate::str::contains("added target: tui.theme"))
         .stdout(predicate::str::contains(
-            "Update target: project_doc_max_bytes",
+            "added target: project_doc_max_bytes",
         ));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
@@ -110,7 +110,7 @@ fn sync_discovers_config_from_parent_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Update target: project_doc_max_bytes",
+            "added target: project_doc_max_bytes",
         ));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
@@ -126,9 +126,9 @@ fn push_preserves_unmanaged_target_fields() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Update target: project_doc_max_bytes",
+            "added target: project_doc_max_bytes",
         ))
-        .stdout(predicate::str::contains("Update target: tui.theme"));
+        .stdout(predicate::str::contains("added target: tui.theme"));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
@@ -142,9 +142,9 @@ fn pull_rewrites_source_in_sync_order() {
         .args(["pull", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Update source: tui.theme"))
+        .stdout(predicate::str::contains("changed source: tui.theme"))
         .stdout(predicate::str::contains(
-            "Update source: project_doc_max_bytes",
+            "added source: project_doc_max_bytes",
         ));
 
     fixture.assert_file_eq("source.toml", "source.expected.toml");
@@ -160,7 +160,7 @@ fn pull_reports_removed_source_fields_missing_from_target() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Remove source: project_doc_fallback_filenames",
+            "removed source: project_doc_fallback_filenames",
         ));
 
     fixture.assert_file_eq("source.toml", "source.expected.toml");
@@ -175,9 +175,9 @@ fn sync_uses_target_values_and_fills_missing_target_fields() {
         .args(["sync", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Update source: tui.theme"))
+        .stdout(predicate::str::contains("changed source: tui.theme"))
         .stdout(predicate::str::contains(
-            "Update target: project_doc_fallback_filenames",
+            "added target: project_doc_fallback_filenames",
         ));
 
     fixture.assert_file_eq("source.toml", "source.expected.toml");
@@ -194,10 +194,10 @@ fn sync_bootstraps_missing_target_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Update target: project_doc_max_bytes",
+            "added target: project_doc_max_bytes",
         ))
         .stdout(predicate::str::contains(
-            "Update target: project_doc_fallback_filenames",
+            "added target: project_doc_fallback_filenames",
         ));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
@@ -212,7 +212,7 @@ fn push_preserves_inline_table_fields() {
         .args(["push", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Update target: settings.theme"));
+        .stdout(predicate::str::contains("changed target: settings.theme"));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
 }
@@ -227,7 +227,7 @@ fn push_handles_quoted_path_segments() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Update target: plugins.\"github@openai-curated\".enabled",
+            "added target: plugins.\"github@openai-curated\".enabled",
         ));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
@@ -242,11 +242,246 @@ fn dry_run_reports_changes_without_writing_files() {
         .args(["push", "codex", "--dry-run"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("dry run: no files written"))
         .stdout(predicate::str::contains(
-            "Would update target: project_doc_max_bytes",
-        ));
+            "would change target: project_doc_max_bytes",
+        ))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
+}
+
+#[test]
+fn dry_run_reports_added_fields() {
+    let fixture = Fixture::load("toml", "preserve_unmanaged_target");
+
+    fixture
+        .command()
+        .args(["push", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "would add target: project_doc_max_bytes",
+        ))
+        .stdout(predicate::str::contains("target: <missing>"));
+}
+
+#[test]
+fn dry_run_reports_removed_fields() {
+    let fixture = Fixture::load("toml", "pull_removes_missing_target_field");
+    let original_source = fixture.read("source.toml");
+
+    fixture
+        .command()
+        .args(["pull", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "would remove source: project_doc_fallback_filenames",
+        ))
+        .stdout(predicate::str::contains("source: [\"AGENTS.md\"]"))
+        .stdout(predicate::str::contains("target: <missing>"));
+
+    assert_eq!(fixture.read("source.toml"), original_source);
+}
+
+#[test]
+fn status_lists_configured_targets() {
+    let fixture = Fixture::load("toml", "multiple_targets");
+
+    fixture
+        .command()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config:"))
+        .stdout(predicate::str::contains("codex ok toml"))
+        .stdout(predicate::str::contains("tooling ok toml"))
+        .stdout(predicate::str::contains("fields=1"));
+}
+
+#[test]
+fn status_can_select_one_target() {
+    let fixture = Fixture::load("toml", "multiple_targets");
+
+    fixture
+        .command()
+        .args(["status", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex ok toml"))
+        .stdout(predicate::str::contains("tooling").not());
+}
+
+#[test]
+fn status_warns_about_missing_files_without_failing() {
+    let fixture = Fixture::load("toml", "missing_target_bootstrap");
+
+    fixture
+        .command()
+        .args(["status", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex warn toml"))
+        .stdout(predicate::str::contains("warn: target file does not exist"));
+}
+
+#[test]
+fn status_reports_invalid_sync_path() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui..theme
+"#,
+    );
+    write_file(&dir.path().join("source.toml"), "");
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "invalid sync path 'tui..theme' in target 'codex'",
+        ));
+}
+
+#[test]
+fn status_reports_unsupported_format() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: yaml
+    source: source.yaml
+    target: target.yaml
+    sync:
+      - tui.theme
+"#,
+    );
+    write_file(&dir.path().join("source.yaml"), "");
+    write_file(&dir.path().join("target.yaml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "target 'codex' uses format 'yaml'",
+        ))
+        .stdout(predicate::str::contains("supported formats: toml"));
+}
+
+#[test]
+fn status_and_dry_run_warn_about_table_value_conflicts() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - settings.theme
+"#,
+    );
+    write_file(
+        &dir.path().join("source.toml"),
+        "[settings]\ntheme = \"dark\"\n",
+    );
+    write_file(&dir.path().join("target.toml"), "settings = \"plain\"\n");
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex warn toml"))
+        .stdout(predicate::str::contains(
+            "target path 'settings.theme' needs 'settings' to be a table",
+        ));
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "warn: target path 'settings.theme' needs 'settings' to be a table",
+        ))
+        .stdout(predicate::str::contains(
+            "would change target: settings.theme",
+        ))
+        .stdout(predicate::str::contains("target: \"plain\""));
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "warn: target path 'settings.theme' needs 'settings' to be a table",
+        ))
+        .stdout(predicate::str::contains("changed target: settings.theme"))
+        .stdout(predicate::str::contains("target: \"plain\""));
+}
+
+#[test]
+fn push_missing_source_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: missing.toml
+    target: target.toml
+    sync:
+      - project_doc_max_bytes
+"#,
+    );
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("source file does not exist"))
+        .stderr(predicate::str::contains(
+            "run pull/sync if you want to bootstrap it",
+        ));
+}
+
+#[test]
+fn pull_missing_target_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: missing.toml
+    sync:
+      - project_doc_max_bytes
+"#,
+    );
+    write_file(&dir.path().join("source.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["pull", "codex", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target file does not exist"))
+        .stderr(predicate::str::contains(
+            "run push/sync if you want to bootstrap it",
+        ));
 }
 
 #[test]
@@ -260,7 +495,7 @@ fn backup_creates_timestamped_copy_before_writing() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Update target: project_doc_max_bytes",
+            "changed target: project_doc_max_bytes",
         ));
 
     fixture.assert_file_eq("target.toml", "target.expected.toml");
