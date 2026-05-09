@@ -40,6 +40,15 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Check installer syntax
+        run: sh -n install.sh
+
+      - name: Smoke test installer help
+        run: sh install.sh --help
+
+      - name: Test installer
+        run: sh tests/install.sh
+
       - name: Smoke test dot-sync
         run: cargo run --quiet --bin dot-sync -- --help
 
