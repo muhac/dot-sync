@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod document;
 mod path;
+mod status;
 mod sync;
 
 use anyhow::Result;
@@ -9,6 +10,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 use crate::config::DotSyncConfig;
+use crate::status::run as run_status;
 use crate::sync::{Direction, SyncOptions, run as run_sync};
 
 pub fn run() -> Result<()> {
@@ -16,6 +18,7 @@ pub fn run() -> Result<()> {
     let loaded = DotSyncConfig::load_from_current_dir()?;
 
     match cli.command {
+        Command::Status { name } => run_status(&loaded, name.as_deref()),
         Command::Pull {
             name,
             dry_run,

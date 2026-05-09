@@ -6,13 +6,17 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::path::FieldPath;
 
+#[derive(Debug, Clone)]
+pub struct TableConflict {
+    pub path: String,
+    pub kind: String,
+}
+
 pub trait Document {
     fn get(&self, path: &FieldPath) -> Option<Item>;
     fn set(&mut self, path: &FieldPath, item: Item) -> Result<()>;
     fn clear(&mut self);
-    fn contains(&self, path: &FieldPath) -> bool {
-        self.get(path).is_some()
-    }
+    fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict>;
     fn to_string(&self) -> String;
 }
 
@@ -21,19 +25,27 @@ pub enum AnyDocument {
 }
 
 impl AnyDocument {
+    pub fn validate_format(format: &str) -> Result<()> {
+        match format {
+            "toml" => Ok(()),
+            "json" => bail!("format json is recognized but not implemented yet"),
+            other => bail!("unsupported format: {other}; supported formats: toml"),
+        }
+    }
+
     pub fn load(format: &str, path: &Path, allow_missing: bool) -> Result<Self> {
+        Self::validate_format(format)?;
         match format {
             "toml" => Ok(Self::Toml(TomlDocument::load(path, allow_missing)?)),
-            "json" => bail!("format json is not implemented yet"),
-            other => bail!("unsupported format: {other}"),
+            _ => unreachable!("format was validated"),
         }
     }
 
     pub fn empty(format: &str) -> Result<Self> {
+        Self::validate_format(format)?;
         match format {
             "toml" => Ok(Self::Toml(TomlDocument::empty())),
-            "json" => bail!("format json is not implemented yet"),
-            other => bail!("unsupported format: {other}"),
+            _ => unreachable!("format was validated"),
         }
     }
 }
@@ -54,6 +66,12 @@ impl Document for AnyDocument {
     fn clear(&mut self) {
         match self {
             Self::Toml(doc) => doc.clear(),
+        }
+    }
+
+    fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
+        match self {
+            Self::Toml(doc) => doc.table_conflict(path),
         }
     }
 
@@ -105,6 +123,10 @@ impl Document for TomlDocument {
         self.doc = DocumentMut::new();
     }
 
+    fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
+        table_conflict_in_table(self.doc.as_table(), path.segments())
+    }
+
     fn to_string(&self) -> String {
         self.doc.to_string()
     }
@@ -122,6 +144,30 @@ fn get_from_table_like<'a>(table: &'a dyn TableLike, segments: &[String]) -> Opt
     }
     let table = item.as_table_like()?;
     get_from_table_like(table, rest)
+}
+
+fn table_conflict_in_table(table: &Table, segments: &[String]) -> Option<TableConflict> {
+    table_conflict_in_table_like(table, segments)
+}
+
+fn table_conflict_in_table_like(
+    table: &dyn TableLike,
+    segments: &[String],
+) -> Option<TableConflict> {
+    let mut current = table;
+    let mut prefix = Vec::new();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        prefix.push(segment.clone());
+        let item = current.get(segment)?;
+        let Some(next) = item.as_table_like() else {
+            return Some(TableConflict {
+                path: prefix.join("."),
+                kind: item.type_name().to_string(),
+            });
+        };
+        current = next;
+    }
+    None
 }
 
 fn set_in_table(table: &mut Table, segments: &[String], item: Item) -> Result<()> {

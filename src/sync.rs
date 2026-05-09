@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
@@ -26,6 +26,8 @@ struct Change {
     path: String,
     destination: Destination,
     action: Action,
+    source_value: String,
+    target_value: String,
 }
 
 #[derive(Debug)]
@@ -36,8 +38,15 @@ enum Destination {
 
 #[derive(Debug)]
 enum Action {
-    Update,
+    Add,
+    Change,
     Remove,
+    Rewrite,
+}
+
+#[derive(Debug)]
+struct Warning {
+    message: String,
 }
 
 pub fn run(
@@ -70,18 +79,33 @@ fn select_targets<'a>(
 }
 
 fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions) -> Result<()> {
-    let mut source = AnyDocument::load(
-        &target.format,
-        &target.source,
+    AnyDocument::validate_format(&target.format).map_err(|error| {
+        anyhow!(
+            "target '{}' uses format '{}': {error}",
+            target.name,
+            target.format
+        )
+    })?;
+
+    let mut source = load_document_for_target(
+        target,
+        DocumentRole::Source,
+        direction,
         matches!(direction, Direction::Pull | Direction::Sync),
     )?;
-    let mut target_doc = AnyDocument::load(
-        &target.format,
-        &target.target,
+    let mut target_doc = load_document_for_target(
+        target,
+        DocumentRole::Target,
+        direction,
         matches!(direction, Direction::Push | Direction::Sync),
     )?;
 
-    let sync_paths = parse_paths(&target.sync)?;
+    let sync_paths = parse_paths(target)?;
+    let warnings = if options.dry_run {
+        detect_table_conflicts(&source, &target_doc, &sync_paths)
+    } else {
+        Vec::new()
+    };
 
     let changes = match direction {
         Direction::Pull => pull(&mut source, &target_doc, &sync_paths, &target.format)?,
@@ -89,7 +113,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
         Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths, &target.format)?,
     };
 
-    report_changes(target, direction, options, &changes);
+    report_changes(target, direction, options, &changes, &warnings);
     if options.dry_run || changes.is_empty() {
         return Ok(());
     }
@@ -111,6 +135,63 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DocumentRole {
+    Source,
+    Target,
+}
+
+impl DocumentRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Target => "target",
+        }
+    }
+
+    fn path(self, target: &TargetConfig) -> &Path {
+        match self {
+            Self::Source => &target.source,
+            Self::Target => &target.target,
+        }
+    }
+
+    fn bootstrap_hint(self) -> &'static str {
+        match self {
+            Self::Source => "create the source file, or run pull/sync if you want to bootstrap it",
+            Self::Target => "create the target file, or run push/sync if you want to bootstrap it",
+        }
+    }
+}
+
+fn load_document_for_target(
+    target: &TargetConfig,
+    role: DocumentRole,
+    direction: Direction,
+    allow_missing: bool,
+) -> Result<AnyDocument> {
+    let path = role.path(target);
+    if !path.exists() && !allow_missing {
+        bail!(
+            "target '{}' cannot {:?}: {} file does not exist: {}\n  fix: {}",
+            target.name,
+            direction,
+            role.label(),
+            path.display(),
+            role.bootstrap_hint()
+        );
+    }
+
+    AnyDocument::load(&target.format, path, allow_missing).with_context(|| {
+        format!(
+            "failed to load {} file for target '{}': {}",
+            role.label(),
+            target.name,
+            path.display()
+        )
+    })
+}
+
 fn pull(
     source: &mut dyn Document,
     target: &dyn Document,
@@ -124,25 +205,38 @@ fn pull(
         let Some(target_item) = canonical_source.get(&path.path) else {
             continue;
         };
+        let source_item = source.get(&path.path);
         if source
             .get(&path.path)
             .is_some_and(|source_item| same_item(&source_item, &target_item))
         {
             continue;
         }
+        let action = if source_item.is_some() {
+            Action::Change
+        } else {
+            Action::Add
+        };
+        let source_value = summarize_item(source_item.as_ref());
+        let target_value = summarize_item(Some(&target_item));
         source.set(&path.path, target_item)?;
         changes.push(Change {
             path: path.raw.clone(),
             destination: Destination::Source,
-            action: Action::Update,
+            action,
+            source_value,
+            target_value,
         });
     }
     for path in paths {
-        if canonical_source.get(&path.path).is_none() && source.contains(&path.path) {
+        let source_item = source.get(&path.path);
+        if canonical_source.get(&path.path).is_none() && source_item.is_some() {
             changes.push(Change {
                 path: path.raw.clone(),
                 destination: Destination::Source,
                 action: Action::Remove,
+                source_value: summarize_item(source_item.as_ref()),
+                target_value: summarize_item(None),
             });
         }
     }
@@ -154,7 +248,9 @@ fn pull(
         changes.push(Change {
             path: "canonical source order".to_string(),
             destination: Destination::Source,
-            action: Action::Update,
+            action: Action::Rewrite,
+            source_value: String::new(),
+            target_value: String::new(),
         });
     }
     replace_with_canonical_source(source, canonical_source, paths)?;
@@ -171,17 +267,27 @@ fn push(
         let Some(source_item) = source.get(&path.path) else {
             continue;
         };
+        let target_item = target.get(&path.path);
         if target
             .get(&path.path)
             .is_some_and(|target_item| same_item(&target_item, &source_item))
         {
             continue;
         }
+        let action = if target_item.is_some() {
+            Action::Change
+        } else {
+            Action::Add
+        };
+        let source_value = summarize_item(Some(&source_item));
+        let target_value = summarize_item(target_item.as_ref());
         target.set(&path.path, source_item)?;
         changes.push(Change {
             path: path.raw.clone(),
             destination: Destination::Target,
-            action: Action::Update,
+            action,
+            source_value,
+            target_value,
         });
     }
     Ok(changes)
@@ -208,21 +314,31 @@ fn sync(
                 .as_ref()
                 .is_none_or(|source_item| !same_item(source_item, canonical_item))
         }) {
+            let action = if source_item.is_some() {
+                Action::Change
+            } else {
+                Action::Add
+            };
             changes.push(Change {
                 path: path.raw.clone(),
                 destination: Destination::Source,
-                action: Action::Update,
+                action,
+                source_value: summarize_item(source_item.as_ref()),
+                target_value: summarize_item(canonical_item.as_ref()),
             });
         }
 
         if target_item.is_none()
             && let Some(source_item) = source_item
         {
+            let source_value = summarize_item(Some(&source_item));
             target.set(&path.path, source_item)?;
             changes.push(Change {
                 path: path.raw.clone(),
                 destination: Destination::Target,
-                action: Action::Update,
+                action: Action::Add,
+                source_value,
+                target_value: summarize_item(None),
             });
         }
     }
@@ -234,7 +350,9 @@ fn sync(
         changes.push(Change {
             path: "canonical source order".to_string(),
             destination: Destination::Source,
-            action: Action::Update,
+            action: Action::Rewrite,
+            source_value: String::new(),
+            target_value: String::new(),
         });
     }
     replace_with_canonical_source(source, canonical_source, paths)?;
@@ -278,13 +396,21 @@ struct ParsedPath {
     path: FieldPath,
 }
 
-fn parse_paths(raw_paths: &[String]) -> Result<Vec<ParsedPath>> {
-    raw_paths
+fn parse_paths(target: &TargetConfig) -> Result<Vec<ParsedPath>> {
+    target
+        .sync
         .iter()
         .map(|raw| {
+            let path = FieldPath::parse(raw).map_err(|error| {
+                anyhow!(
+                    "invalid sync path '{}' in target '{}': {error}; quote path segments that contain dots, for example plugins.\"github@openai-curated\".enabled",
+                    raw,
+                    target.name
+                )
+            })?;
             Ok(ParsedPath {
                 raw: raw.clone(),
-                path: FieldPath::parse(raw)?,
+                path,
             })
         })
         .collect()
@@ -294,14 +420,72 @@ fn same_item(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
     left.to_string() == right.to_string()
 }
 
+fn detect_table_conflicts(
+    source: &dyn Document,
+    target: &dyn Document,
+    paths: &[ParsedPath],
+) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+    for path in paths {
+        if let Some(conflict) = source.table_conflict(&path.path) {
+            warnings.push(Warning {
+                message: format!(
+                    "source path '{}' needs '{}' to be a table, but it is {}",
+                    path.raw, conflict.path, conflict.kind
+                ),
+            });
+        }
+        if let Some(conflict) = target.table_conflict(&path.path) {
+            warnings.push(Warning {
+                message: format!(
+                    "target path '{}' needs '{}' to be a table, but it is {}",
+                    path.raw, conflict.path, conflict.kind
+                ),
+            });
+        }
+    }
+    warnings
+}
+
+fn summarize_item(item: Option<&toml_edit::Item>) -> String {
+    let Some(item) = item else {
+        return "<missing>".to_string();
+    };
+
+    let mut rendered = item
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rendered.is_empty() {
+        rendered = item.type_name().to_string();
+    }
+    const LIMIT: usize = 120;
+    if rendered.chars().count() > LIMIT {
+        let mut truncated = rendered.chars().take(LIMIT - 3).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        rendered
+    }
+}
+
 fn report_changes(
     target: &TargetConfig,
     direction: Direction,
     options: SyncOptions,
     changes: &[Change],
+    warnings: &[Warning],
 ) {
     let mode = if options.dry_run { "dry-run" } else { "apply" };
     println!("{} {:?} {}", target.name, direction, mode);
+    if options.dry_run {
+        println!("  dry run: no files written");
+    }
+
+    for warning in warnings {
+        println!("  warn: {}", warning.message);
+    }
 
     if changes.is_empty() {
         println!("  No changes.");
@@ -313,13 +497,22 @@ fn report_changes(
             Destination::Source => "source",
             Destination::Target => "target",
         };
-        let prefix = match (options.dry_run, &change.action) {
-            (true, Action::Update) => "Would update",
-            (true, Action::Remove) => "Would remove",
-            (false, Action::Update) => "Update",
-            (false, Action::Remove) => "Remove",
+        let (present, past) = match change.action {
+            Action::Add => ("add", "added"),
+            Action::Change => ("change", "changed"),
+            Action::Remove => ("remove", "removed"),
+            Action::Rewrite => ("rewrite", "rewritten"),
         };
-        println!("  {prefix} {destination}: {}", change.path);
+        let label = if options.dry_run {
+            format!("would {present}")
+        } else {
+            past.to_string()
+        };
+        println!("  {label} {destination}: {}", change.path);
+        if !matches!(change.action, Action::Rewrite) {
+            println!("    source: {}", change.source_value);
+            println!("    target: {}", change.target_value);
+        }
     }
 }
 
