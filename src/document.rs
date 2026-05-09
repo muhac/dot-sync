@@ -10,6 +10,7 @@ use crate::path::FieldPath;
 pub struct TableConflict {
     pub path: String,
     pub kind: String,
+    pub value: String,
 }
 
 pub trait Document {
@@ -163,11 +164,31 @@ fn table_conflict_in_table_like(
             return Some(TableConflict {
                 path: prefix.join("."),
                 kind: item.type_name().to_string(),
+                value: summarize_toml_item(item),
             });
         };
         current = next;
     }
     None
+}
+
+fn summarize_toml_item(item: &Item) -> String {
+    let mut rendered = item
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rendered.is_empty() {
+        rendered = item.type_name().to_string();
+    }
+    const LIMIT: usize = 120;
+    if rendered.chars().count() > LIMIT {
+        let mut truncated = rendered.chars().take(LIMIT - 3).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        rendered
+    }
 }
 
 fn set_in_table(table: &mut Table, segments: &[String], item: Item) -> Result<()> {

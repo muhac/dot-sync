@@ -126,8 +126,8 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         })
         .collect::<Vec<_>>();
 
-    let source = inspect_document("source", target, &mut status);
-    let target_doc = inspect_document("target", target, &mut status);
+    let source = inspect_document(DocumentRole::Source, target, &mut status);
+    let target_doc = inspect_document(DocumentRole::Target, target, &mut status);
 
     for (raw, path) in parsed_paths {
         if let Some(doc) = source.as_ref()
@@ -151,21 +151,40 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
     status
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DocumentRole {
+    Source,
+    Target,
+}
+
+impl DocumentRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Target => "target",
+        }
+    }
+
+    fn path(self, target: &TargetConfig) -> &std::path::Path {
+        match self {
+            Self::Source => &target.source,
+            Self::Target => &target.target,
+        }
+    }
+}
+
 fn inspect_document(
-    role: &str,
+    role: DocumentRole,
     target: &TargetConfig,
     status: &mut TargetStatus,
 ) -> Option<AnyDocument> {
-    let path = if role == "source" {
-        &target.source
-    } else {
-        &target.target
-    };
+    let path = role.path(target);
+    let label = role.label();
 
     if !path.exists() {
         status
             .warnings
-            .push(format!("{role} file does not exist: {}", path.display()));
+            .push(format!("{label} file does not exist: {}", path.display()));
         return None;
     }
 
@@ -173,7 +192,7 @@ fn inspect_document(
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))
     {
         status.errors.push(format!(
-            "failed to inspect {role} file {}: {error:#}",
+            "failed to inspect {label} file {}: {error:#}",
             path.display()
         ));
         return None;
@@ -183,7 +202,7 @@ fn inspect_document(
         Ok(doc) => Some(doc),
         Err(error) => {
             status.errors.push(format!(
-                "failed to read {role} file {} for target '{}': {error:#}",
+                "failed to read {label} file {} for target '{}': {error:#}",
                 path.display(),
                 target.name
             ));

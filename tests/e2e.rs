@@ -416,7 +416,20 @@ fn status_and_dry_run_warn_about_table_value_conflicts() {
         .stdout(predicate::str::contains(
             "warn: target path 'settings.theme' needs 'settings' to be a table",
         ))
-        .stdout(predicate::str::contains("would add target: settings.theme"));
+        .stdout(predicate::str::contains(
+            "would change target: settings.theme",
+        ))
+        .stdout(predicate::str::contains("target: \"plain\""));
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "warn: target path 'settings.theme' needs 'settings' to be a table",
+        ))
+        .stdout(predicate::str::contains("changed target: settings.theme"))
+        .stdout(predicate::str::contains("target: \"plain\""));
 }
 
 #[test]

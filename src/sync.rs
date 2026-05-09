@@ -101,11 +101,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     )?;
 
     let sync_paths = parse_paths(target)?;
-    let warnings = if options.dry_run {
-        detect_table_conflicts(&source, &target_doc, &sync_paths)
-    } else {
-        Vec::new()
-    };
+    let warnings = detect_table_conflicts(&source, &target_doc, &sync_paths, direction);
 
     let changes = match direction {
         Direction::Pull => pull(&mut source, &target_doc, &sync_paths, &target.format)?,
@@ -206,18 +202,22 @@ fn pull(
             continue;
         };
         let source_item = source.get(&path.path);
-        if source
-            .get(&path.path)
-            .is_some_and(|source_item| same_item(&source_item, &target_item))
+        let source_conflict = source.table_conflict(&path.path);
+        if source_item
+            .as_ref()
+            .is_some_and(|source_item| same_item(source_item, &target_item))
         {
             continue;
         }
-        let action = if source_item.is_some() {
+        let action = if source_item.is_some() || source_conflict.is_some() {
             Action::Change
         } else {
             Action::Add
         };
-        let source_value = summarize_item(source_item.as_ref());
+        let source_value = source_conflict
+            .as_ref()
+            .map(|conflict| conflict.value.clone())
+            .unwrap_or_else(|| summarize_item(source_item.as_ref()));
         let target_value = summarize_item(Some(&target_item));
         source.set(&path.path, target_item)?;
         changes.push(Change {
@@ -268,19 +268,23 @@ fn push(
             continue;
         };
         let target_item = target.get(&path.path);
-        if target
-            .get(&path.path)
-            .is_some_and(|target_item| same_item(&target_item, &source_item))
+        let target_conflict = target.table_conflict(&path.path);
+        if target_item
+            .as_ref()
+            .is_some_and(|target_item| same_item(target_item, &source_item))
         {
             continue;
         }
-        let action = if target_item.is_some() {
+        let action = if target_item.is_some() || target_conflict.is_some() {
             Action::Change
         } else {
             Action::Add
         };
         let source_value = summarize_item(Some(&source_item));
-        let target_value = summarize_item(target_item.as_ref());
+        let target_value = target_conflict
+            .as_ref()
+            .map(|conflict| conflict.value.clone())
+            .unwrap_or_else(|| summarize_item(target_item.as_ref()));
         target.set(&path.path, source_item)?;
         changes.push(Change {
             path: path.raw.clone(),
@@ -308,13 +312,15 @@ fn sync(
         let target_item = target.get(&path.path);
         let source_item = source.get(&path.path);
         let canonical_item = canonical_source.get(&path.path);
+        let source_conflict = source.table_conflict(&path.path);
+        let target_conflict = target.table_conflict(&path.path);
 
         if canonical_item.as_ref().is_some_and(|canonical_item| {
             source_item
                 .as_ref()
                 .is_none_or(|source_item| !same_item(source_item, canonical_item))
         }) {
-            let action = if source_item.is_some() {
+            let action = if source_item.is_some() || source_conflict.is_some() {
                 Action::Change
             } else {
                 Action::Add
@@ -323,12 +329,15 @@ fn sync(
                 path: path.raw.clone(),
                 destination: Destination::Source,
                 action,
-                source_value: summarize_item(source_item.as_ref()),
+                source_value: source_conflict
+                    .as_ref()
+                    .map(|conflict| conflict.value.clone())
+                    .unwrap_or_else(|| summarize_item(source_item.as_ref())),
                 target_value: summarize_item(canonical_item.as_ref()),
             });
         }
 
-        if target_item.is_none()
+        if (target_item.is_none() || target_conflict.is_some())
             && let Some(source_item) = source_item
         {
             let source_value = summarize_item(Some(&source_item));
@@ -336,9 +345,16 @@ fn sync(
             changes.push(Change {
                 path: path.raw.clone(),
                 destination: Destination::Target,
-                action: Action::Add,
+                action: if target_conflict.is_some() {
+                    Action::Change
+                } else {
+                    Action::Add
+                },
                 source_value,
-                target_value: summarize_item(None),
+                target_value: target_conflict
+                    .as_ref()
+                    .map(|conflict| conflict.value.clone())
+                    .unwrap_or_else(|| summarize_item(None)),
             });
         }
     }
@@ -424,21 +440,26 @@ fn detect_table_conflicts(
     source: &dyn Document,
     target: &dyn Document,
     paths: &[ParsedPath],
+    direction: Direction,
 ) -> Vec<Warning> {
     let mut warnings = Vec::new();
     for path in paths {
-        if let Some(conflict) = source.table_conflict(&path.path) {
+        if matches!(direction, Direction::Pull | Direction::Sync)
+            && let Some(conflict) = source.table_conflict(&path.path)
+        {
             warnings.push(Warning {
                 message: format!(
-                    "source path '{}' needs '{}' to be a table, but it is {}",
+                    "source path '{}' needs '{}' to be a table, but it is {} and may be overwritten",
                     path.raw, conflict.path, conflict.kind
                 ),
             });
         }
-        if let Some(conflict) = target.table_conflict(&path.path) {
+        if matches!(direction, Direction::Push | Direction::Sync)
+            && let Some(conflict) = target.table_conflict(&path.path)
+        {
             warnings.push(Warning {
                 message: format!(
-                    "target path '{}' needs '{}' to be a table, but it is {}",
+                    "target path '{}' needs '{}' to be a table, but it is {} and may be overwritten",
                     path.raw, conflict.path, conflict.kind
                 ),
             });
