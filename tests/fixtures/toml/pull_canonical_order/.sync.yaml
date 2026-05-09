@@ -1,0 +1,9 @@
+targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+      - project_doc_max_bytes
+      - notice.hide_rate_limit_model_nudge

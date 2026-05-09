@@ -1,0 +1,11 @@
+model = "gpt-5.2"
+project_doc_max_bytes = 65536
+
+[projects."/secret"]
+trust_level = "trusted"
+
+[history]
+persistence = "save-all"
+
+[tui]
+theme = "monokai"

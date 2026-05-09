@@ -124,6 +124,9 @@ mod tests {
     fn load_from_path_reports_actual_path_without_parent() {
         let err = DotSyncConfig::load_from_path(Path::new("/")).unwrap_err();
 
-        assert!(err.to_string().contains("config path has no parent directory: /"));
+        assert!(
+            err.to_string()
+                .contains("config path has no parent directory: /")
+        );
     }
 }

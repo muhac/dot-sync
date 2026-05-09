@@ -1,0 +1,8 @@
+targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+      - project_doc_fallback_filenames

@@ -1,0 +1,3 @@
+project_doc_fallback_filenames = ["AGENTS.md"]
+[tui]
+theme = "target"

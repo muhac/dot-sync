@@ -21,6 +21,29 @@ Keep your environment consistent across machines, while preserving local paths, 
 
 ## Quick start
 
+Install the latest stable release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh
+```
+
+Install the nightly prerelease:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --nightly
+```
+
+Install a specific version or directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --dir ~/.local/bin
+```
+
+The installer always installs `dot-sync`. It installs the shorter `ds` alias
+only when that path is empty or already points to an existing `dot-sync`
+installation, so it will not overwrite an unrelated `ds` command.
+
 ```sh
 dot-sync sync  # or: ds sync
 ```

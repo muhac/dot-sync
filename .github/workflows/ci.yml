@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Check installer syntax
+        run: sh -n install.sh
+
+      - name: Smoke test installer help
+        run: sh install.sh --help
+
+      - name: Test installer
+        run: sh tests/install.sh
+
+      - name: Smoke test dot-sync
+        run: cargo run --quiet --bin dot-sync -- --help
+
+      - name: Smoke test ds
+        run: cargo run --quiet --bin ds -- --help

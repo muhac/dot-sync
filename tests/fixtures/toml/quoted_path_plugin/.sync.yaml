@@ -1,0 +1,7 @@
+targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - plugins."github@openai-curated".enabled

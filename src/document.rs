@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::path::FieldPath;

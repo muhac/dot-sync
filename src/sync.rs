@@ -215,15 +215,15 @@ fn sync(
             });
         }
 
-        if target_item.is_none() {
-            if let Some(source_item) = source_item {
-                target.set(&path.path, source_item)?;
-                changes.push(Change {
-                    path: path.raw.clone(),
-                    destination: Destination::Target,
-                    action: Action::Update,
-                });
-            }
+        if target_item.is_none()
+            && let Some(source_item) = source_item
+        {
+            target.set(&path.path, source_item)?;
+            changes.push(Change {
+                path: path.raw.clone(),
+                destination: Destination::Target,
+                action: Action::Update,
+            });
         }
     }
     if source_needs_canonical_rewrite

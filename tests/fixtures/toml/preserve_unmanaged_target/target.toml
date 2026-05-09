@@ -1,0 +1,7 @@
+model = "gpt-5.2"
+
+[projects."/secret"]
+trust_level = "trusted"
+
+[history]
+persistence = "save-all"
