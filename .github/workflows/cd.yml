@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish_nightly:
+        description: Publish this selected ref to the shared nightly prerelease
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -85,6 +91,7 @@ jobs:
 
   publish:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_nightly)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -130,7 +137,7 @@ jobs:
 
           release_tag="nightly"
           release_title="nightly"
-          release_notes="Nightly build from main at ${GITHUB_SHA}."
+          release_notes="Nightly build from ${GITHUB_REF_NAME} at ${GITHUB_SHA}."
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
