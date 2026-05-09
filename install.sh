@@ -152,7 +152,7 @@ else
 fi
 
 if [ -n "$checksum_cmd" ]; then
-  if ! grep " ${archive}\$" "${tmp_dir}/SHA256SUMS" > "${tmp_dir}/${archive}.sha256"; then
+  if ! grep "[ *]${archive}\$" "${tmp_dir}/SHA256SUMS" > "${tmp_dir}/${archive}.sha256"; then
     echo "error: checksum for ${archive} not found in SHA256SUMS" >&2
     exit 1
   fi

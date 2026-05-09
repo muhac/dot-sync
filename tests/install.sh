@@ -159,6 +159,13 @@ make_archive "nightly" "x86_64-apple-darwin"
   sha256sum dot-sync-*.tar.gz > SHA256SUMS
 )
 
+latest_archive="dot-sync-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+latest_checksum="$(sha256sum "${fixture_dir}/${latest_archive}")"
+latest_checksum="${latest_checksum%% *}"
+grep -v "$latest_archive" "${fixture_dir}/SHA256SUMS" > "${fixture_dir}/SHA256SUMS.new"
+printf '%s *%s\n' "$latest_checksum" "$latest_archive" >> "${fixture_dir}/SHA256SUMS.new"
+mv "${fixture_dir}/SHA256SUMS.new" "${fixture_dir}/SHA256SUMS"
+
 export FAKE_RELEASE_FIXTURE_DIR="$fixture_dir"
 
 run_install latest_linux
