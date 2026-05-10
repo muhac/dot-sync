@@ -174,6 +174,49 @@ dot-sync push
 dot-sync sync
 ```
 
+### Adding a target
+
+`dot-sync add <name>` creates a new target in `.sync.yaml` (bootstrapping
+the file if missing) or appends fields to an existing one.
+
+Non-interactive — full flag-driven, scriptable:
+
+```sh
+dot-sync add codex \
+  --format toml \
+  --source codex.sync.toml \
+  --target ~/.codex/config.toml \
+  --field tui.theme --field max_bytes
+```
+
+Format is inferred from the source / target extension when `--format`
+is omitted (`.toml` / `.json` / `.jsonc`). Append fields to an existing
+target with just `--field`:
+
+```sh
+dot-sync add codex --field tui.notification_condition
+```
+
+Interactive — drop the `--field` flags on a TTY and an interactive
+tree picker discovers fields from the source / target document:
+
+```sh
+dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
+# Tree picker opens.
+```
+
+Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space` toggle,
+`enter` confirm, `q` / `Esc` cancel. On containers, `space` cycles
+through `[ ]` (empty) → `[x]` (sync the whole subtree as one path) →
+`[*]` (sync each leaf individually) → `[ ]`. Manually toggling some
+leaves under a container shows `[~]` (mixed); pressing space on `[~]`
+resets the container.
+
+Pass `--dry-run` to preview the YAML write without modifying
+`.sync.yaml`. Note: editing `.sync.yaml` via `add` re-serializes the
+file via `serde_yaml_ng` and does not preserve user comments inside
+the YAML itself.
+
 All commands support `--dry-run` to show planned changes without writing either
 file. Pass `--backup` to also keep a persistent timestamped copy
 (`<file>.bak.<timestamp>`) next to the destination.
@@ -199,6 +242,30 @@ dot-sync sync codex --fail-on-conflict   # exit non-zero, write nothing, list co
 ```
 
 `pull` is always target-wins by definition; `push` is always source-wins.
+
+### Shell completions and man page
+
+The fastest path is the installer flag — it detects your shell and
+writes completion files to the standard user-owned directories:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --with-completions
+```
+
+That installs `dot-sync` plus completions for `bash` / `zsh` / `fish`
+and a man page at `~/.local/share/man/man1/dot-sync.1`. The installer
+prints any rc-file edits you still need to make (mostly just `zsh`).
+
+If you'd rather wire it up by hand, both come from hidden
+subcommands:
+
+```sh
+dot-sync completions bash       > ~/.local/share/bash-completion/completions/dot-sync
+dot-sync completions zsh        > ~/.zfunc/_dot-sync
+dot-sync completions fish       > ~/.config/fish/completions/dot-sync.fish
+dot-sync completions powershell > $PROFILE.dot-sync.ps1
+dot-sync man                    > ~/.local/share/man/man1/dot-sync.1
+```
 
 ## Recovering from a bad write
 

@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
+use crate::discovery::{FieldNode, FieldTree, detect_identifier_key};
 use crate::path::{FieldPath, ItemSelector, Segment, SelectorValue};
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,21 @@ pub trait Document: Sized {
     /// target format (TOML scalars in TOML syntax, JSON scalars in JSON
     /// syntax) so users reading the report can match it back to the file.
     fn summarize(item: Option<&Self::Item>) -> String;
+
+    /// Walk the document and produce a `FieldTree` describing every
+    /// selectable sync path. Used by the interactive `add` picker so
+    /// users can pick fields without knowing path syntax up front.
+    ///
+    /// Tree shape:
+    /// - Object keys become container nodes; their leaves are scalar
+    ///   children.
+    /// - Arrays of objects with a detectable identifier (`name` / `id` /
+    ///   `key` / `slug` priority) become a parent node containing a
+    ///   virtual `[name=*]` wildcard cluster plus one pinned-item
+    ///   container per concrete element.
+    /// - Arrays without a detectable identifier and arrays of scalars
+    ///   are skipped — the user has to write those paths manually.
+    fn discover_field_tree(&self) -> FieldTree;
 }
 
 /// Supported document formats. Adding a variant prompts the compiler to
@@ -217,6 +233,191 @@ impl Document for TomlDocument {
         )?;
         Ok(out)
     }
+
+    fn discover_field_tree(&self) -> FieldTree {
+        let mut roots = Vec::new();
+        toml_walk_table_for_discovery(self.doc.as_table(), &[], &mut roots);
+        FieldTree { roots }
+    }
+}
+
+// ----- TOML field-tree discovery -----
+//
+// Walks an `&dyn TableLike` recursively, producing FieldNodes per key.
+// Path tracking is via ancestors (a slice of Segments built up from the
+// root) so each emitted FieldPath is fully qualified.
+//
+// Arrays of objects with a detectable identifier produce a container
+// (the array key itself) plus a virtual `[name=*]` wildcard group and
+// one pinned-item container per concrete entry. Arrays without a
+// detectable identifier are skipped — the user has to write those
+// paths manually since we can't fabricate stable identity.
+
+fn toml_walk_table_for_discovery(
+    table: &dyn TableLike,
+    ancestors: &[Segment],
+    out: &mut Vec<FieldNode>,
+) {
+    for (key, item) in table.iter() {
+        let mut seg_ancestors = ancestors.to_vec();
+        seg_ancestors.push(Segment {
+            name: key.to_string(),
+            select: None,
+        });
+        let path = FieldPath::from_segments(seg_ancestors.clone());
+
+        if let Some(child_table) = item.as_table_like() {
+            // Plain object container — recurse for its keys.
+            let mut children = Vec::new();
+            toml_walk_table_for_discovery(child_table, &seg_ancestors, &mut children);
+            out.push(FieldNode::object(key, path, children));
+            continue;
+        }
+
+        match item {
+            Item::ArrayOfTables(arr) => {
+                let items: Vec<&Table> = arr.iter().collect();
+                if let Some(node) = toml_array_of_objects_node(
+                    key,
+                    &items
+                        .iter()
+                        .map(|t| *t as &dyn TableLike)
+                        .collect::<Vec<_>>(),
+                    &seg_ancestors,
+                ) {
+                    out.push(node);
+                }
+            }
+            Item::Value(Value::Array(arr)) => {
+                let inline_tables: Vec<&InlineTable> =
+                    arr.iter().filter_map(|v| v.as_inline_table()).collect();
+                if inline_tables.len() == arr.len() && !inline_tables.is_empty() {
+                    let as_table_like: Vec<&dyn TableLike> =
+                        inline_tables.iter().map(|t| *t as &dyn TableLike).collect();
+                    if let Some(node) =
+                        toml_array_of_objects_node(key, &as_table_like, &seg_ancestors)
+                    {
+                        out.push(node);
+                    }
+                }
+                // Arrays of scalars / mixed: skip — user writes manually.
+            }
+            _ => {
+                // Plain scalar leaf — value is whatever (string / int / bool / ...).
+                out.push(FieldNode::leaf(key, path));
+            }
+        }
+    }
+}
+
+/// Build a FieldNode for an array of objects. Returns `None` when no
+/// usable identifier exists across the items (silent skip — surface a
+/// hint to the user via picker output if useful later).
+fn toml_array_of_objects_node(
+    key: &str,
+    items: &[&dyn TableLike],
+    ancestors: &[Segment],
+) -> Option<FieldNode> {
+    let id_key = detect_identifier_key(items.len(), |i, k| {
+        items[i]
+            .get(k)
+            .and_then(|item| item.as_value())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    })?;
+
+    // Wildcard cluster: virtual group with one leaf per shared scalar
+    // key across items (excluding the identifier itself, which is
+    // implicit in the wildcard's `[name=*]` form).
+    let mut wildcard_leaves = Vec::new();
+    let shared_leaf_keys = toml_shared_scalar_leaf_keys(items, &id_key);
+    for leaf_key in &shared_leaf_keys {
+        let mut wc_ancestors = ancestors.to_vec();
+        // Replace the trailing segment's select with Wildcard.
+        let last = wc_ancestors.last_mut().expect("array key on stack");
+        last.select = Some(ItemSelector::Wildcard {
+            key: id_key.clone(),
+        });
+        wc_ancestors.push(Segment {
+            name: leaf_key.clone(),
+            select: None,
+        });
+        let wc_path = FieldPath::from_segments(wc_ancestors);
+        wildcard_leaves.push(FieldNode::leaf(leaf_key, wc_path));
+    }
+    let wildcard_group = FieldNode::virtual_group(format!("[{id_key}=*]"), wildcard_leaves);
+
+    // Per-item pinned containers.
+    let mut pinned_items = Vec::new();
+    for item in items {
+        let id_value = item
+            .get(&id_key)
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let Some(id_value) = id_value else { continue };
+
+        let mut pin_ancestors = ancestors.to_vec();
+        let last = pin_ancestors.last_mut().expect("array key on stack");
+        last.select = Some(ItemSelector::Pinned {
+            key: id_key.clone(),
+            value: SelectorValue::String(id_value.clone()),
+        });
+        let pin_path = FieldPath::from_segments(pin_ancestors.clone());
+
+        let mut item_children = Vec::new();
+        toml_walk_table_for_discovery(*item, &pin_ancestors, &mut item_children);
+
+        pinned_items.push(FieldNode::pinned_item(
+            format!("[{id_key}=\"{id_value}\"]"),
+            pin_path,
+            item_children,
+        ));
+    }
+
+    let mut children = Vec::new();
+    children.push(wildcard_group);
+    children.extend(pinned_items);
+
+    // The array key itself gets a "whole array sync" path (path =
+    // ancestors as-is, no selector). It's a container with the wildcard
+    // group + per-item children.
+    let array_path = FieldPath::from_segments(ancestors.to_vec());
+    Some(FieldNode::object(key, array_path, children))
+}
+
+/// Collect scalar leaf keys (string / int / bool / float / etc.) that
+/// appear in *every* item, excluding the identifier key itself. These
+/// are the keys the wildcard `[name=*].leaf` form can address.
+fn toml_shared_scalar_leaf_keys(items: &[&dyn TableLike], id_key: &str) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut common: Option<Vec<String>> = None;
+    for item in items {
+        let mut keys: Vec<String> = item
+            .iter()
+            .filter_map(|(k, v)| {
+                if k == id_key {
+                    return None;
+                }
+                let is_scalar = v.as_value().is_some_and(|val| {
+                    val.as_str().is_some()
+                        || val.as_integer().is_some()
+                        || val.as_bool().is_some()
+                        || val.as_float().is_some()
+                        || val.as_datetime().is_some()
+                });
+                if is_scalar { Some(k.to_string()) } else { None }
+            })
+            .collect();
+        keys.sort();
+        common = Some(match common {
+            None => keys,
+            Some(prev) => prev.into_iter().filter(|k| keys.contains(k)).collect(),
+        });
+    }
+    common.unwrap_or_default()
 }
 
 // ----- shared helpers -----
@@ -855,6 +1056,184 @@ impl Document for JsonDocument {
         )?;
         Ok(out)
     }
+
+    fn discover_field_tree(&self) -> FieldTree {
+        let mut roots = Vec::new();
+        let root_obj = self
+            .root
+            .object_value()
+            .expect("JsonDocument root is always an object");
+        json_walk_object_for_discovery(&root_obj, &[], &mut roots);
+        FieldTree { roots }
+    }
+}
+
+// ----- JSON field-tree discovery -----
+
+fn json_walk_object_for_discovery(
+    obj: &CstObject,
+    ancestors: &[Segment],
+    out: &mut Vec<FieldNode>,
+) {
+    for prop in obj.properties() {
+        let Some(name_node) = prop.name() else {
+            continue;
+        };
+        let key = if let Some(sl) = name_node.as_string_lit() {
+            match sl.decoded_value() {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        } else if let Some(wl) = name_node.as_word_lit() {
+            wl.to_string()
+        } else {
+            continue;
+        };
+
+        let Some(val_node) = prop.value() else {
+            continue;
+        };
+
+        let mut seg_ancestors = ancestors.to_vec();
+        seg_ancestors.push(Segment {
+            name: key.clone(),
+            select: None,
+        });
+        let path = FieldPath::from_segments(seg_ancestors.clone());
+
+        if let Some(child_obj) = val_node.as_object() {
+            let mut children = Vec::new();
+            json_walk_object_for_discovery(&child_obj, &seg_ancestors, &mut children);
+            out.push(FieldNode::object(key, path, children));
+            continue;
+        }
+
+        if let Some(arr) = val_node.as_array() {
+            // Filter to object elements only. `as_object()` returning
+            // `Some` is sufficient post jsonc-parser 0.32.4 — the
+            // phantom-string-lit bug that previously needed a separate
+            // pre-filter is fixed upstream.
+            let elements = arr.elements();
+            let item_objs: Vec<CstObject> =
+                elements.iter().filter_map(|el| el.as_object()).collect();
+            if !item_objs.is_empty()
+                && item_objs.len() == elements.len()
+                && let Some(node) = json_array_of_objects_node(&key, &item_objs, &seg_ancestors)
+            {
+                out.push(node);
+            }
+            // Mixed / scalar / no-objects arrays: skip.
+            continue;
+        }
+
+        // Scalar (string / number / bool / null) — leaf.
+        out.push(FieldNode::leaf(key, path));
+    }
+}
+
+fn json_array_of_objects_node(
+    key: &str,
+    items: &[CstObject],
+    ancestors: &[Segment],
+) -> Option<FieldNode> {
+    let id_key = detect_identifier_key(items.len(), |i, k| {
+        items[i]
+            .get(k)
+            .and_then(|p| p.value())
+            .and_then(|v| v.as_string_lit())
+            .and_then(|sl| sl.decoded_value().ok())
+    })?;
+
+    // Wildcard cluster.
+    let mut wildcard_leaves = Vec::new();
+    let shared_leaf_keys = json_shared_scalar_leaf_keys(items, &id_key);
+    for leaf_key in &shared_leaf_keys {
+        let mut wc_ancestors = ancestors.to_vec();
+        let last = wc_ancestors.last_mut().expect("array key on stack");
+        last.select = Some(ItemSelector::Wildcard {
+            key: id_key.clone(),
+        });
+        wc_ancestors.push(Segment {
+            name: leaf_key.clone(),
+            select: None,
+        });
+        let wc_path = FieldPath::from_segments(wc_ancestors);
+        wildcard_leaves.push(FieldNode::leaf(leaf_key, wc_path));
+    }
+    let wildcard_group = FieldNode::virtual_group(format!("[{id_key}=*]"), wildcard_leaves);
+
+    // Per-item pinned containers.
+    let mut pinned_items = Vec::new();
+    for item in items {
+        let id_value = item
+            .get(&id_key)
+            .and_then(|p| p.value())
+            .and_then(|v| v.as_string_lit())
+            .and_then(|sl| sl.decoded_value().ok());
+        let Some(id_value) = id_value else { continue };
+
+        let mut pin_ancestors = ancestors.to_vec();
+        let last = pin_ancestors.last_mut().expect("array key on stack");
+        last.select = Some(ItemSelector::Pinned {
+            key: id_key.clone(),
+            value: SelectorValue::String(id_value.clone()),
+        });
+        let pin_path = FieldPath::from_segments(pin_ancestors.clone());
+
+        let mut item_children = Vec::new();
+        json_walk_object_for_discovery(item, &pin_ancestors, &mut item_children);
+
+        pinned_items.push(FieldNode::pinned_item(
+            format!("[{id_key}=\"{id_value}\"]"),
+            pin_path,
+            item_children,
+        ));
+    }
+
+    let mut children = Vec::new();
+    children.push(wildcard_group);
+    children.extend(pinned_items);
+
+    let array_path = FieldPath::from_segments(ancestors.to_vec());
+    Some(FieldNode::object(key, array_path, children))
+}
+
+fn json_shared_scalar_leaf_keys(items: &[CstObject], id_key: &str) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut common: Option<Vec<String>> = None;
+    for item in items {
+        let mut keys: Vec<String> = item
+            .properties()
+            .iter()
+            .filter_map(|prop| {
+                let name_node = prop.name()?;
+                let k = if let Some(sl) = name_node.as_string_lit() {
+                    sl.decoded_value().ok()?
+                } else if let Some(wl) = name_node.as_word_lit() {
+                    wl.to_string()
+                } else {
+                    return None;
+                };
+                if k == id_key {
+                    return None;
+                }
+                let val = prop.value()?;
+                let is_scalar = val.as_string_lit().is_some()
+                    || val.as_number_lit().is_some()
+                    || val.as_boolean_lit().is_some()
+                    || val.as_null_keyword().is_some();
+                if is_scalar { Some(k) } else { None }
+            })
+            .collect();
+        keys.sort();
+        common = Some(match common {
+            None => keys,
+            Some(prev) => prev.into_iter().filter(|k| keys.contains(k)).collect(),
+        });
+    }
+    common.unwrap_or_default()
 }
 
 // ----- JSON helpers -----
@@ -2575,5 +2954,231 @@ enabled = true
 
         let a = doc.get(&FieldPath::parse("a").unwrap()).expect("a present");
         assert_eq!(a, json!({"b": {"c": 1, "d": "x"}}));
+    }
+
+    // =================================================================
+    // Field-tree discovery tests
+    // =================================================================
+
+    use crate::discovery::FieldNodeKind;
+
+    #[test]
+    fn toml_discover_emits_leaves_and_object_containers() {
+        let doc = TomlDocument {
+            doc: r#"
+project_doc_max_bytes = 65536
+
+[tui]
+theme = "monokai"
+status_line = true
+"#
+            .parse()
+            .unwrap(),
+        };
+        let tree = doc.discover_field_tree();
+        let names: Vec<&str> = tree.roots.iter().map(|n| n.display.as_str()).collect();
+        assert!(names.contains(&"project_doc_max_bytes"));
+        assert!(names.contains(&"tui"));
+
+        let tui = tree.roots.iter().find(|n| n.display == "tui").unwrap();
+        assert_eq!(tui.kind, FieldNodeKind::Object);
+        let tui_keys: Vec<&str> = tui.children.iter().map(|c| c.display.as_str()).collect();
+        assert!(tui_keys.contains(&"theme"));
+        assert!(tui_keys.contains(&"status_line"));
+        let theme = tui.children.iter().find(|c| c.display == "theme").unwrap();
+        assert_eq!(theme.kind, FieldNodeKind::Leaf);
+        assert_eq!(theme.path.as_ref().unwrap().to_string(), "tui.theme");
+    }
+
+    #[test]
+    fn toml_discover_array_of_objects_creates_wildcard_and_pinned_groups() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+url = "https://api.github.com"
+
+[[mcp_servers]]
+name = "linear"
+enabled = false
+url = "https://linear.app"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let tree = doc.discover_field_tree();
+        let mcp = tree
+            .roots
+            .iter()
+            .find(|n| n.display == "mcp_servers")
+            .expect("mcp_servers present");
+        assert_eq!(mcp.kind, FieldNodeKind::Object);
+
+        // First child: wildcard virtual group.
+        let wildcard = &mcp.children[0];
+        assert_eq!(wildcard.display, "[name=*]");
+        assert_eq!(wildcard.kind, FieldNodeKind::VirtualGroup);
+        assert!(wildcard.path.is_none());
+        let wc_leaf_keys: Vec<&str> = wildcard
+            .children
+            .iter()
+            .map(|c| c.display.as_str())
+            .collect();
+        assert!(wc_leaf_keys.contains(&"enabled"));
+        assert!(wc_leaf_keys.contains(&"url"));
+        // Identifier key (`name`) excluded from the wildcard's leaves.
+        assert!(!wc_leaf_keys.contains(&"name"));
+
+        // Wildcard leaf paths use [name] form, not pinned.
+        let wc_enabled = wildcard
+            .children
+            .iter()
+            .find(|c| c.display == "enabled")
+            .unwrap();
+        assert_eq!(
+            wc_enabled.path.as_ref().unwrap().to_string(),
+            "mcp_servers[name].enabled"
+        );
+
+        // Per-item pinned containers follow.
+        let pinned_displays: Vec<&str> = mcp.children[1..]
+            .iter()
+            .map(|c| c.display.as_str())
+            .collect();
+        assert_eq!(
+            pinned_displays,
+            vec!["[name=\"github\"]", "[name=\"linear\"]"]
+        );
+        let github = mcp
+            .children
+            .iter()
+            .find(|c| c.display == "[name=\"github\"]")
+            .unwrap();
+        assert_eq!(github.kind, FieldNodeKind::PinnedArrayItem);
+        assert_eq!(
+            github.path.as_ref().unwrap().to_string(),
+            "mcp_servers[name=\"github\"]"
+        );
+        let github_enabled = github
+            .children
+            .iter()
+            .find(|c| c.display == "enabled")
+            .unwrap();
+        assert_eq!(
+            github_enabled.path.as_ref().unwrap().to_string(),
+            "mcp_servers[name=\"github\"].enabled"
+        );
+    }
+
+    #[test]
+    fn toml_discover_skips_array_with_no_detectable_identifier() {
+        // Two items both `name = "x"` — duplicates can't disambiguate.
+        let doc = TomlDocument {
+            doc: r#"
+[[items]]
+name = "x"
+
+[[items]]
+name = "x"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let tree = doc.discover_field_tree();
+        assert!(
+            tree.roots.iter().all(|n| n.display != "items"),
+            "items should be skipped: {:?}",
+            tree.roots.iter().map(|n| &n.display).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn json_discover_emits_leaves_and_object_containers() {
+        let doc = json_doc(
+            r#"{
+              "max_bytes": 65536,
+              "tui": {
+                "theme": "monokai",
+                "status_line": true
+              }
+            }"#,
+        );
+        let tree = doc.discover_field_tree();
+        let names: Vec<&str> = tree.roots.iter().map(|n| n.display.as_str()).collect();
+        assert!(names.contains(&"max_bytes"));
+        assert!(names.contains(&"tui"));
+
+        let tui = tree.roots.iter().find(|n| n.display == "tui").unwrap();
+        assert_eq!(tui.kind, FieldNodeKind::Object);
+        let theme = tui.children.iter().find(|c| c.display == "theme").unwrap();
+        assert_eq!(theme.path.as_ref().unwrap().to_string(), "tui.theme");
+    }
+
+    #[test]
+    fn json_discover_array_of_objects_creates_wildcard_and_pinned_groups() {
+        let doc = json_doc(
+            r#"{
+              "mcpServers": [
+                {"name": "github", "enabled": true, "url": "https://api.github.com"},
+                {"name": "linear", "enabled": false, "url": "https://linear.app"}
+              ]
+            }"#,
+        );
+        let tree = doc.discover_field_tree();
+        let mcp = tree
+            .roots
+            .iter()
+            .find(|n| n.display == "mcpServers")
+            .unwrap();
+        assert_eq!(mcp.kind, FieldNodeKind::Object);
+
+        let wildcard = &mcp.children[0];
+        assert_eq!(wildcard.display, "[name=*]");
+        assert_eq!(wildcard.kind, FieldNodeKind::VirtualGroup);
+        let wc_enabled = wildcard
+            .children
+            .iter()
+            .find(|c| c.display == "enabled")
+            .unwrap();
+        assert_eq!(
+            wc_enabled.path.as_ref().unwrap().to_string(),
+            "mcpServers[name].enabled"
+        );
+
+        let github = mcp
+            .children
+            .iter()
+            .find(|c| c.display == "[name=\"github\"]")
+            .unwrap();
+        let github_url = github.children.iter().find(|c| c.display == "url").unwrap();
+        assert_eq!(
+            github_url.path.as_ref().unwrap().to_string(),
+            "mcpServers[name=\"github\"].url"
+        );
+    }
+
+    #[test]
+    fn json_discover_skips_array_of_scalars() {
+        let doc = json_doc(r#"{"things": [1, 2, 3]}"#);
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.iter().all(|n| n.display != "things"));
+    }
+
+    #[test]
+    fn json_discover_returns_empty_tree_for_empty_object() {
+        // Empty document — no roots. Picker code special-cases an empty
+        // tree to "Confirmed(empty)" so the user sees a "no fields"
+        // message rather than an empty TUI.
+        let doc = JsonDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
+    }
+
+    #[test]
+    fn toml_discover_returns_empty_tree_for_empty_doc() {
+        let doc = TomlDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
     }
 }

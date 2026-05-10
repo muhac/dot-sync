@@ -15,8 +15,11 @@ path = "src/bin/ds.rs"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 dirs = "6"
 jsonc-parser = { version = "0.32.4", features = ["cst", "serde_json", "preserve_order"] }
+ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"

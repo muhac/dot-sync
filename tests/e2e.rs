@@ -1640,3 +1640,509 @@ fn jsonc_push_preserves_trailing_commas() {
         ));
     fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
 }
+
+// =====================================================================
+// `add` subcommand
+// =====================================================================
+
+#[test]
+fn add_bootstraps_sync_yaml_for_new_target() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.toml"),
+        "tui = { theme = \"monokai\" }\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target 'codex'"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("codex:"), "yaml: {yaml}");
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_infers_format_from_source_extension() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.json"), "{}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "agent",
+            "--source",
+            "source.json",
+            "--target",
+            "target.json",
+            "--field",
+            "feature.enabled",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: json"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_infers_jsonc_from_extension() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("settings.jsonc"), "{}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "vscode",
+            "--source",
+            "settings.jsonc",
+            "--target",
+            "settings.jsonc",
+            "--field",
+            "editor.tabSize",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: jsonc"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_errors_when_source_target_extensions_conflict() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add", "codex", "--source", "src.toml", "--target", "tgt.json", "--field", "x",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conflicting format extensions"));
+}
+
+#[test]
+fn add_appends_fields_to_existing_target_without_changing_format() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "max_bytes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 1 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+    assert!(yaml.contains("- max_bytes"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_dedupes_when_field_already_exists() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "tui.theme"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 0 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    let count = yaml.matches("- tui.theme").count();
+    assert_eq!(count, 1, "should not duplicate: {yaml}");
+}
+
+#[test]
+fn add_rejects_invalid_field_paths() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "src.toml",
+            "--target",
+            "tgt.toml",
+            "--field",
+            "tui..theme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid sync path 'tui..theme'"));
+}
+
+#[test]
+fn add_dry_run_does_not_write() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+    let original = read_file(&dir.path().join(".sync.yaml"));
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "src.toml",
+            "--target",
+            "tgt.toml",
+            "--field",
+            "tui.theme",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("- tui.theme"));
+
+    assert_eq!(read_file(&dir.path().join(".sync.yaml")), original);
+}
+
+#[test]
+fn add_non_tty_without_field_errors_with_actionable_message() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+    write_file(&dir.path().join("source.toml"), "tui = { theme = \"x\" }\n");
+
+    // assert_cmd runs the binary with non-TTY stdin/stdout, so the
+    // picker can't open. The command must surface a clear error.
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "interactive picker requires a TTY",
+        ));
+}
+
+#[test]
+fn add_then_push_uses_the_added_target() {
+    // End-to-end: bootstrap `.sync.yaml`, add a target, then push to
+    // verify the engine accepts what `add` wrote.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.toml"),
+        "max_bytes = 65536\n[tui]\ntheme = \"monokai\"\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+            "--field",
+            "max_bytes",
+        ])
+        .assert()
+        .success();
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: tui.theme"))
+        .stdout(predicate::str::contains("added target: max_bytes"));
+
+    let target = read_file(&dir.path().join("target.toml"));
+    assert!(target.contains("monokai"), "{target}");
+    assert!(target.contains("65536"), "{target}");
+}
+
+#[test]
+fn add_errors_when_new_target_missing_source() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--source is required"));
+}
+
+#[test]
+fn add_format_inferred_when_only_one_side_has_known_extension() {
+    // Source has a known extension; target doesn't (someone using a
+    // bare file name like `~/.codex/config`). The single recognized
+    // extension should still drive format inference.
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.toml"), "tui = { theme = \"x\" }\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--source",
+            "source.toml",
+            "--target",
+            "target", // no extension
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_dedupes_when_existing_leaf_path_overlaps_new_container_path() {
+    // Existing target syncs `tui.theme` (a single leaf). User now adds
+    // `tui` as a whole-subtree path. Both should end up in the list —
+    // they're different paths even though one covers the other at sync
+    // time. add() only dedupes by exact string match. Lock that
+    // behavior so a future "redundant path detection" feature has a
+    // baseline to compare against.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "tui"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 1 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+    assert!(yaml.contains("- tui\n"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_warns_when_existing_target_overrides_are_passed() {
+    // Existing target is `format: toml`. User passes --format json +
+    // new --source and --target trying to update them. add() ignores
+    // those overrides and warns; the user can re-run with a different
+    // target name if they actually wanted a fresh entry.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "json",
+            "--source",
+            "different.json",
+            "--field",
+            "max_bytes",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: target 'codex' already exists",
+        ))
+        .stderr(predicate::str::contains("--format"))
+        .stderr(predicate::str::contains("--source"));
+
+    // The existing format stays unchanged.
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+    assert!(!yaml.contains("format: json"), "yaml: {yaml}");
+    assert!(yaml.contains("source: source.toml"), "yaml: {yaml}");
+}
+
+// =====================================================================
+// Hidden completions / man subcommands + after_help blocks
+// =====================================================================
+
+#[test]
+fn completions_bash_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_dot-sync()"))
+        .stdout(predicate::str::contains("complete -F _dot-sync"));
+}
+
+#[test]
+fn completions_zsh_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#compdef dot-sync"));
+}
+
+#[test]
+fn completions_fish_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete "));
+}
+
+#[test]
+fn completions_powershell_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "powershell"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Register-ArgumentCompleter"));
+}
+
+#[test]
+fn completions_rejects_unknown_shell() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "tcsh"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value 'tcsh'"));
+}
+
+#[test]
+fn man_emits_roff_source_with_dot_sync_section() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .arg("man")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".TH dot-sync"))
+        .stdout(predicate::str::contains(".SH NAME"))
+        .stdout(predicate::str::contains("Sync selected fields"));
+}
+
+#[test]
+fn completions_and_man_hidden_from_main_help() {
+    // Both generation subcommands are `#[command(hide = true)]` so
+    // they don't clutter the main --help output. Surface them via
+    // README + the install.sh --with-completions flag instead.
+    let out = Command::cargo_bin("dot-sync")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let commands_section: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .take_while(|l| !l.starts_with("Options:"))
+        .collect();
+    let dump = commands_section.join("\n");
+    assert!(
+        !dump.contains("completions"),
+        "completions should be hidden from main help: {dump}"
+    );
+    assert!(
+        !dump.contains("man "),
+        "man should be hidden from main help: {dump}"
+    );
+}
+
+#[test]
+fn each_subcommand_help_shows_examples_block() {
+    // after_help blocks: each user-visible subcommand has an
+    // `Examples:` line in its own --help output.
+    for sub in ["status", "pull", "push", "sync", "restore", "add"] {
+        let out = Command::cargo_bin("dot-sync")
+            .unwrap()
+            .args([sub, "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("Examples:"),
+            "expected `Examples:` in `{sub} --help`:\n{stdout}"
+        );
+    }
+}

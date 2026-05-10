@@ -73,23 +73,109 @@ pub struct RestoreFlags {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Target name in .sync.yaml. New targets are created; existing
+    /// targets get fields appended.
+    pub name: String,
+
+    /// Format string written to .sync.yaml. Inferred from --source /
+    /// --target extension (.toml / .json / .jsonc) when omitted.
+    #[arg(long)]
+    pub format: Option<String>,
+
+    /// Path to the managed source fragment. Required for new targets;
+    /// optional when appending fields to an existing target.
+    #[arg(long)]
+    pub source: Option<String>,
+
+    /// Path to the real config file the application reads.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Sync path to add. Repeat to add multiple. When omitted and
+    /// stdin/stdout is a TTY, an interactive picker discovers fields
+    /// from the source or target file.
+    #[arg(long = "field")]
+    pub fields: Vec<String>,
+
+    /// Show what would be written to .sync.yaml without modifying it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show configuration and file health without syncing.
+    #[command(after_help = "\
+Examples:
+  dot-sync status                    # all targets
+  dot-sync status codex              # one target
+")]
     Status {
         /// Target name from .sync.yaml. Omit to inspect all targets.
         name: Option<String>,
     },
 
     /// Pull selected fields from target into source.
+    #[command(after_help = "\
+Examples:
+  dot-sync pull                      # all targets
+  dot-sync pull codex --dry-run      # preview without writing
+  dot-sync pull --backup             # keep persistent .bak.* copies
+")]
     Pull(#[command(flatten)] SyncFlags),
 
     /// Push selected fields from source into target.
+    #[command(after_help = "\
+Examples:
+  dot-sync push                      # all targets
+  dot-sync push codex --dry-run      # preview without writing
+  dot-sync push --backup             # keep persistent .bak.* copies
+")]
     Push(#[command(flatten)] SyncFlags),
 
     /// Reconcile selected fields between source and target in both directions.
+    #[command(after_help = "\
+Examples:
+  dot-sync sync codex                          # default --target-wins
+  dot-sync sync codex --source-wins            # source value wins on conflict
+  dot-sync sync --fail-on-conflict             # abort if any listed field differs
+")]
     Sync(#[command(flatten)] SyncCmdFlags),
 
     /// Restore a previous snapshot of source or target.
+    #[command(after_help = "\
+Examples:
+  dot-sync restore codex --list      # list candidates without restoring
+  dot-sync restore codex             # restore newest target snapshot
+  dot-sync restore codex --pick 2    # restore the second listed candidate
+  dot-sync restore codex --source    # restore the source side
+")]
     Restore(#[command(flatten)] RestoreFlags),
+
+    /// Add a sync target or fields to .sync.yaml. Bootstraps the file
+    /// if it doesn't exist. With --field, runs non-interactively;
+    /// without --field on a TTY, opens an interactive tree picker.
+    #[command(after_help = "\
+Examples:
+  dot-sync add codex --format toml --source codex.sync.toml --target ~/.codex/config.toml --field tui.theme
+  dot-sync add codex --field max_bytes --field tui.theme        # append to existing target
+  dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
+                                                                # interactive picker (TTY required)
+")]
+    Add(#[command(flatten)] AddArgs),
+
+    /// Print a shell completion script for `dot-sync` to stdout.
+    /// Hidden — surfaced via README rather than the main --help.
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the `dot-sync` man page (roff source) to stdout.
+    /// Hidden — surfaced via README rather than the main --help.
+    #[command(hide = true)]
+    Man,
 }
