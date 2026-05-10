@@ -231,6 +231,10 @@ fn build_tree(fmt: Format, source: &Path, target: &Path) -> Result<FieldTree> {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct YamlConfig {
+    /// Default to an empty map so partial configs (e.g. a file with only
+    /// `version: 1` and no `targets:` key yet) parse cleanly. The user
+    /// can always add targets via this very command.
+    #[serde(default)]
     targets: BTreeMap<String, RawTargetConfig>,
 }
 
