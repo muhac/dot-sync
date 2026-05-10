@@ -1171,18 +1171,24 @@ fn replace_pinned_target_with_object(
             json_type_name(&item)
         );
     };
-    // Build the replacement property list, ensuring the pinning key is
-    // present (callers transferring values across docs may not include it).
+    // Build the replacement property list, then *force* the pinning key
+    // to the selector's value. Just checking that the key name exists
+    // isn't enough: the replacement payload may carry the key with a
+    // different value (e.g. cross-doc transfer where the source has
+    // `name: "linear"` but the target path is `name="github"`). Without
+    // this, the replaced item silently stops matching its own selector,
+    // and the next sync pass appends a duplicate entry instead of finding
+    // it. Drop any existing entry under the pin key and prepend the
+    // canonical one.
     let mut props: Vec<(String, CstInputValue)> = map
         .iter()
+        .filter(|(k, _)| k.as_str() != pin_key)
         .map(|(k, v)| (k.clone(), value_to_cst_input(v)))
         .collect();
-    if !props.iter().any(|(k, _)| k == pin_key) {
-        props.insert(
-            0,
-            (pin_key.to_string(), selector_value_to_cst_input(pin_value)),
-        );
-    }
+    props.insert(
+        0,
+        (pin_key.to_string(), selector_value_to_cst_input(pin_value)),
+    );
     let target_clone = target.clone();
     target_clone.replace_with(CstInputValue::Object(props));
     Ok(())
@@ -2106,6 +2112,29 @@ enabled = true
         let port = doc.get(&port_path).unwrap();
         assert_eq!(port.as_i64(), Some(8080), "port should be JSON Number");
         assert!(port.is_number(), "port should not be stringified: {port:?}");
+    }
+
+    #[test]
+    fn json_pinned_leaf_set_forces_pin_key_to_selector_value() {
+        // Pinned-leaf write where the replacement payload carries the pin
+        // key with the *wrong* value (e.g. sourced from a doc that uses a
+        // different name for the same role). The matched item must still
+        // match the selector after the write — otherwise the next sync
+        // pass appends a duplicate instead of finding this entry.
+        let mut doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true, "url": "https://api.github.com"}]}"#,
+        );
+        let path = FieldPath::parse("mcpServers[name=\"github\"]").unwrap();
+        // Replacement object's `name` is wrong; force_pin_key must override.
+        doc.set(&path, json!({ "name": "linear", "enabled": false }))
+            .unwrap();
+
+        // The item still matches the original `name="github"` selector.
+        let enabled = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        assert_eq!(doc.get(&enabled).unwrap(), json!(false));
+        // And does NOT now match `name="linear"`.
+        let linear = FieldPath::parse("mcpServers[name=\"linear\"].enabled").unwrap();
+        assert!(doc.get(&linear).is_none());
     }
 
     #[test]
