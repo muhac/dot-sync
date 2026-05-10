@@ -138,6 +138,7 @@ pub trait Document: Sized {
 pub enum Format {
     Toml,
     Json,
+    GitConfig,
 }
 
 /// Parse the format string from `.sync.yaml` into the typed `Format` enum,
@@ -151,7 +152,10 @@ pub fn parse_format(format: &str) -> Result<Format> {
     match format {
         "toml" => Ok(Format::Toml),
         "json" | "jsonc" => Ok(Format::Json),
-        other => bail!("unsupported format: {other}; supported formats: toml, json, jsonc"),
+        "gitconfig" => Ok(Format::GitConfig),
+        other => {
+            bail!("unsupported format: {other}; supported formats: toml, json, jsonc, gitconfig")
+        }
     }
 }
 
@@ -1693,6 +1697,102 @@ fn json_expand_walk(
     Ok(())
 }
 
+// =====================================================================
+// GitConfigDocument
+// =====================================================================
+
+/// gitconfig backend, wrapping `gix_config::File`. The library handles
+/// format-preserving round-trip — comments, blank lines, tab/space
+/// indentation, and `[section "subsection"]` quoting all survive
+/// read-modify-write cycles. Multivar keys (multiple values for the
+/// same key, e.g. several `remote.origin.fetch =` lines) round-trip in
+/// memory, but dot-sync's surgical-sync model treats them as ambiguous
+/// — see `get`/`set` for the policy.
+///
+/// Path semantics on this backend differ from the structured TOML/JSON
+/// backends. A `FieldPath` of two segments addresses `section.key`; a
+/// path of three addresses `section.subsection.key`. Anything deeper
+/// is invalid because gitconfig has no nested objects under a key.
+/// Subsections containing characters that need escaping in dot-sync's
+/// path syntax (e.g. `[includeIf "gitdir:~/work/"]`) use the existing
+/// quoted-segment form: `includeIf."gitdir:~/work/".path`.
+pub struct GitConfigDocument {
+    file: gix_config::File<'static>,
+}
+
+impl GitConfigDocument {
+    pub fn empty() -> Self {
+        Self {
+            file: gix_config::File::new(gix_config::file::Metadata::default()),
+        }
+    }
+}
+
+impl Document for GitConfigDocument {
+    type Item = String;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self> {
+        if !path.exists() {
+            if allow_missing {
+                return Ok(Self::empty());
+            }
+            bail!("file does not exist: {}", path.display());
+        }
+        let file =
+            gix_config::File::from_path_no_includes(path.to_path_buf(), gix_config::Source::Local)
+                .with_context(|| format!("failed to parse gitconfig {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    fn get(&self, _path: &FieldPath) -> Option<String> {
+        unimplemented!("GitConfigDocument::get — wired in next commit")
+    }
+
+    fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
+        unimplemented!("GitConfigDocument::set — wired in next commit")
+    }
+
+    fn table_conflict(&self, _path: &FieldPath) -> Option<TableConflict> {
+        // gitconfig keys cannot contain nested values — a key is always
+        // a leaf scalar — so writing a value at any valid path can never
+        // clobber a "table" the way TOML/JSON can. Always None.
+        None
+    }
+
+    fn render(&self) -> String {
+        let bytes = self.file.to_bstring();
+        // gix_config preserves the original input bytes, which for
+        // pre-existing files keeps the trailing newline status the user
+        // had. For docs constructed via `empty()` + edits, the rendered
+        // output may lack a trailing newline; force one for POSIX
+        // cleanliness, matching the JSON backend.
+        let mut s = bytes.to_string();
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    }
+
+    fn items_equal(a: &String, b: &String) -> bool {
+        a == b
+    }
+
+    fn summarize(item: Option<&String>) -> String {
+        match item {
+            None => "<missing>".to_string(),
+            Some(v) => format!("\"{}\"", v),
+        }
+    }
+
+    fn expand(&self, _pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        unimplemented!("GitConfigDocument::expand — wired in next commit")
+    }
+
+    fn discover_field_tree(&self) -> FieldTree {
+        unimplemented!("GitConfigDocument::discover_field_tree — wired in a later commit")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use toml_edit::value;
@@ -1716,7 +1816,12 @@ mod tests {
     fn parse_format_rejects_unknown_names() {
         let err = parse_format("yaml").unwrap_err().to_string();
         assert!(err.contains("yaml"), "msg: {err}");
-        assert!(err.contains("toml, json, jsonc"), "msg: {err}");
+        assert!(err.contains("toml, json, jsonc, gitconfig"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_format_accepts_gitconfig() {
+        assert_eq!(parse_format("gitconfig").unwrap(), Format::GitConfig);
     }
 
     #[test]
@@ -3180,5 +3285,71 @@ name = "x"
         let doc = TomlDocument::empty();
         let tree = doc.discover_field_tree();
         assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
+    }
+}
+
+// =====================================================================
+// GitConfigDocument tests
+// =====================================================================
+
+#[cfg(test)]
+mod gitconfig_tests {
+    use super::{Document, GitConfigDocument};
+
+    fn write_fixture(content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loads_and_renders_unchanged_input_byte_for_byte() {
+        // gix-config preserves comments / blank lines / tab indentation /
+        // [section "subsection"] quoting on a no-op load → render. Keep
+        // this contract under test — the whole gitconfig backend depends
+        // on it.
+        let original = "\
+# top-level header
+
+[user]
+\tname = Alice
+\t# inline comment
+\temail = alice@example.com
+
+; semicolon comment
+[remote \"origin\"]
+\turl = https://example.com/foo
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+";
+        let dir = write_fixture(original);
+        let doc = GitConfigDocument::load(&dir.path().join("config"), false).unwrap();
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn empty_doc_renders_to_empty_string() {
+        let doc = GitConfigDocument::empty();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn allow_missing_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let doc = GitConfigDocument::load(&missing, true).unwrap();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn missing_without_allow_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let result = GitConfigDocument::load(&missing, false);
+        let err = match result {
+            Ok(_) => panic!("expected an error for missing file"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"));
     }
 }
