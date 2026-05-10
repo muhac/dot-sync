@@ -436,7 +436,19 @@ fn table_conflict_like(
             let matched = find_pinned_item(item, key, value)?;
             table_conflict_like(matched.as_table_like(), rest, prefix)
         }
-        Some(ItemSelector::Wildcard { .. }) => None,
+        Some(ItemSelector::Wildcard { .. }) => {
+            // Same array-shape check as Pinned. Per-item validation happens
+            // in `expand`; the conflict layer just flags "this can't be an
+            // array at all".
+            if !matches!(item, Item::ArrayOfTables(_) | Item::Value(Value::Array(_))) {
+                return Some(TableConflict {
+                    path: prefix.join("."),
+                    kind: item.type_name().to_string(),
+                    value: summarize_toml_item(item),
+                });
+            }
+            None
+        }
     }
 }
 
@@ -846,6 +858,78 @@ enabled = false
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
         let resolved = doc.expand(&pattern);
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn expand_combines_pinned_and_wildcard_segments() {
+        let doc = TomlDocument {
+            doc: r#"
+[[providers]]
+name = "openai"
+
+[[providers.models]]
+id = "gpt-4"
+enabled = true
+
+[[providers.models]]
+id = "gpt-5"
+enabled = false
+
+[[providers]]
+name = "anthropic"
+
+[[providers.models]]
+id = "opus"
+enabled = true
+"#
+            .parse()
+            .unwrap(),
+        };
+        // pinned then wildcard: only openai's models, but every model.
+        let pattern = FieldPath::parse("providers[name=\"openai\"].models[id].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern);
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec!["gpt-4".to_string()]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"openai\"].models[id=\"gpt-4\"].enabled"
+        );
+        assert_eq!(resolved[1].identity, vec!["gpt-5".to_string()]);
+    }
+
+    #[test]
+    fn pinned_set_then_get_works_through_nested_arrays() {
+        let mut doc = TomlDocument {
+            doc: r#"
+[[providers]]
+name = "openai"
+
+[[providers.models]]
+id = "gpt-4"
+enabled = false
+"#
+            .parse()
+            .unwrap(),
+        };
+        let path =
+            FieldPath::parse("providers[name=\"openai\"].models[id=\"gpt-4\"].enabled").unwrap();
+        doc.set(&path, value(true)).unwrap();
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn table_conflict_warns_when_wildcard_target_is_not_an_array() {
+        let doc = TomlDocument {
+            doc: r#"mcp_servers = "not an array""#.parse().unwrap(),
+        };
+        let path = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        let conflict = doc.table_conflict(&path).expect("expected conflict");
+        assert_eq!(conflict.path, "mcp_servers[name]");
+        assert!(conflict.value.contains("not an array"));
     }
 
     #[test]
