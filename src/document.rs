@@ -139,6 +139,7 @@ pub enum Format {
     Toml,
     Json,
     GitConfig,
+    Env,
 }
 
 /// Parse the format string from `.sync.yaml` into the typed `Format` enum,
@@ -153,9 +154,10 @@ pub fn parse_format(format: &str) -> Result<Format> {
         "toml" => Ok(Format::Toml),
         "json" | "jsonc" => Ok(Format::Json),
         "gitconfig" => Ok(Format::GitConfig),
-        other => {
-            bail!("unsupported format: {other}; supported formats: toml, json, jsonc, gitconfig")
-        }
+        "env" => Ok(Format::Env),
+        other => bail!(
+            "unsupported format: {other}; supported formats: toml, json, jsonc, gitconfig, env"
+        ),
     }
 }
 
@@ -2095,6 +2097,323 @@ fn leaf_path(parts: &[&str]) -> FieldPath {
     FieldPath::from_segments(segments)
 }
 
+// =====================================================================
+// EnvDocument
+// =====================================================================
+
+/// `.env` / `.envrc`-style backend. The format is flat (single-segment
+/// keys, no nesting), with three line kinds: blank, comment (`#`), and
+/// entry (`[export ]KEY=value` with optional double or single quoting).
+///
+/// dot-sync owns the parse/render layer for this backend because no
+/// round-trip-preserving Rust crate exists — every dotenv library
+/// available throws away trivia. The line-based CST below preserves
+/// the original bytes of unmodified entries verbatim (`raw` field on
+/// `EnvEntry`); only entries the engine actually writes through `set`
+/// get rebuilt, and even then the user's `export` prefix and quote
+/// style survive.
+///
+/// Supported value forms:
+/// - `KEY=value` — bare; trailing whitespace stripped on read.
+/// - `KEY="value"` — double-quoted; supports `\"` and `\\` escapes
+///   only (no `\n` / `\t` interpolation — values containing real
+///   newlines aren't supported).
+/// - `KEY='value'` — single-quoted; byte-literal, no escapes.
+/// - `export KEY=...` — `export` prefix preserved on round-trip.
+///
+/// Not supported (rejected at load):
+/// - Backslash-continued multi-line values.
+/// - Unclosed quotes.
+/// - Anything not matching `KEY=value` shape (shell expressions like
+///   `if`, function defs, `$(...)`). Variable interpolation `${OTHER}`
+///   inside values is accepted *as literal string* — dot-sync does not
+///   expand it.
+/// - Trailing `# comment` after a value (treated as part of the value
+///   bytes — bash itself does this for unquoted values).
+pub struct EnvDocument {
+    lines: Vec<EnvLine>,
+    /// `true` iff the original file ended with `\n`. Lets a no-op
+    /// load → render produce byte-identical output.
+    trailing_newline: bool,
+}
+
+#[derive(Debug, Clone)]
+enum EnvLine {
+    Blank,
+    /// Raw text of the comment line (no trailing `\n`).
+    Comment(String),
+    Entry(EnvEntry),
+}
+
+#[derive(Debug, Clone)]
+struct EnvEntry {
+    /// Original bytes of the line (no trailing newline). Re-emitted
+    /// verbatim when `modified == false` so trivia (spacing around
+    /// `=`, quote style nuances, trailing whitespace inside quotes,
+    /// etc.) round-trips.
+    raw: String,
+    export: bool,
+    key: String,
+    /// Unescaped, unquoted value as the engine sees it.
+    value: String,
+    quote: QuoteStyle,
+    modified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteStyle {
+    None,
+    Double,
+    Single,
+}
+
+impl EnvDocument {
+    pub fn empty() -> Self {
+        Self {
+            lines: Vec::new(),
+            trailing_newline: false,
+        }
+    }
+
+    fn parse(content: &str) -> Result<Self> {
+        let trailing_newline = content.ends_with('\n');
+        let mut lines = Vec::new();
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line_num = idx + 1;
+            let line = parse_env_line(raw_line)
+                .with_context(|| format!("env file line {line_num}: {raw_line:?}"))?;
+            lines.push(line);
+        }
+        Ok(Self {
+            lines,
+            trailing_newline,
+        })
+    }
+}
+
+fn parse_env_line(raw: &str) -> Result<EnvLine> {
+    let trimmed = raw.trim_start();
+    if trimmed.is_empty() {
+        return Ok(EnvLine::Blank);
+    }
+    if trimmed.starts_with('#') {
+        return Ok(EnvLine::Comment(raw.to_string()));
+    }
+    parse_env_entry(raw).map(EnvLine::Entry)
+}
+
+fn parse_env_entry(raw: &str) -> Result<EnvEntry> {
+    let leading_trimmed = raw.trim_start();
+    let (export, body) = if let Some(rest) = leading_trimmed.strip_prefix("export ") {
+        (true, rest.trim_start())
+    } else {
+        (false, leading_trimmed)
+    };
+
+    let eq_pos = body
+        .find('=')
+        .ok_or_else(|| anyhow::anyhow!("missing `=` separator (expected `KEY=value`)"))?;
+    let key = body[..eq_pos].trim_end().to_string();
+    let value_part = body[eq_pos + 1..].trim_start();
+
+    if !is_valid_env_key(&key) {
+        bail!(
+            "invalid env key {key:?} \
+             (POSIX requires [A-Za-z_][A-Za-z0-9_]*)"
+        );
+    }
+
+    let (value, quote) = parse_env_value(value_part)?;
+    Ok(EnvEntry {
+        raw: raw.to_string(),
+        export,
+        key,
+        value,
+        quote,
+        modified: false,
+    })
+}
+
+fn parse_env_value(input: &str) -> Result<(String, QuoteStyle)> {
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut value = String::new();
+        let mut chars = rest.chars();
+        loop {
+            match chars.next() {
+                None => bail!("unclosed double-quoted value"),
+                Some('"') => {
+                    let after: String = chars.collect();
+                    if !after.trim().is_empty() {
+                        bail!("trailing content after closing double quote: {after:?}");
+                    }
+                    return Ok((value, QuoteStyle::Double));
+                }
+                // Only `\"` and `\\` are interpreted; other backslashes
+                // pass through literally. `\n` etc. are *not* expanded
+                // — values containing real newlines are unsupported
+                // (multi-line values are rejected at load).
+                Some('\\') => match chars.next() {
+                    Some('"') => value.push('"'),
+                    Some('\\') => value.push('\\'),
+                    Some(other) => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                    None => bail!("dangling backslash in double-quoted value"),
+                },
+                Some(c) => value.push(c),
+            }
+        }
+    }
+    if let Some(rest) = input.strip_prefix('\'') {
+        // POSIX single quotes: byte-literal, no escapes possible.
+        let end = rest
+            .find('\'')
+            .ok_or_else(|| anyhow::anyhow!("unclosed single-quoted value"))?;
+        let value = &rest[..end];
+        let after = &rest[end + 1..];
+        if !after.trim().is_empty() {
+            bail!("trailing content after closing single quote: {after:?}");
+        }
+        return Ok((value.to_string(), QuoteStyle::Single));
+    }
+    // Bare value. Trailing whitespace is stripped (POSIX shell
+    // convention); a trailing `\` is treated as a continuation
+    // attempt and rejected.
+    let bare = input.trim_end();
+    if bare.ends_with('\\') {
+        bail!("backslash-continued multi-line values are not supported");
+    }
+    Ok((bare.to_string(), QuoteStyle::None))
+}
+
+fn is_valid_env_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+impl Document for EnvDocument {
+    type Item = String;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self> {
+        if !path.exists() {
+            if allow_missing {
+                return Ok(Self::empty());
+            }
+            bail!("file does not exist: {}", path.display());
+        }
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::parse(&content)
+            .with_context(|| format!("failed to parse env file {}", path.display()))
+    }
+
+    fn get(&self, _path: &FieldPath) -> Option<String> {
+        unimplemented!("EnvDocument::get — wired in next commit")
+    }
+
+    fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
+        unimplemented!("EnvDocument::set — wired in next commit")
+    }
+
+    fn table_conflict(&self, _path: &FieldPath) -> Option<TableConflict> {
+        // env is flat — no key can occupy a slot a nested write would clobber.
+        None
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            match line {
+                EnvLine::Blank => {}
+                EnvLine::Comment(s) => out.push_str(s),
+                EnvLine::Entry(e) => {
+                    if e.modified {
+                        render_entry(&mut out, e);
+                    } else {
+                        out.push_str(&e.raw);
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        // Drop the synthesized trailing newline if the original didn't
+        // have one — keeps no-op round-trip byte-stable.
+        if !self.trailing_newline && out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
+    fn items_equal(a: &String, b: &String) -> bool {
+        a == b
+    }
+
+    fn summarize(item: Option<&String>) -> String {
+        match item {
+            None => "<missing>".to_string(),
+            Some(v) => format!("\"{v}\""),
+        }
+    }
+
+    fn expand(&self, _pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        unimplemented!("EnvDocument::expand — wired in next commit")
+    }
+
+    fn discover_field_tree(&self) -> FieldTree {
+        unimplemented!("EnvDocument::discover_field_tree — wired in a later commit")
+    }
+}
+
+fn render_entry(out: &mut String, e: &EnvEntry) {
+    if e.export {
+        out.push_str("export ");
+    }
+    out.push_str(&e.key);
+    out.push('=');
+    match e.quote {
+        QuoteStyle::None => out.push_str(&e.value),
+        QuoteStyle::Double => {
+            out.push('"');
+            for c in e.value.chars() {
+                if c == '"' || c == '\\' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        }
+        QuoteStyle::Single => {
+            out.push('\'');
+            // Single-quoted values are byte-literal; if the value
+            // somehow contains a `'`, fall back to double-quoting so
+            // the file stays parseable. set() should have re-chosen
+            // an appropriate quote style before reaching here, so
+            // this branch is defensive only.
+            if e.value.contains('\'') {
+                out.pop(); // remove opening `'`
+                out.push('"');
+                for c in e.value.chars() {
+                    if c == '"' || c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            } else {
+                out.push_str(&e.value);
+                out.push('\'');
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use toml_edit::value;
@@ -2118,12 +2437,20 @@ mod tests {
     fn parse_format_rejects_unknown_names() {
         let err = parse_format("yaml").unwrap_err().to_string();
         assert!(err.contains("yaml"), "msg: {err}");
-        assert!(err.contains("toml, json, jsonc, gitconfig"), "msg: {err}");
+        assert!(
+            err.contains("toml, json, jsonc, gitconfig, env"),
+            "msg: {err}"
+        );
     }
 
     #[test]
     fn parse_format_accepts_gitconfig() {
         assert_eq!(parse_format("gitconfig").unwrap(), Format::GitConfig);
+    }
+
+    #[test]
+    fn parse_format_accepts_env() {
+        assert_eq!(parse_format("env").unwrap(), Format::Env);
     }
 
     #[test]
@@ -4503,5 +4830,113 @@ mod gitconfig_tests {
         let name_path = FieldPath::parse("user.name").unwrap();
         assert_eq!(doc.get(&name_path), Some("Alice".to_string()));
         assert_eq!(doc.get(&path), Some("new".to_string()));
+    }
+}
+
+// =====================================================================
+// EnvDocument tests
+// =====================================================================
+
+#[cfg(test)]
+mod env_tests {
+    use super::{Document, EnvDocument};
+
+    fn write_fixture(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn round_trips_trivia_byte_for_byte() {
+        // Locks the line-based CST's preservation contract: comments,
+        // blank lines, leading whitespace, export prefixes, all three
+        // quote styles, and the trailing-newline policy all round-trip
+        // through a no-op load → render.
+        let original = "\
+# top-level comment
+NODE_VERSION=22
+export DATABASE_URL=postgres://localhost/db
+
+  # indented comment
+MSG=\"hello world\"
+LITERAL='no $interpolation here'
+
+EMPTY=
+";
+        let (_dir, path) = write_fixture(original);
+        let doc = EnvDocument::load(&path, false).unwrap();
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn round_trips_file_without_trailing_newline() {
+        let original = "KEY=value";
+        let (_dir, path) = write_fixture(original);
+        let doc = EnvDocument::load(&path, false).unwrap();
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn empty_doc_renders_to_empty_string() {
+        let doc = EnvDocument::empty();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn allow_missing_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never");
+        let doc = EnvDocument::load(&missing, true).unwrap();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn missing_without_allow_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never");
+        let err = match EnvDocument::load(&missing, false) {
+            Ok(_) => panic!("expected error for missing file"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn rejects_line_without_equals() {
+        let (_dir, path) = write_fixture("KEY=ok\nthis is not a key=value\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(s.contains("invalid env key"), "msg: {s}");
+    }
+
+    #[test]
+    fn rejects_unclosed_double_quote() {
+        let (_dir, path) = write_fixture("KEY=\"unterminated\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("unclosed double-quoted value"),
+            "msg: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_backslash_continued_bare_value() {
+        let (_dir, path) = write_fixture("KEY=value\\\nNEXT=ok\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("backslash-continued"),
+            "msg: {err:#}"
+        );
     }
 }

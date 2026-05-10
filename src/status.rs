@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{DotSyncConfig, TargetConfig};
 use crate::document::{
-    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+    Document, EnvDocument, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
 };
 use crate::path::FieldPath;
 
@@ -120,6 +120,7 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         Format::Toml => inspect_target_typed::<TomlDocument>(target, &mut status),
         Format::Json => inspect_target_typed::<JsonDocument>(target, &mut status),
         Format::GitConfig => inspect_target_typed::<GitConfigDocument>(target, &mut status),
+        Format::Env => inspect_target_typed::<EnvDocument>(target, &mut status),
     }
 
     status

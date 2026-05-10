@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::AddArgs;
 use crate::discovery::FieldTree;
 use crate::document::{
-    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+    Document, EnvDocument, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
 };
 use crate::path::FieldPath;
 use crate::picker::{self, PickerOutcome};
@@ -250,6 +250,10 @@ fn build_tree(fmt: Format, source: &Path, target: &Path) -> Result<FieldTree> {
         }
         Format::GitConfig => {
             let doc = GitConfigDocument::load(chosen, false)?;
+            Ok(doc.discover_field_tree())
+        }
+        Format::Env => {
+            let doc = EnvDocument::load(chosen, false)?;
             Ok(doc.discover_field_tree())
         }
     }
