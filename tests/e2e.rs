@@ -530,6 +530,51 @@ fn malformed_config_exits_with_parse_error() {
 }
 
 #[test]
+fn write_emits_recovery_snapshot_for_existing_files() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let assert = fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"))
+        .stdout(predicate::str::contains("recovery:"));
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let snapshot_line = output
+        .lines()
+        .find(|line| line.contains("recovery:"))
+        .unwrap();
+    let snapshot_path = PathBuf::from(snapshot_line.split_once("recovery:").unwrap().1.trim());
+    assert!(
+        snapshot_path.starts_with(snap.path().join("dot-sync")),
+        "snapshot {snapshot_path:?} not under {:?}",
+        snap.path().join("dot-sync"),
+    );
+    assert!(snapshot_path.exists(), "snapshot file missing");
+}
+
+#[test]
+fn dry_run_does_not_emit_recovery_snapshot() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["push", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote ").not());
+
+    assert!(!snap.path().join("dot-sync").exists());
+}
+
+#[test]
 fn config_rejects_unknown_keys() {
     let dir = TempDir::new().unwrap();
     write_file(

@@ -131,14 +131,35 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
         .iter()
         .any(|change| matches!(change.destination, Destination::Target));
 
+    let snapshot_dir = std::env::temp_dir().join("dot-sync");
+
     if writes_source {
-        write_document(&target.source, source.render(), options.backup)?;
+        let outcome = write_document(
+            &target.source,
+            source.render(),
+            options.backup,
+            &snapshot_dir,
+        )?;
+        report_write(DocumentRole::Source, &target.source, &outcome);
     }
     if writes_target {
-        write_document(&target.target, target_doc.render(), options.backup)?;
+        let outcome = write_document(
+            &target.target,
+            target_doc.render(),
+            options.backup,
+            &snapshot_dir,
+        )?;
+        report_write(DocumentRole::Target, &target.target, &outcome);
     }
 
     Ok(())
+}
+
+fn report_write(role: DocumentRole, path: &Path, outcome: &WriteOutcome) {
+    println!("  wrote {}: {}", role.label(), path.display());
+    if let Some(snapshot) = &outcome.snapshot {
+        println!("    recovery: {}", snapshot.display());
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -424,7 +445,17 @@ fn report_changes(
     }
 }
 
-fn write_document(path: &Path, content: String, backup: bool) -> Result<()> {
+#[derive(Debug, Default)]
+struct WriteOutcome {
+    snapshot: Option<PathBuf>,
+}
+
+fn write_document(
+    path: &Path,
+    content: String,
+    backup: bool,
+    snapshot_dir: &Path,
+) -> Result<WriteOutcome> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -434,7 +465,49 @@ fn write_document(path: &Path, content: String, backup: bool) -> Result<()> {
         backup_file(path)?;
     }
 
-    atomic_write(path, &content)
+    let snapshot = snapshot_existing(path, snapshot_dir)?;
+    atomic_write(path, &content)?;
+    Ok(WriteOutcome { snapshot })
+}
+
+fn snapshot_existing(path: &Path, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::create_dir_all(snapshot_dir).with_context(|| {
+        format!(
+            "failed to create snapshot directory {}",
+            snapshot_dir.display()
+        )
+    })?;
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let stem = sanitize_for_filename(path);
+    let mut snapshot = snapshot_dir.join(format!("{stem}.{timestamp}"));
+    let mut index = 0;
+    while snapshot.exists() {
+        index += 1;
+        snapshot = snapshot_dir.join(format!("{stem}.{timestamp}.{index}"));
+    }
+    fs::copy(path, &snapshot).with_context(|| {
+        format!(
+            "failed to snapshot {} to {}",
+            path.display(),
+            snapshot.display()
+        )
+    })?;
+    Ok(Some(snapshot))
+}
+
+fn sanitize_for_filename(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let trimmed = raw.trim_start_matches(['/', '\\']);
+    trimmed
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            _ => c,
+        })
+        .collect()
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -805,10 +878,11 @@ tui_theme = "monokai"
     #[test]
     fn write_document_skips_backup_by_default() {
         let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "old = true\n").unwrap();
 
-        write_document(&path, "new = true\n".to_string(), false).unwrap();
+        write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
         let backups = fs::read_dir(dir.path())
@@ -822,10 +896,11 @@ tui_theme = "monokai"
     #[test]
     fn atomic_write_leaves_no_tmp_remnant_after_success() {
         let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "old = true\n").unwrap();
 
-        write_document(&path, "new = true\n".to_string(), false).unwrap();
+        write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
         let tmp_files: Vec<_> = fs::read_dir(dir.path())
@@ -839,10 +914,11 @@ tui_theme = "monokai"
     #[test]
     fn write_document_creates_backup_when_requested() {
         let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "old = true\n").unwrap();
 
-        write_document(&path, "new = true\n".to_string(), true).unwrap();
+        write_document(&path, "new = true\n".to_string(), true, snap.path()).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
         let backups = fs::read_dir(dir.path())
@@ -851,5 +927,33 @@ tui_theme = "monokai"
             .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn write_document_creates_recovery_snapshot_for_existing_file() {
+        let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old = true\n").unwrap();
+
+        let outcome =
+            write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
+
+        let snapshot_path = outcome.snapshot.expect("expected snapshot path");
+        assert_eq!(fs::read_to_string(&snapshot_path).unwrap(), "old = true\n");
+        assert!(snapshot_path.starts_with(snap.path()));
+    }
+
+    #[test]
+    fn write_document_skips_snapshot_for_new_file() {
+        let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
+        let path = dir.path().join("brand-new.toml");
+
+        let outcome =
+            write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
+
+        assert!(outcome.snapshot.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
     }
 }
