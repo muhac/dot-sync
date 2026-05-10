@@ -1,0 +1,13 @@
+{
+  "mcpServers": [
+    {
+      "name": "github",
+      "enabled": false,
+      "url": "https://api.github.com"
+    },
+    {
+      "name": "linear",
+      "enabled": false
+    }
+  ]
+}

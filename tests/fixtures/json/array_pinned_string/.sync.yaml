@@ -1,0 +1,7 @@
+targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - mcpServers[name="github"].enabled

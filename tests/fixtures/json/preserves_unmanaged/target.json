@@ -1,0 +1,7 @@
+{
+  "tui": {
+    "theme": "old",
+    "private": "keep"
+  },
+  "user_only": "keep"
+}

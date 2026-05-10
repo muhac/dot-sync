@@ -59,7 +59,12 @@ directory. Paths in `source` are resolved relative to that file. Paths in
 `target` may use `~` for the current user's home directory.
 
 **Supporting formats:**
-- **TOML** (Format-preserving via `toml_edit`)
+- **TOML** — format-preserving via `toml_edit` (whitespace, key order, comments).
+- **JSON** — key-order-preserving via `serde_json` with the `preserve_order`
+  feature. The renderer sniffs the source file's indent style (2-space,
+  4-space, tab, …) and reuses it; minified or empty inputs fall back to
+  2-space pretty-print. Always emits a trailing newline. Comments /
+  trailing commas / JSON5 / JSONC are not supported.
 
 ## Concepts
 
@@ -85,6 +90,15 @@ targets:
       - plugins."github@openai-curated".enabled
       - mcp_servers[name="github"].enabled    # specific item by key
       - mcp_servers[name].enabled              # all items, paired by key
+
+  claude:
+    format: json
+    source: claude.sync.json
+    target: ~/.claude/settings.json
+    sync:
+      - mcpServers[name="github"].enabled      # string identifier
+      - servers[port=8080].host                # integer identifier
+      - features[primary=true].host            # boolean identifier
 ```
 
 ### Path syntax
@@ -94,12 +108,16 @@ targets:
 | `tui.theme` | Plain object navigation. |
 | `plugins."github@openai-curated".enabled` | Quoted segment, for keys with `.` `[` or whitespace. |
 | `arr[name="github"].enabled` | Pin to the array item where `name == "github"`; sync just its `enabled` field. Stable across reorderings. |
+| `arr[port=8080].host` | Pinned with an integer literal; matches `port = 8080` only, never the string `"8080"`. |
+| `arr[primary=true].host` | Pinned with a boolean literal. |
 | `arr[name].enabled` | Wildcard: fan out across every item in `arr`, pairing source / target items by `name`. |
 
 Pinned and wildcard selectors:
 
-- The identifier value (`"github"`) is matched as a string. Numeric / boolean
-  identifiers are not yet supported.
+- Selector value types: `"quoted string"`, decimal integer (e.g. `8080`,
+  `-1`), or `true` / `false`. Floats are not supported. The literal's
+  syntax determines its type — comparison is **strict**, so `[k=8080]`
+  matches `k = 8080` only, and `[k="8080"]` matches `k = "8080"` only.
 - **Multi-match is an error.** Two array items sharing the same identifier
   value (e.g. two `mcp_servers` both named `github`) is treated as data
   corruption and the sync bails before any write — surgical sync requires
@@ -107,11 +125,29 @@ Pinned and wildcard selectors:
 - When the identifier matches an item that exists on one side but not the other,
   the missing side gets a new array entry seeded with the identifier — the
   "fill missing" rule from `pull`/`sync` extended to array members.
-- Writes go into TOML `[[arrays]]` form. Inline `arr = [{...}]` arrays are
-  read-only for now.
+- TOML writes go into `[[arrays]]` form; inline `arr = [{...}]` arrays are
+  read-only for now. JSON writes go into the single native array form.
 - Plain index syntax (`arr[0]`) is intentionally not supported — array
   positions shift when data changes, so index-based sync is destructive in
   the cases that matter most.
+
+### JSON specifics
+
+- **Null vs missing.** `{"key": null}` is a present field with the value
+  `null`; an absent key is "missing". `pull` / `push` / `sync` treat them
+  as different values, so an explicit `null` propagates instead of being
+  dropped. Use this to deliberately overwrite a target's value with `null`.
+- **Int vs float in selectors.** `[k=8080]` matches `"k": 8080` only —
+  not `"k": 8080.0`. `serde_json` distinguishes integer and float
+  representations, and selector matching follows that distinction. Floats
+  are not supported as selector values at all.
+- Object key order is preserved on parse and round-trip (`preserve_order`
+  feature of `serde_json`).
+- **Indent is preserved** by sniffing the first indented line of the source
+  file. 4-space, tab, or other consistent styles round-trip unchanged. A
+  minified or empty input falls back to 2-space pretty-print.
+- Other whitespace (blank lines between keys, alignment columns, etc) is
+  not preserved.
 
 ## Commands
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::path::{FieldPath, ItemSelector, Segment};
+use crate::path::{FieldPath, ItemSelector, Segment, SelectorValue};
 
 #[derive(Debug, Clone)]
 pub struct TableConflict {
@@ -18,9 +18,12 @@ pub struct TableConflict {
 /// `identity` carries the matched key values for each `Wildcard` segment in
 /// declaration order — engines compare identities across documents to pair
 /// items. `path` is the pattern with every `Wildcard` replaced by `Pinned`.
+///
+/// Identity uses `SelectorValue` so cross-side pairing is type-strict:
+/// a wildcard hit on `Int(8080)` never pairs with one on `String("8080")`.
 #[derive(Debug, Clone)]
 pub struct ResolvedPath {
-    pub identity: Vec<String>,
+    pub identity: Vec<SelectorValue>,
     pub path: FieldPath,
 }
 
@@ -118,6 +121,7 @@ pub trait Document: Sized {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Toml,
+    Json,
 }
 
 /// Parse the format string from `.sync.yaml` into the typed `Format` enum,
@@ -125,8 +129,8 @@ pub enum Format {
 pub fn parse_format(format: &str) -> Result<Format> {
     match format {
         "toml" => Ok(Format::Toml),
-        "json" => bail!("format json is recognized but not implemented yet"),
-        other => bail!("unsupported format: {other}; supported formats: toml"),
+        "json" => Ok(Format::Json),
+        other => bail!("unsupported format: {other}; supported formats: toml, json"),
     }
 }
 
@@ -231,14 +235,45 @@ fn summarize_toml_item(item: &Item) -> String {
     }
 }
 
-/// True when `table[key]` is a string equal to `value`. Used to identify a
-/// matching array item for a `[key="value"]` pinned selector.
-fn matches_pinned(table: &dyn TableLike, key: &str, value: &str) -> bool {
-    table
-        .get(key)
-        .and_then(|item| item.as_value())
-        .and_then(|v| v.as_str())
-        == Some(value)
+/// True when `table[key]` matches the typed pinned-selector value. Type-strict:
+/// `String` only matches `Value::String`, `Int` only `Value::Integer`, `Bool`
+/// only `Value::Boolean`. A path of `[k=8080]` never matches `k = "8080"`.
+fn matches_pinned(table: &dyn TableLike, key: &str, value: &SelectorValue) -> bool {
+    let Some(v) = table.get(key).and_then(|item| item.as_value()) else {
+        return false;
+    };
+    match value {
+        SelectorValue::String(s) => v.as_str() == Some(s.as_str()),
+        SelectorValue::Int(i) => v.as_integer() == Some(*i),
+        SelectorValue::Bool(b) => v.as_bool() == Some(*b),
+    }
+}
+
+/// Extract the wildcard-key value from `table[key]` as a `SelectorValue` if it
+/// is one of the supported scalar types. `None` if the field is absent or has
+/// an unsupported type (e.g. float, array, table) — those items are skipped
+/// during wildcard expansion just as untyped items used to be.
+fn item_selector_value(table: &dyn TableLike, key: &str) -> Option<SelectorValue> {
+    let v = table.get(key).and_then(|item| item.as_value())?;
+    if let Some(s) = v.as_str() {
+        Some(SelectorValue::String(s.to_string()))
+    } else if let Some(i) = v.as_integer() {
+        Some(SelectorValue::Int(i))
+    } else {
+        v.as_bool().map(SelectorValue::Bool)
+    }
+}
+
+/// Build a `toml_edit::Item` from a `SelectorValue`, used when seeding a new
+/// array entry whose pinning key didn't exist on this side yet.
+fn selector_value_to_item(value: &SelectorValue) -> Item {
+    match value {
+        SelectorValue::String(s) => {
+            Item::Value(Value::String(toml_edit::Formatted::new(s.clone())))
+        }
+        SelectorValue::Int(i) => Item::Value(Value::Integer(toml_edit::Formatted::new(*i))),
+        SelectorValue::Bool(b) => Item::Value(Value::Boolean(toml_edit::Formatted::new(*b))),
+    }
 }
 
 /// A matched array item. Either a `[[arrays.of.tables]]` entry (`Table`) or
@@ -266,7 +301,11 @@ impl<'a> Matched<'a> {
     }
 }
 
-fn find_pinned_item<'a>(arr_item: &'a Item, key: &str, value: &str) -> Option<Matched<'a>> {
+fn find_pinned_item<'a>(
+    arr_item: &'a Item,
+    key: &str,
+    value: &SelectorValue,
+) -> Option<Matched<'a>> {
     match arr_item {
         Item::ArrayOfTables(arr) => arr
             .iter()
@@ -306,7 +345,7 @@ fn iter_array_items(arr_item: &Item) -> Vec<&dyn TableLike> {
 fn expand_walk(
     table: &dyn TableLike,
     remaining: &[Segment],
-    identity: Vec<String>,
+    identity: Vec<SelectorValue>,
     resolved: Vec<Segment>,
     out: &mut Vec<ResolvedPath>,
 ) -> Result<()> {
@@ -344,7 +383,7 @@ fn expand_walk(
             };
             let count = count_pinned_matches(arr, key, value);
             if count > 1 {
-                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value:?}");
+                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value}");
             }
             let Some(matched) = find_pinned_item(arr, key, value) else {
                 return Ok(());
@@ -358,20 +397,16 @@ fn expand_walk(
                 return Ok(());
             };
             // Pre-scan for duplicate identifier values across the array.
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            let mut counts: BTreeMap<SelectorValue, usize> = BTreeMap::new();
             for item_table in iter_array_items(arr) {
-                if let Some(v) = item_table
-                    .get(key)
-                    .and_then(|i| i.as_value())
-                    .and_then(|v| v.as_str())
-                {
-                    *counts.entry(v.to_string()).or_default() += 1;
+                if let Some(v) = item_selector_value(item_table, key) {
+                    *counts.entry(v).or_default() += 1;
                 }
             }
             let dups: Vec<String> = counts
                 .iter()
                 .filter(|(_, c)| **c > 1)
-                .map(|(k, c)| format!("{k:?}×{c}"))
+                .map(|(v, c)| format!("{v}×{c}"))
                 .collect();
             if !dups.is_empty() {
                 bail!(
@@ -380,21 +415,17 @@ fn expand_walk(
                 );
             }
             for item_table in iter_array_items(arr) {
-                let Some(value) = item_table
-                    .get(key)
-                    .and_then(|i| i.as_value())
-                    .and_then(|v| v.as_str())
-                else {
+                let Some(value) = item_selector_value(item_table, key) else {
                     continue;
                 };
                 let mut branch_id = identity.clone();
-                branch_id.push(value.to_string());
+                branch_id.push(value.clone());
                 let mut branch_resolved = resolved.clone();
                 branch_resolved.push(Segment {
                     name: seg.name.clone(),
                     select: Some(ItemSelector::Pinned {
                         key: key.clone(),
-                        value: value.to_string(),
+                        value,
                     }),
                 });
                 expand_walk(item_table, rest, branch_id, branch_resolved, out)?;
@@ -404,7 +435,7 @@ fn expand_walk(
     Ok(())
 }
 
-fn count_pinned_matches(arr_item: &Item, key: &str, value: &str) -> usize {
+fn count_pinned_matches(arr_item: &Item, key: &str, value: &SelectorValue) -> usize {
     match arr_item {
         Item::ArrayOfTables(arr) => arr
             .iter()
@@ -580,7 +611,7 @@ fn ensure_array_of_tables<'a>(table: &'a mut Table, name: &str) -> Result<&'a mu
 fn descend_set_in_array(
     arr: &mut ArrayOfTables,
     key: &str,
-    pinned: &str,
+    pinned: &SelectorValue,
     rest: &[Segment],
     value: Item,
 ) -> Result<()> {
@@ -590,10 +621,7 @@ fn descend_set_in_array(
         Some(p) => p,
         None => {
             let mut new_table = Table::new();
-            new_table.insert(
-                key,
-                Item::Value(Value::String(toml_edit::Formatted::new(pinned.to_string()))),
-            );
+            new_table.insert(key, selector_value_to_item(pinned));
             arr.push(new_table);
             arr.len() - 1
         }
@@ -608,10 +636,7 @@ fn descend_set_in_array(
         // Restore the pinning key in case the replacement value didn't carry
         // it (callers transferring values across docs sometimes don't).
         if !matches_pinned(item_table, key, pinned) {
-            item_table.insert(
-                key,
-                Item::Value(Value::String(toml_edit::Formatted::new(pinned.to_string()))),
-            );
+            item_table.insert(key, selector_value_to_item(pinned));
         }
         return Ok(());
     }
@@ -669,12 +694,519 @@ fn set_in_inline_descend(table: &mut InlineTable, segments: &[Segment], item: It
     set_in_child(child, rest, item)
 }
 
+// =====================================================================
+// JsonDocument
+// =====================================================================
+//
+// `serde_json::Value` is the native item. The `preserve_order` feature
+// keeps object keys in insertion order on parse and round-trip, mirroring
+// `toml_edit`'s format-preserving behavior at the structural level.
+//
+// JSON has no comments and no inline-vs-block array distinction, so the
+// implementation is structurally simpler than the TOML side: arrays are
+// always `Vec<Value>` and there is exactly one container type per shape.
+//
+// Limitations explicitly accepted in v1:
+// - Whitespace and indentation are not preserved; render emits canonical
+//   2-space pretty-print plus trailing newline. Most editor / agent JSON
+//   configs already use that style.
+// - Comments / trailing commas / JSON5 / JSONC are not supported.
+// - Floats are not supported as selector values; `[k=1.5]` is rejected
+//   by the path parser, and a wildcard hit on a numeric field that is
+//   not representable as `i64` is silently skipped (same policy as
+//   non-scalar items).
+
+use serde_json::{Map as JsonMap, Value as JsonValue};
+
+pub struct JsonDocument {
+    /// Root document. Always a `JsonValue::Object` for our purposes —
+    /// `load` normalizes empty / missing files to an empty object so
+    /// `get` / `set` can descend without special-casing the root.
+    root: JsonValue,
+    /// Indent unit used by `render`. Sniffed from the source file's first
+    /// indented line when available; falls back to `DEFAULT_JSON_INDENT`
+    /// for empty / missing / minified inputs. This way an existing
+    /// 4-space or tab-indented config keeps its style after a write.
+    indent: Vec<u8>,
+}
+
+const DEFAULT_JSON_INDENT: &[u8] = b"  ";
+
+impl JsonDocument {
+    pub fn empty() -> Self {
+        Self {
+            root: JsonValue::Object(JsonMap::new()),
+            indent: DEFAULT_JSON_INDENT.to_vec(),
+        }
+    }
+}
+
+impl Document for JsonDocument {
+    type Item = JsonValue;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self> {
+        if !path.exists() {
+            if allow_missing {
+                return Ok(Self::empty());
+            }
+            bail!("file does not exist: {}", path.display());
+        }
+
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        // Treat truly empty files as `{}`. JSON itself doesn't allow this,
+        // but a freshly created config file commonly is empty until first
+        // write — bootstrapping should not error.
+        if content.trim().is_empty() {
+            return Ok(Self::empty());
+        }
+
+        let indent = sniff_json_indent(&content);
+        let root: JsonValue = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+        if !root.is_object() {
+            bail!(
+                "expected JSON object at root of {}, got {}",
+                path.display(),
+                json_type_name(&root)
+            );
+        }
+        Ok(Self { root, indent })
+    }
+
+    fn get(&self, path: &FieldPath) -> Option<JsonValue> {
+        // Returns `Some(JsonValue::Null)` when the path resolves to an
+        // explicit `null`, distinct from `None` ("absent"). Sync rules
+        // treat the two cases differently — explicit null is a value
+        // and gets propagated; missing is a no-op or fill-in.
+        json_descend_get(&self.root, path.segments())
+    }
+
+    fn set(&mut self, path: &FieldPath, item: JsonValue) -> Result<()> {
+        json_descend_set(&mut self.root, path.segments(), item)
+    }
+
+    fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
+        json_table_conflict(&self.root, path.segments())
+    }
+
+    fn render(&self) -> String {
+        // Use the sniffed indent so an existing 4-space or tab-indented
+        // file keeps its style after a write. Append a trailing newline
+        // for POSIX cleanliness.
+        use serde::Serialize;
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(&self.indent);
+        let mut buf = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        if self.root.serialize(&mut serializer).is_err() {
+            return String::new();
+        }
+        let mut s = String::from_utf8(buf).unwrap_or_default();
+        s.push('\n');
+        s
+    }
+
+    fn items_equal(a: &JsonValue, b: &JsonValue) -> bool {
+        a == b
+    }
+
+    fn summarize(item: Option<&JsonValue>) -> String {
+        match item {
+            None => "<missing>".to_string(),
+            Some(item) => summarize_json_item(item),
+        }
+    }
+
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        if pattern.segments().iter().all(|s| s.select.is_none()) {
+            return Ok(vec![ResolvedPath {
+                identity: Vec::new(),
+                path: pattern.clone(),
+            }]);
+        }
+        let mut out = Vec::new();
+        let obj = self
+            .root
+            .as_object()
+            .expect("JsonDocument root is always an object");
+        json_expand_walk(obj, pattern.segments(), Vec::new(), Vec::new(), &mut out)?;
+        Ok(out)
+    }
+}
+
+// ----- JSON helpers -----
+
+/// Detect the indent unit used by a pretty-printed JSON document. Returns
+/// the leading whitespace of the first indented line — that's the first
+/// nested level, which equals one indent unit for any sane pretty-printer
+/// (serde_json, jq, IDE formatters, etc). Falls back to the default when
+/// the file is minified, empty after the opening brace, or otherwise has
+/// no indented content to learn from.
+fn sniff_json_indent(content: &str) -> Vec<u8> {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let leading_len = line.len() - trimmed.len();
+        if leading_len == 0 {
+            continue;
+        }
+        return line.as_bytes()[..leading_len].to_vec();
+    }
+    DEFAULT_JSON_INDENT.to_vec()
+}
+
+fn json_type_name(v: &JsonValue) -> &'static str {
+    match v {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "bool",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+fn summarize_json_item(item: &JsonValue) -> String {
+    // `serde_json::to_string` is the canonical compact form for every JSON
+    // value (quotes strings, prints `null` / `true` / numbers). Reports stay
+    // one line because the compact serializer never inserts whitespace.
+    let mut rendered = serde_json::to_string(item).unwrap_or_default();
+    if rendered.is_empty() {
+        rendered = json_type_name(item).to_string();
+    }
+    const LIMIT: usize = 120;
+    if rendered.chars().count() > LIMIT {
+        let mut truncated = rendered.chars().take(LIMIT - 3).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        rendered
+    }
+}
+
+/// True when `obj[key]` matches the typed pinned-selector value. Type-strict.
+fn json_matches_pinned(obj: &JsonMap<String, JsonValue>, key: &str, value: &SelectorValue) -> bool {
+    let Some(v) = obj.get(key) else {
+        return false;
+    };
+    match (value, v) {
+        (SelectorValue::String(s), JsonValue::String(t)) => s == t,
+        (SelectorValue::Int(i), JsonValue::Number(n)) => n.as_i64() == Some(*i),
+        (SelectorValue::Bool(b), JsonValue::Bool(c)) => b == c,
+        _ => false,
+    }
+}
+
+/// Extract the wildcard-key value from `obj[key]` as a `SelectorValue` if it
+/// is one of the supported scalar types. Floats / arrays / objects / null
+/// are skipped (the item is excluded from wildcard expansion), mirroring
+/// the TOML side's behavior on unsupported types.
+fn json_item_selector_value(obj: &JsonMap<String, JsonValue>, key: &str) -> Option<SelectorValue> {
+    match obj.get(key)? {
+        JsonValue::String(s) => Some(SelectorValue::String(s.clone())),
+        JsonValue::Number(n) => n.as_i64().map(SelectorValue::Int),
+        JsonValue::Bool(b) => Some(SelectorValue::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// Build a `JsonValue` from a `SelectorValue`, used to seed a new array
+/// entry whose pinning key didn't exist on this side yet.
+fn selector_value_to_json(value: &SelectorValue) -> JsonValue {
+    match value {
+        SelectorValue::String(s) => JsonValue::String(s.clone()),
+        SelectorValue::Int(i) => JsonValue::Number((*i).into()),
+        SelectorValue::Bool(b) => JsonValue::Bool(*b),
+    }
+}
+
+fn json_descend_get(value: &JsonValue, segments: &[Segment]) -> Option<JsonValue> {
+    let Some((first, rest)) = segments.split_first() else {
+        return Some(value.clone());
+    };
+    let last = rest.is_empty();
+    match &first.select {
+        None => {
+            let obj = value.as_object()?;
+            // `Some(Null)` when the key is present with explicit null.
+            // `None` when the key is absent. The distinction is preserved
+            // through clone() because `obj.get` returns Option<&Value>.
+            let v = obj.get(&first.name)?;
+            if last {
+                return Some(v.clone());
+            }
+            json_descend_get(v, rest)
+        }
+        Some(ItemSelector::Pinned { key, value: pv }) => {
+            let obj = value.as_object()?;
+            let arr = obj.get(&first.name)?.as_array()?;
+            let mut hits = arr.iter().filter(|it| {
+                it.as_object()
+                    .map(|o| json_matches_pinned(o, key, pv))
+                    .unwrap_or(false)
+            });
+            let matched = hits.next()?;
+            if last {
+                return Some(matched.clone());
+            }
+            json_descend_get(matched, rest)
+        }
+        Some(ItemSelector::Wildcard { .. }) => None,
+    }
+}
+
+fn json_table_conflict(root: &JsonValue, segments: &[Segment]) -> Option<TableConflict> {
+    let obj = root.as_object()?;
+    json_table_conflict_walk(obj, segments, &mut Vec::new())
+}
+
+fn json_table_conflict_walk(
+    obj: &JsonMap<String, JsonValue>,
+    segments: &[Segment],
+    prefix: &mut Vec<String>,
+) -> Option<TableConflict> {
+    let (first, rest) = segments.split_first()?;
+    prefix.push(first.to_string());
+    let item = obj.get(&first.name)?;
+    match &first.select {
+        None => {
+            if rest.is_empty() {
+                return None;
+            }
+            match item.as_object() {
+                Some(next) => json_table_conflict_walk(next, rest, prefix),
+                None => Some(TableConflict {
+                    path: prefix.join("."),
+                    kind: json_type_name(item).to_string(),
+                    value: summarize_json_item(item),
+                }),
+            }
+        }
+        Some(ItemSelector::Pinned { key, value: pv }) => {
+            // Container at first.name must be an array.
+            let Some(arr) = item.as_array() else {
+                return Some(TableConflict {
+                    path: prefix.join("."),
+                    kind: json_type_name(item).to_string(),
+                    value: summarize_json_item(item),
+                });
+            };
+            // Missing matched item is not a conflict — `set` will append.
+            let matched = arr
+                .iter()
+                .find_map(|it| it.as_object().filter(|o| json_matches_pinned(o, key, pv)))?;
+            json_table_conflict_walk(matched, rest, prefix)
+        }
+        Some(ItemSelector::Wildcard { .. }) => {
+            if !item.is_array() {
+                return Some(TableConflict {
+                    path: prefix.join("."),
+                    kind: json_type_name(item).to_string(),
+                    value: summarize_json_item(item),
+                });
+            }
+            None
+        }
+    }
+}
+
+fn json_descend_set(root: &mut JsonValue, segments: &[Segment], item: JsonValue) -> Result<()> {
+    let Some((first, rest)) = segments.split_first() else {
+        bail!("path must not be empty");
+    };
+    if let Some(ItemSelector::Wildcard { .. }) = first.select {
+        bail!("wildcard selectors are not yet supported in JsonDocument writes");
+    }
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("expected object at path prefix"))?;
+    let last = rest.is_empty();
+
+    match &first.select {
+        None => {
+            if last {
+                obj.insert(first.name.clone(), item);
+                return Ok(());
+            }
+            // Ensure object child.
+            if !matches!(obj.get(&first.name), Some(v) if v.is_object()) {
+                obj.insert(first.name.clone(), JsonValue::Object(JsonMap::new()));
+            }
+            let child = obj.get_mut(&first.name).expect("just ensured");
+            json_descend_set(child, rest, item)
+        }
+        Some(ItemSelector::Pinned { key, value: pv }) => {
+            // Ensure array; bail on shape conflict.
+            match obj.get(&first.name) {
+                Some(JsonValue::Array(_)) => {}
+                Some(other) => bail!(
+                    "{} is {} but path expects an array",
+                    first.name,
+                    json_type_name(other)
+                ),
+                None => {
+                    obj.insert(first.name.clone(), JsonValue::Array(Vec::new()));
+                }
+            }
+            let arr = obj
+                .get_mut(&first.name)
+                .and_then(|v| v.as_array_mut())
+                .expect("just ensured");
+            let pos = arr.iter().position(|it| {
+                it.as_object()
+                    .map(|o| json_matches_pinned(o, key, pv))
+                    .unwrap_or(false)
+            });
+            let pos = match pos {
+                Some(p) => p,
+                None => {
+                    let mut new_obj = JsonMap::new();
+                    new_obj.insert(key.clone(), selector_value_to_json(pv));
+                    arr.push(JsonValue::Object(new_obj));
+                    arr.len() - 1
+                }
+            };
+            let item_val = arr.get_mut(pos).expect("indexed");
+            if last {
+                if !item.is_object() {
+                    bail!(
+                        "pinned-selector leaf write requires an object value, got {}",
+                        json_type_name(&item)
+                    );
+                }
+                *item_val = item;
+                let map = item_val.as_object_mut().expect("just placed object");
+                if !json_matches_pinned(map, key, pv) {
+                    map.insert(key.clone(), selector_value_to_json(pv));
+                }
+                return Ok(());
+            }
+            json_descend_set(item_val, rest, item)
+        }
+        Some(ItemSelector::Wildcard { .. }) => unreachable!("checked above"),
+    }
+}
+
+fn json_expand_walk(
+    obj: &JsonMap<String, JsonValue>,
+    remaining: &[Segment],
+    identity: Vec<SelectorValue>,
+    resolved: Vec<Segment>,
+    out: &mut Vec<ResolvedPath>,
+) -> Result<()> {
+    let no_more_selectors = remaining.iter().all(|s| s.select.is_none());
+
+    if no_more_selectors {
+        let mut full = resolved;
+        full.extend(remaining.iter().cloned());
+        out.push(ResolvedPath {
+            identity,
+            path: FieldPath::from_segments(full),
+        });
+        return Ok(());
+    }
+
+    let (seg, rest) = remaining
+        .split_first()
+        .expect("non-empty: selectors exist downstream");
+
+    match &seg.select {
+        None => {
+            let Some(item) = obj.get(&seg.name) else {
+                return Ok(());
+            };
+            let Some(next) = item.as_object() else {
+                return Ok(());
+            };
+            let mut new_resolved = resolved;
+            new_resolved.push(seg.clone());
+            json_expand_walk(next, rest, identity, new_resolved, out)?;
+        }
+        Some(ItemSelector::Pinned { key, value }) => {
+            let Some(arr) = obj.get(&seg.name).and_then(|v| v.as_array()) else {
+                return Ok(());
+            };
+            let count = arr
+                .iter()
+                .filter(|it| {
+                    it.as_object()
+                        .map(|o| json_matches_pinned(o, key, value))
+                        .unwrap_or(false)
+                })
+                .count();
+            if count > 1 {
+                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value}");
+            }
+            let Some(matched) = arr.iter().find_map(|it| {
+                it.as_object()
+                    .filter(|o| json_matches_pinned(o, key, value))
+            }) else {
+                return Ok(());
+            };
+            let mut new_resolved = resolved;
+            new_resolved.push(seg.clone());
+            json_expand_walk(matched, rest, identity, new_resolved, out)?;
+        }
+        Some(ItemSelector::Wildcard { key }) => {
+            let Some(arr) = obj.get(&seg.name).and_then(|v| v.as_array()) else {
+                return Ok(());
+            };
+            let mut counts: BTreeMap<SelectorValue, usize> = BTreeMap::new();
+            for it in arr {
+                if let Some(map) = it.as_object()
+                    && let Some(v) = json_item_selector_value(map, key)
+                {
+                    *counts.entry(v).or_default() += 1;
+                }
+            }
+            let dups: Vec<String> = counts
+                .iter()
+                .filter(|(_, c)| **c > 1)
+                .map(|(v, c)| format!("{v}×{c}"))
+                .collect();
+            if !dups.is_empty() {
+                bail!(
+                    "ambiguous wildcard at {seg}: duplicate {key} values: {}",
+                    dups.join(", ")
+                );
+            }
+            for it in arr {
+                let Some(map) = it.as_object() else {
+                    continue;
+                };
+                let Some(value) = json_item_selector_value(map, key) else {
+                    continue;
+                };
+                let mut branch_id = identity.clone();
+                branch_id.push(value.clone());
+                let mut branch_resolved = resolved.clone();
+                branch_resolved.push(Segment {
+                    name: seg.name.clone(),
+                    select: Some(ItemSelector::Pinned {
+                        key: key.clone(),
+                        value,
+                    }),
+                });
+                json_expand_walk(map, rest, branch_id, branch_resolved, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use toml_edit::value;
 
     use super::{Document, TomlDocument};
-    use crate::path::FieldPath;
+    use crate::path::{FieldPath, SelectorValue};
+
+    fn s(v: &str) -> SelectorValue {
+        SelectorValue::String(v.to_string())
+    }
 
     #[test]
     fn sets_and_gets_nested_values() {
@@ -752,6 +1284,93 @@ enabled = false
         assert_eq!(
             doc.get(&path).unwrap().as_value().unwrap().as_integer(),
             Some(81)
+        );
+    }
+
+    #[test]
+    fn pinned_get_with_int_selector() {
+        let doc = TomlDocument {
+            doc: r#"
+[[servers]]
+port = 8080
+host = "alpha"
+
+[[servers]]
+port = 9090
+host = "beta"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let path = FieldPath::parse("servers[port=9090].host").unwrap();
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn pinned_get_with_bool_selector() {
+        let doc = TomlDocument {
+            doc: r#"
+[[entries]]
+primary = true
+host = "alpha"
+
+[[entries]]
+primary = false
+host = "beta"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let path = FieldPath::parse("entries[primary=true].host").unwrap();
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn pinned_selector_is_type_strict() {
+        // [k=8080] (int) does not match k = "8080" (string).
+        let doc = TomlDocument {
+            doc: r#"
+[[servers]]
+port = "8080"
+host = "alpha"
+"#
+            .parse()
+            .unwrap(),
+        };
+        assert!(
+            doc.get(&FieldPath::parse("servers[port=8080].host").unwrap())
+                .is_none()
+        );
+        assert!(
+            doc.get(&FieldPath::parse("servers[port=\"8080\"].host").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pinned_set_seeds_int_pinning_key_for_new_item() {
+        let mut doc = TomlDocument::empty();
+        let path = FieldPath::parse("servers[port=8080].host").unwrap();
+        doc.set(&path, value("alpha")).unwrap();
+
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("alpha")
+        );
+        let port_path = FieldPath::parse("servers[port=8080].port").unwrap();
+        assert_eq!(
+            doc.get(&port_path)
+                .unwrap()
+                .as_value()
+                .unwrap()
+                .as_integer(),
+            Some(8080)
         );
     }
 
@@ -889,12 +1508,12 @@ enabled = false
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "mcp_servers[name=\"github\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["linear".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("linear")]);
     }
 
     #[test]
@@ -935,12 +1554,12 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["gpt-4".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("gpt-4")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"openai\"].models[id=\"gpt-4\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["gpt-5".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("gpt-5")]);
     }
 
     #[test]
@@ -1086,7 +1705,7 @@ enabled = false
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
         assert_eq!(resolved[0].path.to_string(), "mcp_servers[name=\"github\"]");
 
         // The resolved path returns the whole item when used with `get`.
@@ -1125,12 +1744,12 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["anthropic".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("anthropic")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"anthropic\"].models[id=\"gpt-4\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["openai".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("openai")]);
     }
 
     #[test]
@@ -1163,18 +1782,9 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 3);
-        assert_eq!(
-            resolved[0].identity,
-            vec!["anthropic".to_string(), "opus".to_string()]
-        );
-        assert_eq!(
-            resolved[1].identity,
-            vec!["openai".to_string(), "gpt-4".to_string()]
-        );
-        assert_eq!(
-            resolved[2].identity,
-            vec!["openai".to_string(), "gpt-5".to_string()]
-        );
+        assert_eq!(resolved[0].identity, vec![s("anthropic"), s("opus")]);
+        assert_eq!(resolved[1].identity, vec![s("openai"), s("gpt-4")]);
+        assert_eq!(resolved[2].identity, vec![s("openai"), s("gpt-5")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"anthropic\"].models[id=\"opus\"].enabled"
@@ -1198,6 +1808,232 @@ enabled = true
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
         let resolved = doc.expand(&pattern).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
+    }
+
+    // =================================================================
+    // JsonDocument tests
+    // =================================================================
+
+    use serde_json::{Value as JsonValue, json};
+
+    use super::JsonDocument;
+
+    fn json_doc(content: &str) -> JsonDocument {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json");
+        std::fs::write(&path, content).unwrap();
+        JsonDocument::load(&path, false).unwrap()
+    }
+
+    #[test]
+    fn json_load_treats_empty_file_as_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json");
+        std::fs::write(&path, "").unwrap();
+        let doc = JsonDocument::load(&path, false).unwrap();
+        assert_eq!(doc.render(), "{}\n");
+    }
+
+    #[test]
+    fn json_load_rejects_non_object_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+        assert!(JsonDocument::load(&path, false).is_err());
+    }
+
+    #[test]
+    fn json_set_and_get_nested_values() {
+        let mut doc = JsonDocument::empty();
+        let path = FieldPath::parse("tui.theme").unwrap();
+        doc.set(&path, json!("monokai")).unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!("monokai"));
+    }
+
+    #[test]
+    fn json_get_distinguishes_explicit_null_from_missing() {
+        let doc = json_doc(r#"{"explicit": null}"#);
+        let exp = FieldPath::parse("explicit").unwrap();
+        let miss = FieldPath::parse("missing").unwrap();
+        assert_eq!(doc.get(&exp), Some(JsonValue::Null));
+        assert_eq!(doc.get(&miss), None);
+    }
+
+    #[test]
+    fn json_render_preserves_key_order() {
+        let doc = json_doc(r#"{"z": 1, "a": 2, "m": 3}"#);
+        let rendered = doc.render();
+        let z = rendered.find("\"z\"").unwrap();
+        let a = rendered.find("\"a\"").unwrap();
+        let m = rendered.find("\"m\"").unwrap();
+        assert!(z < a && a < m, "expected z<a<m order; got {rendered}");
+    }
+
+    #[test]
+    fn json_render_uses_pretty_with_trailing_newline() {
+        let mut doc = JsonDocument::empty();
+        doc.set(&FieldPath::parse("a.b").unwrap(), json!(1))
+            .unwrap();
+        let rendered = doc.render();
+        assert!(rendered.ends_with('\n'));
+        assert!(
+            rendered.contains("  "),
+            "expected 2-space indent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_preserves_four_space_indent_from_source() {
+        let doc = json_doc("{\n    \"a\": 1,\n    \"b\": {\n        \"c\": 2\n    }\n}\n");
+        let rendered = doc.render();
+        // First nested level keeps 4 spaces.
+        assert!(
+            rendered.contains("\n    \"a\": 1"),
+            "expected 4-space indent, got: {rendered}"
+        );
+        // Deeper level keeps 8 spaces.
+        assert!(
+            rendered.contains("\n        \"c\": 2"),
+            "expected 8-space nested indent, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_preserves_tab_indent_from_source() {
+        let doc = json_doc("{\n\t\"a\": 1\n}\n");
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n\t\"a\": 1"),
+            "expected tab indent, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn json_render_falls_back_to_two_space_for_minified_input() {
+        let doc = json_doc(r#"{"a":1,"b":{"c":2}}"#);
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n  \"a\""),
+            "expected 2-space default for minified input: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_keeps_indent_after_set_writes() {
+        // Sniff once on load, then a write through `set` must not lose
+        // the sniffed style.
+        let mut doc = json_doc("{\n    \"a\": 1\n}\n");
+        doc.set(&FieldPath::parse("b").unwrap(), json!(2)).unwrap();
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n    \"b\": 2"),
+            "expected 4-space indent preserved after set, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_pinned_get_with_string_selector() {
+        let doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "linear", "enabled": false}]}"#,
+        );
+        let path = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!(true));
+    }
+
+    #[test]
+    fn json_pinned_get_with_int_selector() {
+        let doc = json_doc(
+            r#"{"servers": [{"port": 8080, "host": "alpha"}, {"port": 9090, "host": "beta"}]}"#,
+        );
+        let path = FieldPath::parse("servers[port=9090].host").unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!("beta"));
+    }
+
+    #[test]
+    fn json_pinned_get_with_bool_selector() {
+        let doc = json_doc(
+            r#"{"entries": [{"primary": true, "host": "alpha"}, {"primary": false, "host": "beta"}]}"#,
+        );
+        let path = FieldPath::parse("entries[primary=true].host").unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!("alpha"));
+    }
+
+    #[test]
+    fn json_pinned_selector_is_type_strict() {
+        let doc = json_doc(r#"{"servers": [{"port": "8080", "host": "alpha"}]}"#);
+        assert!(
+            doc.get(&FieldPath::parse("servers[port=8080].host").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("servers[port=\"8080\"].host").unwrap())
+                .unwrap(),
+            json!("alpha")
+        );
+    }
+
+    #[test]
+    fn json_pinned_set_appends_with_int_pinning_key() {
+        let mut doc = JsonDocument::empty();
+        let path = FieldPath::parse("servers[port=8080].host").unwrap();
+        doc.set(&path, json!("alpha")).unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!("alpha"));
+        // The seeded pinning key must round-trip as a JSON Number, not a
+        // String. Equality against `json!(8080)` already enforces this
+        // (Value's PartialEq is type-strict), but spell out the type
+        // expectation at the call site for parity with the TOML test.
+        let port_path = FieldPath::parse("servers[port=8080].port").unwrap();
+        let port = doc.get(&port_path).unwrap();
+        assert_eq!(port.as_i64(), Some(8080), "port should be JSON Number");
+        assert!(port.is_number(), "port should not be stringified: {port:?}");
+    }
+
+    #[test]
+    fn json_pinned_set_updates_existing_and_preserves_siblings() {
+        let mut doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true, "url": "https://api.github.com"}, {"name": "linear", "enabled": false}]}"#,
+        );
+        let path = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        doc.set(&path, json!(false)).unwrap();
+        assert_eq!(doc.get(&path).unwrap(), json!(false));
+        let url = FieldPath::parse("mcpServers[name=\"github\"].url").unwrap();
+        assert_eq!(doc.get(&url).unwrap(), json!("https://api.github.com"));
+        let linear = FieldPath::parse("mcpServers[name=\"linear\"].enabled").unwrap();
+        assert_eq!(doc.get(&linear).unwrap(), json!(false));
+    }
+
+    #[test]
+    fn json_table_conflict_reports_non_object_prefix() {
+        let doc = json_doc(r#"{"settings": "plain"}"#);
+        let path = FieldPath::parse("settings.theme").unwrap();
+        let conflict = doc.table_conflict(&path).expect("expected conflict");
+        assert_eq!(conflict.path, "settings");
+        assert_eq!(conflict.kind, "string");
+    }
+
+    #[test]
+    fn json_expand_wildcard_fans_out_with_typed_identity() {
+        let doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "linear", "enabled": false}]}"#,
+        );
+        let pattern = FieldPath::parse("mcpServers[name].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
+        assert_eq!(resolved[1].identity, vec![s("linear")]);
+    }
+
+    #[test]
+    fn json_expand_errors_on_wildcard_duplicate_identifier() {
+        let doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+        );
+        let pattern = FieldPath::parse("mcpServers[name].enabled").unwrap();
+        let err = doc.expand(&pattern).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous wildcard"), "msg: {msg}");
+        assert!(msg.contains("\"github\""), "msg: {msg}");
     }
 }

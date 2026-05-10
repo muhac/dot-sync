@@ -1,0 +1,7 @@
+{
+  "tui": {
+    "theme": "monokai",
+    "private": "keep"
+  },
+  "user_only": "keep"
+}

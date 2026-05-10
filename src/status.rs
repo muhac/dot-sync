@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{Document, Format, TomlDocument, parse_format};
+use crate::document::{Document, Format, JsonDocument, TomlDocument, parse_format};
 use crate::path::FieldPath;
 
 pub fn run(config: &DotSyncConfig, name: Option<&str>) -> Result<()> {
@@ -116,6 +116,7 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
 
     match format {
         Format::Toml => inspect_target_typed::<TomlDocument>(target, &mut status),
+        Format::Json => inspect_target_typed::<JsonDocument>(target, &mut status),
     }
 
     status
