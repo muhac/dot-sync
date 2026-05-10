@@ -256,6 +256,91 @@ mod tests {
     }
 
     #[test]
+    fn render_gitconfig_tree_via_test_backend() {
+        // End-to-end: build a GitConfigDocument from a realistic
+        // fixture, hand its discover_field_tree() to the picker, and
+        // render the result. Locks two coupling points:
+        //   1. discovery.rs's gitconfig walker emits the expected
+        //      tree shape (sections / subsections as VirtualGroups,
+        //      keys as Leaves).
+        //   2. picker.rs renders that shape with the right glyph
+        //      cycle — VirtualGroups don't have a `[x]` whole-mode,
+        //      only `[ ]` ↔ `[*]`.
+        use crate::document::{Document, GitConfigDocument};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "\
+[user]
+\tname = Alice
+\temail = a@b
+[remote \"origin\"]
+\turl = https://example.com/o
+[alias]
+\tco = checkout
+",
+        )
+        .unwrap();
+        let doc = GitConfigDocument::load(&path, false).unwrap();
+        let tree = doc.discover_field_tree();
+        let state = PickerState::from_tree(tree);
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, "test", &state)).unwrap();
+        let dump = buffer_to_string(terminal.backend().buffer());
+
+        for label in ["user", "remote", "alias", "name", "email"] {
+            assert!(dump.contains(label), "missing {label}:\n{dump}");
+        }
+        assert!(dump.contains("[ ]"), "checkbox glyph missing:\n{dump}");
+        // Subsection "origin" appears with quotes (matches our
+        // discovery output for non-special-char subsections).
+        assert!(dump.contains("\"origin\""), "subsection label missing:\n{dump}");
+    }
+
+    #[test]
+    fn render_gitconfig_individual_mode_uses_star_not_x() {
+        // VirtualGroup nodes (sections in gitconfig) skip the `[x]`
+        // whole-subtree state when the user cycles them — `[ ]` →
+        // `[*]` → `[ ]`. This locks that behavior at the picker
+        // level for the gitconfig discovery shape specifically. Note
+        // that the leaves *under* an Individual-mode container do
+        // render `[x]` (they're "selected as part of [*]"), which is
+        // the intended visual.
+        use crate::document::{Document, GitConfigDocument};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, "[user]\n\tname = Alice\n\temail = a@b\n").unwrap();
+        let doc = GitConfigDocument::load(&path, false).unwrap();
+        let tree = doc.discover_field_tree();
+        let mut state = PickerState::from_tree(tree);
+
+        // Toggle the [user] section (top-level VirtualGroup at idx 0).
+        state.toggle(0);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, "test", &state)).unwrap();
+        let dump = buffer_to_string(terminal.backend().buffer());
+
+        // Find the line that contains the section label and assert it
+        // shows `[*]` and not `[x]` — `[x]` on the row would mean the
+        // VirtualGroup mistakenly entered Whole mode.
+        let user_line = dump
+            .lines()
+            .find(|l| l.contains(" user"))
+            .unwrap_or_else(|| panic!("user row missing:\n{dump}"));
+        assert!(user_line.contains("[*]"), "user row: {user_line:?}");
+        assert!(
+            !user_line.contains("[x]"),
+            "VirtualGroup row must not show [x]: {user_line:?}"
+        );
+    }
+
+    #[test]
     fn render_reflects_tri_state_glyphs() {
         let mut state = fixture_state();
         // Toggle tui (Object container) → Whole.
