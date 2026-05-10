@@ -1121,6 +1121,25 @@ fn jsonc_new_key_appended_does_not_strand_neighbor_comment() {
 }
 
 #[test]
+fn jsonc_vscode_settings_round_trips_real_world_shape() {
+    // Representative VS Code settings.jsonc — top-of-section line
+    // comments, `// inline comment, blank lines between sections,
+    // trailing commas inside nested objects, multi-line block comments.
+    // Sync only `editor.tabSize`. Everything else (sibling keys, all
+    // comments, blank lines, trailing commas) must round-trip unchanged.
+    let fixture = Fixture::load("json", "jsonc_vscode_settings");
+    fixture
+        .command()
+        .args(["push", "vscode"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: editor.tabSize",
+        ));
+    fixture.assert_file_eq("settings.jsonc", "settings.expected.jsonc");
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
