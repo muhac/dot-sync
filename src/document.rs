@@ -733,7 +733,7 @@ fn set_in_inline_descend(table: &mut InlineTable, segments: &[Segment], item: It
 //   non-scalar items).
 
 use jsonc_parser::ParseOptions;
-use jsonc_parser::cst::{CstArray, CstInputValue, CstObject, CstObjectProp, CstRootNode};
+use jsonc_parser::cst::{CstArray, CstInputValue, CstNode, CstObject, CstObjectProp, CstRootNode};
 use serde_json::Value as JsonValue;
 
 /// Format-preserving JSON / JSONC document.
@@ -976,7 +976,7 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
             let prop = obj.get(&first.name)?;
             let val_node = prop.value()?;
             if last {
-                return val_node.to_serde_value();
+                return cst_node_to_serde_value_safe(&val_node);
             }
             let next_obj = val_node.as_object()?;
             json_get(&next_obj, rest)
@@ -989,7 +989,7 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
                 };
                 if cst_object_matches(&elem_obj, key, value) {
                     if last {
-                        return elem.to_serde_value();
+                        return cst_node_to_serde_value_safe(&elem);
                     }
                     return json_get(&elem_obj, rest);
                 }
@@ -998,6 +998,95 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
         }
         Some(ItemSelector::Wildcard { .. }) => None,
     }
+}
+
+/// Convert a CST node to a `serde_json::Value` while filtering out
+/// jsonc-parser 0.32.3's phantom whitespace "string lit" elements that
+/// can appear in arrays after `append()`. The crate's own
+/// `CstNode::to_serde_value()` doesn't filter these and panics inside
+/// `decoded_value()` when the phantom's raw value is whitespace, so we
+/// recurse manually with the same leaf-direct pattern that
+/// `cst_object_matches` uses.
+fn cst_node_to_serde_value_safe(node: &CstNode) -> Option<JsonValue> {
+    if let Some(obj) = node.as_object() {
+        let mut map = serde_json::Map::new();
+        for prop in obj.properties() {
+            let name_node = prop.name()?;
+            let name = if let Some(sl) = name_node.as_string_lit() {
+                sl.decoded_value().ok()?
+            } else if let Some(wl) = name_node.as_word_lit() {
+                wl.to_string()
+            } else {
+                continue;
+            };
+            let val = prop
+                .value()
+                .and_then(|v| cst_node_to_serde_value_safe(&v))?;
+            map.insert(name, val);
+        }
+        return Some(JsonValue::Object(map));
+    }
+    if let Some(arr) = node.as_array() {
+        let mut out = Vec::new();
+        for el in arr.elements() {
+            if !cst_node_is_real_value(&el) {
+                // Phantom whitespace masquerading as a value node — skip.
+                continue;
+            }
+            out.push(cst_node_to_serde_value_safe(&el)?);
+        }
+        return Some(JsonValue::Array(out));
+    }
+    if let Some(sl) = node.as_string_lit() {
+        // Defense in depth: a phantom would have leaked through if we
+        // reached here directly without going through the array filter.
+        // Skip if the raw value isn't a properly delimited string.
+        let raw = sl.raw_value();
+        if !raw.starts_with('"') && !raw.starts_with('\'') {
+            return None;
+        }
+        return sl.decoded_value().ok().map(JsonValue::String);
+    }
+    if let Some(nl) = node.as_number_lit() {
+        let raw = nl.to_string();
+        if let Ok(i) = raw.parse::<i64>() {
+            return Some(JsonValue::from(i));
+        }
+        if let Ok(f) = raw.parse::<f64>() {
+            return serde_json::Number::from_f64(f).map(JsonValue::Number);
+        }
+        // Non-finite or unparseable — fall back to the raw string so the
+        // value is at least visible to the caller, matching jsonc-parser's
+        // own AST-to-value behavior on edge-case numbers.
+        return Some(JsonValue::String(raw));
+    }
+    if let Some(bl) = node.as_boolean_lit() {
+        return Some(JsonValue::Bool(bl.value()));
+    }
+    if node.as_null_keyword().is_some() {
+        return Some(JsonValue::Null);
+    }
+    None
+}
+
+/// True when the CST node is a real value-bearing node (object, array,
+/// number / bool / null literal, or a properly quoted string literal),
+/// not a phantom trivia node leaking through `as_string_lit()` after
+/// `append()` (jsonc-parser 0.32.3 quirk).
+fn cst_node_is_real_value(node: &CstNode) -> bool {
+    if node.as_object().is_some()
+        || node.as_array().is_some()
+        || node.as_number_lit().is_some()
+        || node.as_boolean_lit().is_some()
+        || node.as_null_keyword().is_some()
+    {
+        return true;
+    }
+    if let Some(sl) = node.as_string_lit() {
+        let raw = sl.raw_value();
+        return raw.starts_with('"') || raw.starts_with('\'');
+    }
+    false
 }
 
 fn json_table_conflict_walk(
@@ -2490,5 +2579,50 @@ enabled = true
             FieldPath::parse("providers[name=\"openai\"].models[id=\"gpt-4\"].enabled").unwrap();
         doc.set(&path, json!(true)).unwrap();
         assert_eq!(doc.get(&path), Some(json!(true)));
+    }
+
+    #[test]
+    fn json_get_on_container_after_array_append_does_not_panic() {
+        // Regression guard for jsonc-parser 0.32.3's phantom-string-lit
+        // bug: after `append()` on an array of objects, `arr.elements()`
+        // can include a whitespace "string lit" whose `decoded_value()`
+        // panics. Calling `to_serde_value()` on the array would walk
+        // every element (including the phantom) — the safe walker filters
+        // the phantom and returns the real array contents.
+        let mut doc = json_doc(r#"{"servers": [{"name": "a"}, {"name": "b"}]}"#);
+        // Append a third entry — triggers the phantom condition.
+        doc.set(
+            &FieldPath::parse("servers[name=\"c\"].host").unwrap(),
+            json!("c.example"),
+        )
+        .unwrap();
+
+        // Now get the whole array as a Value. Without the safe walker
+        // this panics inside parse_string with "Expected \", was Some(' ')".
+        let arr = doc
+            .get(&FieldPath::parse("servers").unwrap())
+            .expect("array present");
+        let arr = arr.as_array().expect("got array");
+        // Three real elements, phantom filtered.
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["name"], json!("a"));
+        assert_eq!(arr[1]["name"], json!("b"));
+        assert_eq!(arr[2]["name"], json!("c"));
+        assert_eq!(arr[2]["host"], json!("c.example"));
+    }
+
+    #[test]
+    fn json_get_on_object_after_set_returns_full_subtree() {
+        // Get on a non-leaf (object) path after a set returns the
+        // fully-converted subtree, going through the safe walker for
+        // every nested value.
+        let mut doc = JsonDocument::empty();
+        doc.set(&FieldPath::parse("a.b.c").unwrap(), json!(1))
+            .unwrap();
+        doc.set(&FieldPath::parse("a.b.d").unwrap(), json!("x"))
+            .unwrap();
+
+        let a = doc.get(&FieldPath::parse("a").unwrap()).expect("a present");
+        assert_eq!(a, json!({"b": {"c": 1, "d": "x"}}));
     }
 }
