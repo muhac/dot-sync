@@ -16,9 +16,8 @@ pub struct TableConflict {
 pub trait Document {
     fn get(&self, path: &FieldPath) -> Option<Item>;
     fn set(&mut self, path: &FieldPath, item: Item) -> Result<()>;
-    fn clear(&mut self);
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict>;
-    fn to_string(&self) -> String;
+    fn render(&self) -> String;
 }
 
 pub enum AnyDocument {
@@ -41,14 +40,6 @@ impl AnyDocument {
             _ => unreachable!("format was validated"),
         }
     }
-
-    pub fn empty(format: &str) -> Result<Self> {
-        Self::validate_format(format)?;
-        match format {
-            "toml" => Ok(Self::Toml(TomlDocument::empty())),
-            _ => unreachable!("format was validated"),
-        }
-    }
 }
 
 impl Document for AnyDocument {
@@ -64,21 +55,15 @@ impl Document for AnyDocument {
         }
     }
 
-    fn clear(&mut self) {
-        match self {
-            Self::Toml(doc) => doc.clear(),
-        }
-    }
-
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
         match self {
             Self::Toml(doc) => doc.table_conflict(path),
         }
     }
 
-    fn to_string(&self) -> String {
+    fn render(&self) -> String {
         match self {
-            Self::Toml(doc) => doc.to_string(),
+            Self::Toml(doc) => doc.render(),
         }
     }
 }
@@ -120,15 +105,11 @@ impl Document for TomlDocument {
         set_in_table(self.doc.as_table_mut(), path.segments(), item)
     }
 
-    fn clear(&mut self) {
-        self.doc = DocumentMut::new();
-    }
-
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
         table_conflict_in_table(self.doc.as_table(), path.segments())
     }
 
-    fn to_string(&self) -> String {
+    fn render(&self) -> String {
         self.doc.to_string()
     }
 }

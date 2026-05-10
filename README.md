@@ -112,38 +112,24 @@ dot-sync push codex --backup
 dot-sync sync --dry-run
 ```
 
-`pull` reads from `target` and updates `source`.
+All three commands share a single rule: **only fields listed in `sync` are
+touched, and nothing is ever removed**. Fields outside `sync` are preserved on
+both sides. `pull` and `push` are mirror images; `sync` is exactly their union.
 
-```text
-target -> source
-```
+| State of a listed field            | `pull` (target → source) | `push` (source → target) | `sync` (both ways)        |
+| ---------------------------------- | ------------------------ | ------------------------ | ------------------------- |
+| Both sides equal                   | skip                     | skip                     | skip                      |
+| Both sides differ                  | source := target         | target := source         | source := target (target wins) |
+| Only target has it                 | source := target (add)   | skip                     | source := target (add)    |
+| Only source has it                 | skip                     | target := source (add)   | target := source (add)    |
+| Neither has it                     | skip                     | skip                     | skip                      |
+| Field not in `sync:` list          | untouched                | untouched                | untouched                 |
 
-Only fields listed in `sync` are extracted from `target` into `source`.
-
-`push` reads from `source` and updates `target`.
-
-```text
-source -> target
-```
-
-Only fields listed in `sync` are written to `target`. All other fields already
-present in `target` are preserved.
-
-`sync` does both directions.
-
-```text
-target -> source -> target
-```
-
-The conflict rule is fixed:
-
-- `target` wins for fields that exist in both files.
-- `source` fills missing `sync` fields in `target`.
-- fields outside `sync` are not touched.
-
-This keeps app-written local state safe while still allowing managed preferences
-to be shared across machines, environments, or projects.
+To stop syncing a field, remove it from `sync:` in `.sync.yaml`. The tool
+will not delete it from either file — clean up by hand if you want it gone.
 
 The direction names mirror deployment-style workflows: `pull` brings the
 current target state back into the managed source, and `push` applies the
-managed source to the target environment.
+managed source to the target environment. `sync` is convenient when you do
+not care which side is more up to date and just want both files to agree on
+the listed fields.

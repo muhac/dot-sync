@@ -1,5 +1,3 @@
-use anyhow::Result;
-
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     dot_sync::run()
 }
