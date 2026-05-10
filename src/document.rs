@@ -723,12 +723,20 @@ pub struct JsonDocument {
     /// `load` normalizes empty / missing files to an empty object so
     /// `get` / `set` can descend without special-casing the root.
     root: JsonValue,
+    /// Indent unit used by `render`. Sniffed from the source file's first
+    /// indented line when available; falls back to `DEFAULT_JSON_INDENT`
+    /// for empty / missing / minified inputs. This way an existing
+    /// 4-space or tab-indented config keeps its style after a write.
+    indent: Vec<u8>,
 }
+
+const DEFAULT_JSON_INDENT: &[u8] = b"  ";
 
 impl JsonDocument {
     pub fn empty() -> Self {
         Self {
             root: JsonValue::Object(JsonMap::new()),
+            indent: DEFAULT_JSON_INDENT.to_vec(),
         }
     }
 }
@@ -754,6 +762,7 @@ impl Document for JsonDocument {
             return Ok(Self::empty());
         }
 
+        let indent = sniff_json_indent(&content);
         let root: JsonValue = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse JSON {}", path.display()))?;
         if !root.is_object() {
@@ -763,7 +772,7 @@ impl Document for JsonDocument {
                 json_type_name(&root)
             );
         }
-        Ok(Self { root })
+        Ok(Self { root, indent })
     }
 
     fn get(&self, path: &FieldPath) -> Option<JsonValue> {
@@ -783,9 +792,17 @@ impl Document for JsonDocument {
     }
 
     fn render(&self) -> String {
-        // serde_json's pretty formatter uses 2-space indent. Append a
-        // trailing newline for POSIX cleanliness.
-        let mut s = serde_json::to_string_pretty(&self.root).unwrap_or_default();
+        // Use the sniffed indent so an existing 4-space or tab-indented
+        // file keeps its style after a write. Append a trailing newline
+        // for POSIX cleanliness.
+        use serde::Serialize;
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(&self.indent);
+        let mut buf = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        if self.root.serialize(&mut serializer).is_err() {
+            return String::new();
+        }
+        let mut s = String::from_utf8(buf).unwrap_or_default();
         s.push('\n');
         s
     }
@@ -819,6 +836,27 @@ impl Document for JsonDocument {
 }
 
 // ----- JSON helpers -----
+
+/// Detect the indent unit used by a pretty-printed JSON document. Returns
+/// the leading whitespace of the first indented line — that's the first
+/// nested level, which equals one indent unit for any sane pretty-printer
+/// (serde_json, jq, IDE formatters, etc). Falls back to the default when
+/// the file is minified, empty after the opening brace, or otherwise has
+/// no indented content to learn from.
+fn sniff_json_indent(content: &str) -> Vec<u8> {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let leading_len = line.len() - trimmed.len();
+        if leading_len == 0 {
+            continue;
+        }
+        return line.as_bytes()[..leading_len].to_vec();
+    }
+    DEFAULT_JSON_INDENT.to_vec()
+}
 
 fn json_type_name(v: &JsonValue) -> &'static str {
     match v {
@@ -1842,6 +1880,55 @@ enabled = true
         assert!(
             rendered.contains("  "),
             "expected 2-space indent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_preserves_four_space_indent_from_source() {
+        let doc = json_doc("{\n    \"a\": 1,\n    \"b\": {\n        \"c\": 2\n    }\n}\n");
+        let rendered = doc.render();
+        // First nested level keeps 4 spaces.
+        assert!(
+            rendered.contains("\n    \"a\": 1"),
+            "expected 4-space indent, got: {rendered}"
+        );
+        // Deeper level keeps 8 spaces.
+        assert!(
+            rendered.contains("\n        \"c\": 2"),
+            "expected 8-space nested indent, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_preserves_tab_indent_from_source() {
+        let doc = json_doc("{\n\t\"a\": 1\n}\n");
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n\t\"a\": 1"),
+            "expected tab indent, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn json_render_falls_back_to_two_space_for_minified_input() {
+        let doc = json_doc(r#"{"a":1,"b":{"c":2}}"#);
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n  \"a\""),
+            "expected 2-space default for minified input: {rendered}"
+        );
+    }
+
+    #[test]
+    fn json_render_keeps_indent_after_set_writes() {
+        // Sniff once on load, then a write through `set` must not lose
+        // the sniffed style.
+        let mut doc = json_doc("{\n    \"a\": 1\n}\n");
+        doc.set(&FieldPath::parse("b").unwrap(), json!(2)).unwrap();
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("\n    \"b\": 2"),
+            "expected 4-space indent preserved after set, got: {rendered}"
         );
     }
 

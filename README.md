@@ -61,8 +61,10 @@ directory. Paths in `source` are resolved relative to that file. Paths in
 **Supporting formats:**
 - **TOML** — format-preserving via `toml_edit` (whitespace, key order, comments).
 - **JSON** — key-order-preserving via `serde_json` with the `preserve_order`
-  feature. Renders as canonical 2-space pretty-print with a trailing newline.
-  Comments / trailing commas / JSON5 / JSONC are not supported.
+  feature. The renderer sniffs the source file's indent style (2-space,
+  4-space, tab, …) and reuses it; minified or empty inputs fall back to
+  2-space pretty-print. Always emits a trailing newline. Comments /
+  trailing commas / JSON5 / JSONC are not supported.
 
 ## Concepts
 
@@ -141,9 +143,11 @@ Pinned and wildcard selectors:
   are not supported as selector values at all.
 - Object key order is preserved on parse and round-trip (`preserve_order`
   feature of `serde_json`).
-- Whitespace and indentation are not preserved; the renderer emits
-  canonical 2-space pretty-print. Most editor / agent JSON configs already
-  use that style.
+- **Indent is preserved** by sniffing the first indented line of the source
+  file. 4-space, tab, or other consistent styles round-trip unchanged. A
+  minified or empty input falls back to 2-space pretty-print.
+- Other whitespace (blank lines between keys, alignment columns, etc) is
+  not preserved.
 
 ## Commands
 
