@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{AnyDocument, Document};
+use crate::document::{Document, TomlDocument, validate_format};
 use crate::path::FieldPath;
 
 pub fn run(config: &DotSyncConfig, name: Option<&str>) -> Result<()> {
@@ -103,7 +103,7 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         errors: Vec::new(),
     };
 
-    if let Err(error) = AnyDocument::validate_format(&target.format) {
+    if let Err(error) = validate_format(&target.format) {
         status.errors.push(format!(
             "target '{}' uses format '{}': {error}",
             target.name, target.format
@@ -111,6 +111,15 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         return status;
     }
 
+    match target.format.as_str() {
+        "toml" => inspect_target_typed::<TomlDocument>(target, &mut status),
+        _ => unreachable!("validate_format guards format"),
+    }
+
+    status
+}
+
+fn inspect_target_typed<D: Document>(target: &TargetConfig, status: &mut TargetStatus) {
     let parsed_paths = target
         .sync
         .iter()
@@ -126,8 +135,8 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         })
         .collect::<Vec<_>>();
 
-    let source = inspect_document(DocumentRole::Source, target, &mut status);
-    let target_doc = inspect_document(DocumentRole::Target, target, &mut status);
+    let source = inspect_document::<D>(DocumentRole::Source, target, status);
+    let target_doc = inspect_document::<D>(DocumentRole::Target, target, status);
 
     for (raw, path) in parsed_paths {
         if let Some(doc) = source.as_ref()
@@ -147,8 +156,6 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
             ));
         }
     }
-
-    status
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,11 +180,11 @@ impl DocumentRole {
     }
 }
 
-fn inspect_document(
+fn inspect_document<D: Document>(
     role: DocumentRole,
     target: &TargetConfig,
     status: &mut TargetStatus,
-) -> Option<AnyDocument> {
+) -> Option<D> {
     let path = role.path(target);
     let label = role.label();
 
@@ -198,7 +205,7 @@ fn inspect_document(
         return None;
     }
 
-    match AnyDocument::load(&target.format, path, false) {
+    match D::load(path, false) {
         Ok(doc) => Some(doc),
         Err(error) => {
             status.errors.push(format!(

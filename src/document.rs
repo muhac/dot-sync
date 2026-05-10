@@ -13,58 +13,35 @@ pub struct TableConflict {
     pub value: String,
 }
 
-pub trait Document {
-    fn get(&self, path: &FieldPath) -> Option<Item>;
-    fn set(&mut self, path: &FieldPath, item: Item) -> Result<()>;
+pub trait Document: Sized {
+    /// Native value type for this format.
+    type Item;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self>;
+    fn get(&self, path: &FieldPath) -> Option<Self::Item>;
+    fn set(&mut self, path: &FieldPath, item: Self::Item) -> Result<()>;
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict>;
     fn render(&self) -> String;
+
+    /// Compare two items for "already in sync" purposes. Defined on the trait
+    /// because not every native value type implements `PartialEq` (e.g.
+    /// `toml_edit::Item` doesn't), and what equality means can be
+    /// format-specific.
+    fn items_equal(a: &Self::Item, b: &Self::Item) -> bool;
+
+    /// Format-aware short rendering used in change reports. Returns
+    /// `<missing>` when the item is None so callers don't have to special-case
+    /// absent values.
+    fn summarize(item: Option<&Self::Item>) -> String;
 }
 
-pub enum AnyDocument {
-    Toml(TomlDocument),
-}
-
-impl AnyDocument {
-    pub fn validate_format(format: &str) -> Result<()> {
-        match format {
-            "toml" => Ok(()),
-            "json" => bail!("format json is recognized but not implemented yet"),
-            other => bail!("unsupported format: {other}; supported formats: toml"),
-        }
-    }
-
-    pub fn load(format: &str, path: &Path, allow_missing: bool) -> Result<Self> {
-        Self::validate_format(format)?;
-        match format {
-            "toml" => Ok(Self::Toml(TomlDocument::load(path, allow_missing)?)),
-            _ => unreachable!("format was validated"),
-        }
-    }
-}
-
-impl Document for AnyDocument {
-    fn get(&self, path: &FieldPath) -> Option<Item> {
-        match self {
-            Self::Toml(doc) => doc.get(path),
-        }
-    }
-
-    fn set(&mut self, path: &FieldPath, item: Item) -> Result<()> {
-        match self {
-            Self::Toml(doc) => doc.set(path, item),
-        }
-    }
-
-    fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
-        match self {
-            Self::Toml(doc) => doc.table_conflict(path),
-        }
-    }
-
-    fn render(&self) -> String {
-        match self {
-            Self::Toml(doc) => doc.render(),
-        }
+/// Validate the format string up front so callers can fail fast before any
+/// file I/O. Returns a list of supported format names in the error message.
+pub fn validate_format(format: &str) -> Result<()> {
+    match format {
+        "toml" => Ok(()),
+        "json" => bail!("format json is recognized but not implemented yet"),
+        other => bail!("unsupported format: {other}; supported formats: toml"),
     }
 }
 
@@ -78,8 +55,12 @@ impl TomlDocument {
             doc: DocumentMut::new(),
         }
     }
+}
 
-    pub fn load(path: &Path, allow_missing: bool) -> Result<Self> {
+impl Document for TomlDocument {
+    type Item = Item;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self> {
         if !path.exists() {
             if allow_missing {
                 return Ok(Self::empty());
@@ -94,9 +75,7 @@ impl TomlDocument {
             .with_context(|| format!("failed to parse TOML {}", path.display()))?;
         Ok(Self { doc })
     }
-}
 
-impl Document for TomlDocument {
     fn get(&self, path: &FieldPath) -> Option<Item> {
         get_from_table(self.doc.as_table(), path.segments()).cloned()
     }
@@ -111,6 +90,18 @@ impl Document for TomlDocument {
 
     fn render(&self) -> String {
         self.doc.to_string()
+    }
+
+    fn items_equal(a: &Item, b: &Item) -> bool {
+        // toml_edit::Item lacks PartialEq; compare via stable serialization.
+        a.to_string() == b.to_string()
+    }
+
+    fn summarize(item: Option<&Item>) -> String {
+        match item {
+            None => "<missing>".to_string(),
+            Some(item) => summarize_toml_item(item),
+        }
     }
 }
 
@@ -236,9 +227,7 @@ mod tests {
 
     #[test]
     fn sets_and_gets_nested_values() {
-        let mut doc = TomlDocument {
-            doc: toml_edit::DocumentMut::new(),
-        };
+        let mut doc = TomlDocument::empty();
         let path = FieldPath::parse("tui.theme").unwrap();
         doc.set(&path, value("monokai")).unwrap();
         assert_eq!(
@@ -249,9 +238,7 @@ mod tests {
 
     #[test]
     fn handles_quoted_segments() {
-        let mut doc = TomlDocument {
-            doc: toml_edit::DocumentMut::new(),
-        };
+        let mut doc = TomlDocument::empty();
         let path = FieldPath::parse("plugins.\"github@openai-curated\".enabled").unwrap();
         doc.set(&path, value(true)).unwrap();
         assert_eq!(

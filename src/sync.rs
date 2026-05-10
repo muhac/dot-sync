@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{AnyDocument, Document};
+use crate::document::{Document, TomlDocument, validate_format};
 use crate::path::FieldPath;
 
 #[derive(Debug, Clone, Copy)]
@@ -94,7 +94,10 @@ pub fn run(
 fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
     let mut violators: Vec<(String, Vec<Conflict>)> = Vec::new();
     for target in targets {
-        let conflicts = target_conflicts(target)?;
+        let conflicts = dispatch_format(target, |t| match t.format.as_str() {
+            "toml" => target_conflicts::<TomlDocument>(t),
+            _ => unreachable!("dispatch_format guards format"),
+        })?;
         if !conflicts.is_empty() {
             violators.push((target.name.clone(), conflicts));
         }
@@ -113,18 +116,27 @@ fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
     );
 }
 
-fn target_conflicts(target: &TargetConfig) -> Result<Vec<Conflict>> {
-    AnyDocument::validate_format(&target.format).map_err(|error| {
+fn target_conflicts<D: Document>(target: &TargetConfig) -> Result<Vec<Conflict>> {
+    let source = D::load(&target.source, true)?;
+    let target_doc = D::load(&target.target, true)?;
+    let sync_paths = parse_paths(target)?;
+    Ok(collect_conflicts::<D>(&source, &target_doc, &sync_paths))
+}
+
+/// Validate the target's format and dispatch to a typed pipeline. Centralizes
+/// the format match so each engine entry point doesn't repeat it.
+fn dispatch_format<T>(
+    target: &TargetConfig,
+    typed: impl FnOnce(&TargetConfig) -> Result<T>,
+) -> Result<T> {
+    validate_format(&target.format).map_err(|error| {
         anyhow!(
             "target '{}' uses format '{}': {error}",
             target.name,
             target.format
         )
     })?;
-    let source = AnyDocument::load(&target.format, &target.source, true)?;
-    let target_doc = AnyDocument::load(&target.format, &target.target, true)?;
-    let sync_paths = parse_paths(target)?;
-    Ok(collect_conflicts(&source, &target_doc, &sync_paths))
+    typed(target)
 }
 
 fn select_targets<'a>(
@@ -143,21 +155,24 @@ fn select_targets<'a>(
 }
 
 fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions) -> Result<()> {
-    AnyDocument::validate_format(&target.format).map_err(|error| {
-        anyhow!(
-            "target '{}' uses format '{}': {error}",
-            target.name,
-            target.format
-        )
-    })?;
+    dispatch_format(target, |t| match t.format.as_str() {
+        "toml" => run_target_typed::<TomlDocument>(t, direction, options),
+        _ => unreachable!("dispatch_format guards format"),
+    })
+}
 
-    let mut source = load_document_for_target(
+fn run_target_typed<D: Document>(
+    target: &TargetConfig,
+    direction: Direction,
+    options: SyncOptions,
+) -> Result<()> {
+    let mut source = load_document_for_target::<D>(
         target,
         DocumentRole::Source,
         direction,
         matches!(direction, Direction::Pull | Direction::Sync),
     )?;
-    let mut target_doc = load_document_for_target(
+    let mut target_doc = load_document_for_target::<D>(
         target,
         DocumentRole::Target,
         direction,
@@ -165,12 +180,12 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     )?;
 
     let sync_paths = parse_paths(target)?;
-    let warnings = detect_table_conflicts(&source, &target_doc, &sync_paths, direction);
+    let warnings = detect_table_conflicts::<D>(&source, &target_doc, &sync_paths, direction);
 
     let changes = match direction {
-        Direction::Pull => pull(&mut source, &target_doc, &sync_paths)?,
-        Direction::Push => push(&source, &mut target_doc, &sync_paths)?,
-        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths, options.conflict)?,
+        Direction::Pull => pull::<D>(&mut source, &target_doc, &sync_paths)?,
+        Direction::Push => push::<D>(&source, &mut target_doc, &sync_paths)?,
+        Direction::Sync => sync::<D>(&mut source, &mut target_doc, &sync_paths, options.conflict)?,
     };
 
     report_changes(target, direction, options, &changes, &warnings);
@@ -245,12 +260,12 @@ impl DocumentRole {
     }
 }
 
-fn load_document_for_target(
+fn load_document_for_target<D: Document>(
     target: &TargetConfig,
     role: DocumentRole,
     direction: Direction,
     allow_missing: bool,
-) -> Result<AnyDocument> {
+) -> Result<D> {
     let path = role.path(target);
     if !path.exists() && !allow_missing {
         bail!(
@@ -263,7 +278,7 @@ fn load_document_for_target(
         );
     }
 
-    AnyDocument::load(&target.format, path, allow_missing).with_context(|| {
+    D::load(path, allow_missing).with_context(|| {
         format!(
             "failed to load {} file for target '{}': {}",
             role.label(),
@@ -273,42 +288,34 @@ fn load_document_for_target(
     })
 }
 
-fn pull(
-    source: &mut dyn Document,
-    target: &dyn Document,
-    paths: &[ParsedPath],
-) -> Result<Vec<Change>> {
+fn pull<D: Document>(source: &mut D, target: &D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for path in paths {
-        if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
+        if let Some(change) = apply_one_way::<D>(source, target, path, Destination::Source)? {
             changes.push(change);
         }
     }
     Ok(changes)
 }
 
-fn push(
-    source: &dyn Document,
-    target: &mut dyn Document,
-    paths: &[ParsedPath],
-) -> Result<Vec<Change>> {
+fn push<D: Document>(source: &D, target: &mut D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for path in paths {
-        if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
+        if let Some(change) = apply_one_way::<D>(target, source, path, Destination::Target)? {
             changes.push(change);
         }
     }
     Ok(changes)
 }
 
-fn sync(
-    source: &mut dyn Document,
-    target: &mut dyn Document,
+fn sync<D: Document>(
+    source: &mut D,
+    target: &mut D,
     paths: &[ParsedPath],
     mode: ConflictMode,
 ) -> Result<Vec<Change>> {
     if matches!(mode, ConflictMode::FailOnConflict) {
-        let conflicts = collect_conflicts(source, target, paths);
+        let conflicts = collect_conflicts::<D>(source, target, paths);
         if !conflicts.is_empty() {
             print_conflicts(&conflicts);
             bail!("fail-on-conflict: {} conflicting field(s)", conflicts.len());
@@ -321,35 +328,29 @@ fn sync(
         let target_item = target.get(&path.path);
         match (source_item, target_item) {
             (None, None) => continue,
-            (Some(s), Some(t)) if same_item(&s, &t) => continue,
+            (Some(s), Some(t)) if D::items_equal(&s, &t) => continue,
             (Some(_), Some(_)) => {
                 // Both sides have a value and they differ — conflict mode picks the winner.
-                let (into, from, dest) = match mode {
-                    ConflictMode::TargetWins => (
-                        source as &mut dyn Document,
-                        target as &dyn Document,
-                        Destination::Source,
-                    ),
-                    ConflictMode::SourceWins => (
-                        target as &mut dyn Document,
-                        source as &dyn Document,
-                        Destination::Target,
-                    ),
+                let (into, from, dest): (&mut D, &D, Destination) = match mode {
+                    ConflictMode::TargetWins => (source, target, Destination::Source),
+                    ConflictMode::SourceWins => (target, source, Destination::Target),
                     ConflictMode::FailOnConflict => unreachable!("checked above"),
                 };
-                if let Some(change) = apply_one_way(into, from, path, dest)? {
+                if let Some(change) = apply_one_way::<D>(into, from, path, dest)? {
                     changes.push(change);
                 }
             }
             (None, Some(_)) => {
                 // Only target has the value; fill source regardless of mode.
-                if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
+                if let Some(change) = apply_one_way::<D>(source, target, path, Destination::Source)?
+                {
                     changes.push(change);
                 }
             }
             (Some(_), None) => {
                 // Only source has the value; fill target regardless of mode.
-                if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
+                if let Some(change) = apply_one_way::<D>(target, source, path, Destination::Target)?
+                {
                     changes.push(change);
                 }
             }
@@ -358,23 +359,19 @@ fn sync(
     Ok(changes)
 }
 
-fn collect_conflicts(
-    source: &dyn Document,
-    target: &dyn Document,
-    paths: &[ParsedPath],
-) -> Vec<Conflict> {
+fn collect_conflicts<D: Document>(source: &D, target: &D, paths: &[ParsedPath]) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
     for path in paths {
         let (Some(s), Some(t)) = (source.get(&path.path), target.get(&path.path)) else {
             continue;
         };
-        if same_item(&s, &t) {
+        if D::items_equal(&s, &t) {
             continue;
         }
         conflicts.push(Conflict {
             path: path.raw.clone(),
-            source_value: summarize_item(Some(&s)),
-            target_value: summarize_item(Some(&t)),
+            source_value: D::summarize(Some(&s)),
+            target_value: D::summarize(Some(&t)),
         });
     }
     conflicts
@@ -395,9 +392,9 @@ struct Conflict {
     target_value: String,
 }
 
-fn apply_one_way(
-    into: &mut dyn Document,
-    from: &dyn Document,
+fn apply_one_way<D: Document>(
+    into: &mut D,
+    from: &D,
     path: &ParsedPath,
     destination: Destination,
 ) -> Result<Option<Change>> {
@@ -408,7 +405,7 @@ fn apply_one_way(
     let into_conflict = into.table_conflict(&path.path);
     if into_item
         .as_ref()
-        .is_some_and(|item| same_item(item, &from_item))
+        .is_some_and(|item| D::items_equal(item, &from_item))
     {
         return Ok(None);
     }
@@ -417,11 +414,11 @@ fn apply_one_way(
     } else {
         Action::Add
     };
-    let from_value = summarize_item(Some(&from_item));
+    let from_value = D::summarize(Some(&from_item));
     let into_value = into_conflict
         .as_ref()
         .map(|conflict| conflict.value.clone())
-        .unwrap_or_else(|| summarize_item(into_item.as_ref()));
+        .unwrap_or_else(|| D::summarize(into_item.as_ref()));
     into.set(&path.path, from_item)?;
 
     // Change records always read source-side / target-side from the user's
@@ -465,13 +462,9 @@ fn parse_paths(target: &TargetConfig) -> Result<Vec<ParsedPath>> {
         .collect()
 }
 
-fn same_item(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
-    left.to_string() == right.to_string()
-}
-
-fn detect_table_conflicts(
-    source: &dyn Document,
-    target: &dyn Document,
+fn detect_table_conflicts<D: Document>(
+    source: &D,
+    target: &D,
     paths: &[ParsedPath],
     direction: Direction,
 ) -> Vec<Warning> {
@@ -499,29 +492,6 @@ fn detect_table_conflicts(
         }
     }
     warnings
-}
-
-fn summarize_item(item: Option<&toml_edit::Item>) -> String {
-    let Some(item) = item else {
-        return "<missing>".to_string();
-    };
-
-    let mut rendered = item
-        .to_string()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if rendered.is_empty() {
-        rendered = item.type_name().to_string();
-    }
-    const LIMIT: usize = 120;
-    if rendered.chars().count() > LIMIT {
-        let mut truncated = rendered.chars().take(LIMIT - 3).collect::<String>();
-        truncated.push_str("...");
-        truncated
-    } else {
-        rendered
-    }
 }
 
 fn report_changes(
