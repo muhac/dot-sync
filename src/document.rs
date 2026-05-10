@@ -2423,7 +2423,21 @@ impl Document for EnvDocument {
     }
 
     fn discover_field_tree(&self) -> FieldTree {
-        unimplemented!("EnvDocument::discover_field_tree — wired in a later commit")
+        // env is flat — every key becomes a top-level leaf. Insertion
+        // order is preserved (matches what the user sees in their
+        // file); duplicate keys collapse to a single leaf labeled
+        // with the first appearance.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut roots = Vec::new();
+        for line in &self.lines {
+            if let EnvLine::Entry(e) = line
+                && seen.insert(e.key.clone())
+            {
+                let path = leaf_path(&[e.key.as_str()]);
+                roots.push(FieldNode::leaf(e.key.clone(), path));
+            }
+        }
+        FieldTree { roots }
     }
 }
 
@@ -5446,5 +5460,100 @@ KEY3=gamma
             reloaded.get(&FieldPath::parse("MSG").unwrap()),
             Some(value.to_string())
         );
+    }
+
+    // ----- discover_field_tree -----
+
+    use crate::discovery::FieldNodeKind;
+
+    fn leaf_displays(tree: &crate::discovery::FieldTree) -> Vec<String> {
+        tree.roots.iter().map(|n| n.display.clone()).collect()
+    }
+
+    fn leaf_paths(tree: &crate::discovery::FieldTree) -> Vec<String> {
+        tree.roots
+            .iter()
+            .filter_map(|n| n.path.as_ref().map(|p| p.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn discover_returns_empty_tree_for_empty_doc() {
+        let doc = EnvDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty());
+    }
+
+    #[test]
+    fn discover_emits_one_leaf_per_key_in_file_order() {
+        let (_dir, doc) = doc_from(
+            "\
+NODE_VERSION=22
+# comment
+
+DATABASE_URL=postgres://localhost/db
+export PORT=8080
+",
+        );
+        let tree = doc.discover_field_tree();
+        assert_eq!(
+            leaf_displays(&tree),
+            vec![
+                "NODE_VERSION".to_string(),
+                "DATABASE_URL".to_string(),
+                "PORT".to_string(),
+            ]
+        );
+        // Every node is a true Leaf — env is flat, no containers.
+        for node in &tree.roots {
+            assert_eq!(node.kind, FieldNodeKind::Leaf);
+            assert!(node.children.is_empty());
+        }
+    }
+
+    #[test]
+    fn discover_dedupes_duplicate_keys() {
+        // Same key defined multiple times collapses to a single leaf
+        // (last-wins semantics: the picker should show it once).
+        let (_dir, doc) = doc_from(
+            "\
+KEY=first
+KEY=second
+KEY=third
+",
+        );
+        let tree = doc.discover_field_tree();
+        assert_eq!(leaf_displays(&tree), vec!["KEY".to_string()]);
+    }
+
+    #[test]
+    fn discover_skips_blank_and_comment_lines() {
+        let (_dir, doc) = doc_from(
+            "\
+# this is a header
+
+A=1
+# inline
+
+B=2
+",
+        );
+        let tree = doc.discover_field_tree();
+        assert_eq!(leaf_paths(&tree), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn discover_paths_round_trip_to_get() {
+        // The picker's foundational contract: every leaf path it
+        // emits must actually fetch a value when handed back to get.
+        let (_dir, doc) = doc_from("FOO=1\nBAR=2\nexport BAZ=3\n");
+        let tree = doc.discover_field_tree();
+        for path_str in leaf_paths(&tree) {
+            let path = FieldPath::parse(&path_str).unwrap();
+            assert!(
+                doc.get(&path).is_some(),
+                "no value at picker path {path_str}"
+            );
+        }
     }
 }
