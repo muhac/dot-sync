@@ -1799,9 +1799,23 @@ impl Document for GitConfigDocument {
     fn set(&mut self, path: &FieldPath, item: String) -> Result<()> {
         let key = path_to_gitconfig_key(path)?;
         let sub = key.subsection.as_deref().map(bstr::BStr::new);
+        // Multivar guard: if the destination key already has more than
+        // one value (e.g. multiple `remote.origin.fetch =` lines),
+        // surgical sync can't pick which one to overwrite. Bail rather
+        // than silently mangle the file. Same "data corruption" stance
+        // that the array-selector backends take on duplicate
+        // identifiers.
+        if let Ok(values) = self.file.raw_values_by(key.section.as_str(), sub, key.key.as_str())
+            && values.len() > 1
+        {
+            bail!(
+                "gitconfig path '{path}' has {} values (multivar); \
+                 dot-sync requires single-valued keys for surgical sync",
+                values.len()
+            );
+        }
         // gix-config's `File<'static>` requires owned key + value
-        // material — `String → ValueName<'static>` and `BString` cover
-        // that. The library validates section / key names against
+        // material. The library validates section / key names against
         // git's grammar (alphanumeric + dash, leading alpha) and
         // returns its own error; surface that verbatim.
         let value: &bstr::BStr = bstr::BStr::new(item.as_bytes());
@@ -1843,8 +1857,20 @@ impl Document for GitConfigDocument {
         }
     }
 
-    fn expand(&self, _pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
-        unimplemented!("GitConfigDocument::expand — wired in next commit")
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        // gitconfig has no arrays of objects — the only multi-value
+        // construct is multivar (multiple lines with the same key),
+        // which is handled at `set` time. Selector segments
+        // (`arr[name="x"]` or `arr[name]`) can never resolve here.
+        if pattern.segments().iter().any(|s| s.select.is_some()) {
+            bail!(
+                "gitconfig has no arrays of objects; selector path '{pattern}' is not supported"
+            );
+        }
+        Ok(vec![ResolvedPath {
+            identity: Vec::new(),
+            path: pattern.clone(),
+        }])
     }
 
     fn discover_field_tree(&self) -> FieldTree {
@@ -3590,5 +3616,55 @@ mod gitconfig_tests {
         let path = FieldPath::parse("a.b.c.d").unwrap();
         let err = doc.set(&path, "x".to_string()).unwrap_err();
         assert!(err.to_string().contains("too many segments"), "msg: {err}");
+    }
+
+    // ----- multivar + selector rejection -----
+
+    #[test]
+    fn set_rejects_destination_with_multivar() {
+        // Target file already has two `fetch` lines under [remote "origin"].
+        // Trying to sync that path is data corruption: which line do we
+        // overwrite? Bail rather than guess.
+        let original = "\
+[remote \"origin\"]
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.origin.fetch").unwrap();
+        let err = doc.set(&path, "+refs/replace/*".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("multivar"), "msg: {s}");
+        assert!(s.contains("2 values"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_rejects_path_with_array_selector() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("a[name=\"foo\"].b").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        assert!(err.to_string().contains("selectors"), "msg: {err}");
+    }
+
+    #[test]
+    fn expand_passes_through_clean_paths() {
+        let doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("user.email").unwrap();
+        let resolved = doc.expand(&path).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, path);
+        assert!(resolved[0].identity.is_empty());
+    }
+
+    #[test]
+    fn expand_rejects_paths_with_selectors() {
+        let doc = GitConfigDocument::empty();
+        let pinned = FieldPath::parse("arr[k=\"v\"].field").unwrap();
+        let err = doc.expand(&pinned).unwrap_err();
+        assert!(err.to_string().contains("no arrays of objects"), "msg: {err}");
+
+        let wildcard = FieldPath::parse("arr[k].field").unwrap();
+        let err = doc.expand(&wildcard).unwrap_err();
+        assert!(err.to_string().contains("no arrays of objects"), "msg: {err}");
     }
 }
