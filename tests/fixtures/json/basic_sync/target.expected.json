@@ -3,10 +3,7 @@
     "theme": "monokai"
   },
   "max_bytes": 65536,
-  "fallback_filenames": [
-    "AGENTS.md",
-    "CLAUDE.md"
-  ],
+  "fallback_filenames": ["AGENTS.md", "CLAUDE.md"],
   "notice": {
     "hide_nudge": true
   }

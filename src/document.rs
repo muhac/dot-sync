@@ -698,46 +698,56 @@ fn set_in_inline_descend(table: &mut InlineTable, segments: &[Segment], item: It
 // JsonDocument
 // =====================================================================
 //
-// `serde_json::Value` is the native item. The `preserve_order` feature
-// keeps object keys in insertion order on parse and round-trip, mirroring
-// `toml_edit`'s format-preserving behavior at the structural level.
+// Backed by `jsonc-parser` with the `cst` feature. Storage is a CST tree
+// that retains comments, trailing commas, blank lines, and original
+// whitespace — round-trips through `pull` / `push` / `sync` lose nothing
+// the user wrote.
 //
-// JSON has no comments and no inline-vs-block array distinction, so the
-// implementation is structurally simpler than the TOML side: arrays are
-// always `Vec<Value>` and there is exactly one container type per shape.
+// `Self::Item` stays as `serde_json::Value` because Item is the cross-side
+// data carrier the engine moves between source and target. Comments don't
+// transfer with values during sync — only the value moves; each side's
+// pre-existing comments stay attached where the user put them.
+//
+// What's preserved:
+// - Object key order (CST preserves; new keys append)
+// - Comments (line `//` and block `/* */`), trailing commas, blank lines
+// - Indent style: jsonc-parser infers `indent_text()` from existing
+//   structure when inserting — 4-space, tab, 2-space all round-trip
+// - Trailing-comma policy follows the source (`uses_trailing_commas`)
+//
+// What's not:
+// - Original string-escape sequences when a string value is *replaced*
+//   (jsonc-parser re-emits canonical escapes for the new value)
+// - JSON5 forms beyond JSONC (single-quoted strings, unquoted keys,
+//   hex / Infinity / NaN literals, etc.)
 //
 // Limitations explicitly accepted in v1:
-// - Whitespace and indentation are not preserved; render emits canonical
-//   2-space pretty-print plus trailing newline. Most editor / agent JSON
-//   configs already use that style.
-// - Comments / trailing commas / JSON5 / JSONC are not supported.
 // - Floats are not supported as selector values; `[k=1.5]` is rejected
 //   by the path parser, and a wildcard hit on a numeric field that is
 //   not representable as `i64` is silently skipped (same policy as
 //   non-scalar items).
 
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstArray, CstInputValue, CstObject, CstObjectProp, CstRootNode};
+use serde_json::Value as JsonValue;
 
 pub struct JsonDocument {
-    /// Root document. Always a `JsonValue::Object` for our purposes —
-    /// `load` normalizes empty / missing files to an empty object so
-    /// `get` / `set` can descend without special-casing the root.
-    root: JsonValue,
-    /// Indent unit used by `render`. Sniffed from the source file's first
-    /// indented line when available; falls back to `DEFAULT_JSON_INDENT`
-    /// for empty / missing / minified inputs. This way an existing
-    /// 4-space or tab-indented config keeps its style after a write.
-    indent: Vec<u8>,
+    /// CST root. Holds the full source text plus parsed structure with
+    /// all trivia (comments, whitespace) attached. `CstRootNode` is
+    /// `Rc`-based with interior mutability — `&mut self` on the trait
+    /// methods is honored at the struct level even though the underlying
+    /// CST mutates through `&self` accessors.
+    root: CstRootNode,
 }
-
-const DEFAULT_JSON_INDENT: &[u8] = b"  ";
 
 impl JsonDocument {
     pub fn empty() -> Self {
-        Self {
-            root: JsonValue::Object(JsonMap::new()),
-            indent: DEFAULT_JSON_INDENT.to_vec(),
-        }
+        // Parsing `{}` is the cheapest way to get a root with an empty
+        // object value; the alternative (`set_value(CstInputValue::Object)`)
+        // requires a root to exist already.
+        let root = CstRootNode::parse("{}", &ParseOptions::default())
+            .expect("hardcoded {} parses cleanly");
+        Self { root }
     }
 }
 
@@ -762,48 +772,42 @@ impl Document for JsonDocument {
             return Ok(Self::empty());
         }
 
-        let indent = sniff_json_indent(&content);
-        let root: JsonValue = serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse JSON {}", path.display()))?;
-        if !root.is_object() {
-            bail!(
-                "expected JSON object at root of {}, got {}",
-                path.display(),
-                json_type_name(&root)
-            );
+        let root = CstRootNode::parse(&content, &ParseOptions::default())
+            .map_err(|e| anyhow::anyhow!("failed to parse JSONC {}: {e}", path.display()))?;
+        if root.object_value().is_none() {
+            bail!("expected JSON object at root of {}", path.display());
         }
-        Ok(Self { root, indent })
+        Ok(Self { root })
     }
 
     fn get(&self, path: &FieldPath) -> Option<JsonValue> {
-        // Returns `Some(JsonValue::Null)` when the path resolves to an
-        // explicit `null`, distinct from `None` ("absent"). Sync rules
-        // treat the two cases differently — explicit null is a value
-        // and gets propagated; missing is a no-op or fill-in.
-        json_descend_get(&self.root, path.segments())
+        // `Some(Value::Null)` distinguishes explicit null from absent
+        // (`None`). Sync rules treat the two cases differently — null is
+        // a value that propagates; missing is a no-op or fill-in.
+        let root_obj = self.root.object_value()?;
+        json_get(&root_obj, path.segments())
     }
 
     fn set(&mut self, path: &FieldPath, item: JsonValue) -> Result<()> {
-        json_descend_set(&mut self.root, path.segments(), item)
+        let root_obj = self.root.object_value_or_set();
+        json_set(&root_obj, path.segments(), item)
     }
 
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
-        json_table_conflict(&self.root, path.segments())
+        let root_obj = self.root.object_value()?;
+        json_table_conflict_walk(&root_obj, path.segments(), &mut Vec::new())
     }
 
     fn render(&self) -> String {
-        // Use the sniffed indent so an existing 4-space or tab-indented
-        // file keeps its style after a write. Append a trailing newline
-        // for POSIX cleanliness.
-        use serde::Serialize;
-        let formatter = serde_json::ser::PrettyFormatter::with_indent(&self.indent);
-        let mut buf = Vec::new();
-        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        if self.root.serialize(&mut serializer).is_err() {
-            return String::new();
+        // CST `Display` re-emits the full source with every trivia child
+        // intact — comments, blank lines, trailing commas, original
+        // indentation. We just guarantee a trailing newline for POSIX
+        // cleanliness when one isn't already present (e.g. `empty()`,
+        // which parses `{}` without a final newline).
+        let mut s = self.root.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
         }
-        let mut s = String::from_utf8(buf).unwrap_or_default();
-        s.push('\n');
         s
     }
 
@@ -826,37 +830,22 @@ impl Document for JsonDocument {
             }]);
         }
         let mut out = Vec::new();
-        let obj = self
+        let root_obj = self
             .root
-            .as_object()
+            .object_value()
             .expect("JsonDocument root is always an object");
-        json_expand_walk(obj, pattern.segments(), Vec::new(), Vec::new(), &mut out)?;
+        json_expand_walk(
+            &root_obj,
+            pattern.segments(),
+            Vec::new(),
+            Vec::new(),
+            &mut out,
+        )?;
         Ok(out)
     }
 }
 
 // ----- JSON helpers -----
-
-/// Detect the indent unit used by a pretty-printed JSON document. Returns
-/// the leading whitespace of the first indented line — that's the first
-/// nested level, which equals one indent unit for any sane pretty-printer
-/// (serde_json, jq, IDE formatters, etc). Falls back to the default when
-/// the file is minified, empty after the opening brace, or otherwise has
-/// no indented content to learn from.
-fn sniff_json_indent(content: &str) -> Vec<u8> {
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let leading_len = line.len() - trimmed.len();
-        if leading_len == 0 {
-            continue;
-        }
-        return line.as_bytes()[..leading_len].to_vec();
-    }
-    DEFAULT_JSON_INDENT.to_vec()
-}
 
 fn json_type_name(v: &JsonValue) -> &'static str {
     match v {
@@ -870,9 +859,6 @@ fn json_type_name(v: &JsonValue) -> &'static str {
 }
 
 fn summarize_json_item(item: &JsonValue) -> String {
-    // `serde_json::to_string` is the canonical compact form for every JSON
-    // value (quotes strings, prints `null` / `true` / numbers). Reports stay
-    // one line because the compact serializer never inserts whitespace.
     let mut rendered = serde_json::to_string(item).unwrap_or_default();
     if rendered.is_empty() {
         rendered = json_type_name(item).to_string();
@@ -887,211 +873,318 @@ fn summarize_json_item(item: &JsonValue) -> String {
     }
 }
 
-/// True when `obj[key]` matches the typed pinned-selector value. Type-strict.
-fn json_matches_pinned(obj: &JsonMap<String, JsonValue>, key: &str, value: &SelectorValue) -> bool {
-    let Some(v) = obj.get(key) else {
+/// Convert a `serde_json::Value` (the engine's cross-side carrier) into a
+/// `CstInputValue` (jsonc-parser's insert/replace value type). Recursion
+/// mirrors the value tree; all leaves go through `From` impls.
+fn value_to_cst_input(v: &JsonValue) -> CstInputValue {
+    match v {
+        JsonValue::Null => CstInputValue::Null,
+        JsonValue::Bool(b) => CstInputValue::Bool(*b),
+        JsonValue::Number(n) => CstInputValue::Number(n.to_string()),
+        JsonValue::String(s) => CstInputValue::String(s.clone()),
+        JsonValue::Array(a) => CstInputValue::Array(a.iter().map(value_to_cst_input).collect()),
+        JsonValue::Object(o) => CstInputValue::Object(
+            o.iter()
+                .map(|(k, v)| (k.clone(), value_to_cst_input(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Build a `CstInputValue` from a `SelectorValue`. Used to seed a new
+/// array entry whose pinning key didn't exist on this side yet.
+fn selector_value_to_cst_input(value: &SelectorValue) -> CstInputValue {
+    match value {
+        SelectorValue::String(s) => CstInputValue::String(s.clone()),
+        SelectorValue::Int(i) => CstInputValue::Number(i.to_string()),
+        SelectorValue::Bool(b) => CstInputValue::Bool(*b),
+    }
+}
+
+/// True when CST `obj[key]` matches the typed pinned-selector value.
+/// Type-strict: `Int(8080)` never matches the JSON string `"8080"`.
+///
+/// Inspects leaves directly (avoiding `to_serde_value` on the value node)
+/// because jsonc-parser 0.32.3 has a bug where `arr.elements()` after an
+/// `append()` can expose a phantom whitespace "string lit" whose
+/// `decoded_value()` panics inside `parse_string`. Going through
+/// `as_string_lit().decoded_value()` is fine for *real* string lits the
+/// caller has already filtered to (e.g. via `as_object()` first), and
+/// for booleans / numbers we don't use `decoded_value` at all.
+fn cst_object_matches(obj: &CstObject, key: &str, value: &SelectorValue) -> bool {
+    let Some(prop) = obj.get(key) else {
         return false;
     };
-    match (value, v) {
-        (SelectorValue::String(s), JsonValue::String(t)) => s == t,
-        (SelectorValue::Int(i), JsonValue::Number(n)) => n.as_i64() == Some(*i),
-        (SelectorValue::Bool(b), JsonValue::Bool(c)) => b == c,
-        _ => false,
-    }
-}
-
-/// Extract the wildcard-key value from `obj[key]` as a `SelectorValue` if it
-/// is one of the supported scalar types. Floats / arrays / objects / null
-/// are skipped (the item is excluded from wildcard expansion), mirroring
-/// the TOML side's behavior on unsupported types.
-fn json_item_selector_value(obj: &JsonMap<String, JsonValue>, key: &str) -> Option<SelectorValue> {
-    match obj.get(key)? {
-        JsonValue::String(s) => Some(SelectorValue::String(s.clone())),
-        JsonValue::Number(n) => n.as_i64().map(SelectorValue::Int),
-        JsonValue::Bool(b) => Some(SelectorValue::Bool(*b)),
-        _ => None,
-    }
-}
-
-/// Build a `JsonValue` from a `SelectorValue`, used to seed a new array
-/// entry whose pinning key didn't exist on this side yet.
-fn selector_value_to_json(value: &SelectorValue) -> JsonValue {
-    match value {
-        SelectorValue::String(s) => JsonValue::String(s.clone()),
-        SelectorValue::Int(i) => JsonValue::Number((*i).into()),
-        SelectorValue::Bool(b) => JsonValue::Bool(*b),
-    }
-}
-
-fn json_descend_get(value: &JsonValue, segments: &[Segment]) -> Option<JsonValue> {
-    let Some((first, rest)) = segments.split_first() else {
-        return Some(value.clone());
+    let Some(val) = prop.value() else {
+        return false;
     };
+    match value {
+        SelectorValue::String(s) => match val.as_string_lit() {
+            Some(sl) => sl
+                .decoded_value()
+                .ok()
+                .as_deref()
+                .is_some_and(|got| got == s.as_str()),
+            None => false,
+        },
+        SelectorValue::Int(i) => match val.as_number_lit() {
+            Some(nl) => nl.to_string().parse::<i64>().is_ok_and(|got| got == *i),
+            None => false,
+        },
+        SelectorValue::Bool(b) => match val.as_boolean_lit() {
+            Some(bl) => bl.value() == *b,
+            None => false,
+        },
+    }
+}
+
+/// Extract the wildcard-key value from CST `obj[key]` as a `SelectorValue`
+/// if it's one of the supported scalar types. Floats / arrays / objects /
+/// null are skipped — the item drops out of wildcard expansion.
+fn cst_object_selector_value(obj: &CstObject, key: &str) -> Option<SelectorValue> {
+    let prop = obj.get(key)?;
+    let val = prop.value()?;
+    if let Some(sl) = val.as_string_lit() {
+        return sl.decoded_value().ok().map(SelectorValue::String);
+    }
+    if let Some(nl) = val.as_number_lit() {
+        return nl.to_string().parse::<i64>().ok().map(SelectorValue::Int);
+    }
+    if let Some(bl) = val.as_boolean_lit() {
+        return Some(SelectorValue::Bool(bl.value()));
+    }
+    None
+}
+
+fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
+    let (first, rest) = segments.split_first()?;
     let last = rest.is_empty();
     match &first.select {
         None => {
-            let obj = value.as_object()?;
-            // `Some(Null)` when the key is present with explicit null.
-            // `None` when the key is absent. The distinction is preserved
-            // through clone() because `obj.get` returns Option<&Value>.
-            let v = obj.get(&first.name)?;
+            let prop = obj.get(&first.name)?;
+            let val_node = prop.value()?;
             if last {
-                return Some(v.clone());
+                return val_node.to_serde_value();
             }
-            json_descend_get(v, rest)
+            let next_obj = val_node.as_object()?;
+            json_get(&next_obj, rest)
         }
-        Some(ItemSelector::Pinned { key, value: pv }) => {
-            let obj = value.as_object()?;
-            let arr = obj.get(&first.name)?.as_array()?;
-            let mut hits = arr.iter().filter(|it| {
-                it.as_object()
-                    .map(|o| json_matches_pinned(o, key, pv))
-                    .unwrap_or(false)
-            });
-            let matched = hits.next()?;
-            if last {
-                return Some(matched.clone());
+        Some(ItemSelector::Pinned { key, value }) => {
+            let arr = obj.array_value(&first.name)?;
+            for elem in arr.elements() {
+                let Some(elem_obj) = elem.as_object() else {
+                    continue;
+                };
+                if cst_object_matches(&elem_obj, key, value) {
+                    if last {
+                        return elem.to_serde_value();
+                    }
+                    return json_get(&elem_obj, rest);
+                }
             }
-            json_descend_get(matched, rest)
+            None
         }
         Some(ItemSelector::Wildcard { .. }) => None,
     }
 }
 
-fn json_table_conflict(root: &JsonValue, segments: &[Segment]) -> Option<TableConflict> {
-    let obj = root.as_object()?;
-    json_table_conflict_walk(obj, segments, &mut Vec::new())
-}
-
 fn json_table_conflict_walk(
-    obj: &JsonMap<String, JsonValue>,
+    obj: &CstObject,
     segments: &[Segment],
     prefix: &mut Vec<String>,
 ) -> Option<TableConflict> {
     let (first, rest) = segments.split_first()?;
     prefix.push(first.to_string());
-    let item = obj.get(&first.name)?;
+    let prop = obj.get(&first.name)?;
+    let val_node = prop.value()?;
     match &first.select {
         None => {
             if rest.is_empty() {
                 return None;
             }
-            match item.as_object() {
-                Some(next) => json_table_conflict_walk(next, rest, prefix),
-                None => Some(TableConflict {
-                    path: prefix.join("."),
-                    kind: json_type_name(item).to_string(),
-                    value: summarize_json_item(item),
-                }),
+            match val_node.as_object() {
+                Some(next) => json_table_conflict_walk(&next, rest, prefix),
+                None => Some(cst_conflict_report(prefix, &val_node)),
             }
         }
         Some(ItemSelector::Pinned { key, value: pv }) => {
-            // Container at first.name must be an array.
-            let Some(arr) = item.as_array() else {
-                return Some(TableConflict {
-                    path: prefix.join("."),
-                    kind: json_type_name(item).to_string(),
-                    value: summarize_json_item(item),
-                });
+            let Some(arr) = val_node.as_array() else {
+                return Some(cst_conflict_report(prefix, &val_node));
             };
-            // Missing matched item is not a conflict — `set` will append.
-            let matched = arr
-                .iter()
-                .find_map(|it| it.as_object().filter(|o| json_matches_pinned(o, key, pv)))?;
-            json_table_conflict_walk(matched, rest, prefix)
+            let matched = arr.elements().into_iter().find_map(|el| {
+                let elem_obj = el.as_object()?;
+                if cst_object_matches(&elem_obj, key, pv) {
+                    Some(elem_obj)
+                } else {
+                    None
+                }
+            })?;
+            json_table_conflict_walk(&matched, rest, prefix)
         }
         Some(ItemSelector::Wildcard { .. }) => {
-            if !item.is_array() {
-                return Some(TableConflict {
-                    path: prefix.join("."),
-                    kind: json_type_name(item).to_string(),
-                    value: summarize_json_item(item),
-                });
+            if val_node.as_array().is_none() {
+                return Some(cst_conflict_report(prefix, &val_node));
             }
             None
         }
     }
 }
 
-fn json_descend_set(root: &mut JsonValue, segments: &[Segment], item: JsonValue) -> Result<()> {
+/// Build a `TableConflict` from a CST node directly. We deliberately do NOT
+/// call `to_serde_value` on the offending node — for container nodes that
+/// recurses into descendants and trips over jsonc-parser 0.32.3's phantom
+/// whitespace "string lit" bug after an array `append()`. Instead, derive
+/// `kind` from CST type accessors and `value` from `Display` (which uses
+/// `raw_value` and is panic-safe).
+fn cst_conflict_report(prefix: &[String], node: &jsonc_parser::cst::CstNode) -> TableConflict {
+    let kind = if node.as_object().is_some() {
+        "object"
+    } else if node.as_array().is_some() {
+        "array"
+    } else if node.as_string_lit().is_some() {
+        "string"
+    } else if node.as_number_lit().is_some() {
+        "number"
+    } else if node.as_boolean_lit().is_some() {
+        "bool"
+    } else if node.as_null_keyword().is_some() {
+        "null"
+    } else {
+        "unknown"
+    };
+    // `Display` of a CstNode walks the original raw text — comments,
+    // whitespace and all. Compact it onto one line and truncate so a
+    // conflict report stays readable.
+    let raw = node
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    const LIMIT: usize = 120;
+    let value = if raw.chars().count() > LIMIT {
+        let mut t = raw.chars().take(LIMIT - 3).collect::<String>();
+        t.push_str("...");
+        t
+    } else {
+        raw
+    };
+    TableConflict {
+        path: prefix.join("."),
+        kind: kind.to_string(),
+        value,
+    }
+}
+
+fn json_set(obj: &CstObject, segments: &[Segment], item: JsonValue) -> Result<()> {
     let Some((first, rest)) = segments.split_first() else {
         bail!("path must not be empty");
     };
     if let Some(ItemSelector::Wildcard { .. }) = first.select {
-        bail!("wildcard selectors are not yet supported in JsonDocument writes");
+        bail!("wildcard selectors are not supported in JsonDocument writes");
     }
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("expected object at path prefix"))?;
     let last = rest.is_empty();
 
     match &first.select {
         None => {
             if last {
-                obj.insert(first.name.clone(), item);
+                let cst = value_to_cst_input(&item);
+                if let Some(prop) = obj.get(&first.name) {
+                    prop.set_value(cst);
+                } else {
+                    obj.append(&first.name, cst);
+                }
                 return Ok(());
             }
-            // Ensure object child.
-            if !matches!(obj.get(&first.name), Some(v) if v.is_object()) {
-                obj.insert(first.name.clone(), JsonValue::Object(JsonMap::new()));
-            }
-            let child = obj.get_mut(&first.name).expect("just ensured");
-            json_descend_set(child, rest, item)
+            // Ensure object child. `object_value_or_set` overwrites
+            // non-object children with an empty object — same behavior
+            // as the TOML side's `ensure_table_child`.
+            let next_obj = obj.object_value_or_set(&first.name);
+            json_set(&next_obj, rest, item)
         }
         Some(ItemSelector::Pinned { key, value: pv }) => {
-            // Ensure array; bail on shape conflict.
-            match obj.get(&first.name) {
-                Some(JsonValue::Array(_)) => {}
-                Some(other) => bail!(
-                    "{} is {} but path expects an array",
-                    first.name,
-                    json_type_name(other)
-                ),
-                None => {
-                    obj.insert(first.name.clone(), JsonValue::Array(Vec::new()));
-                }
-            }
-            let arr = obj
-                .get_mut(&first.name)
-                .and_then(|v| v.as_array_mut())
-                .expect("just ensured");
-            let pos = arr.iter().position(|it| {
-                it.as_object()
-                    .map(|o| json_matches_pinned(o, key, pv))
-                    .unwrap_or(false)
-            });
-            let pos = match pos {
-                Some(p) => p,
-                None => {
-                    let mut new_obj = JsonMap::new();
-                    new_obj.insert(key.clone(), selector_value_to_json(pv));
-                    arr.push(JsonValue::Object(new_obj));
-                    arr.len() - 1
-                }
-            };
-            let item_val = arr.get_mut(pos).expect("indexed");
+            let arr = ensure_array_for_pinned(obj, &first.name)?;
+            let target_obj = find_or_seed_pinned_item(&arr, key, pv);
             if last {
-                if !item.is_object() {
-                    bail!(
-                        "pinned-selector leaf write requires an object value, got {}",
-                        json_type_name(&item)
-                    );
-                }
-                *item_val = item;
-                let map = item_val.as_object_mut().expect("just placed object");
-                if !json_matches_pinned(map, key, pv) {
-                    map.insert(key.clone(), selector_value_to_json(pv));
-                }
+                replace_pinned_target_with_object(&target_obj, key, pv, item)?;
                 return Ok(());
             }
-            json_descend_set(item_val, rest, item)
+            json_set(&target_obj, rest, item)
         }
         Some(ItemSelector::Wildcard { .. }) => unreachable!("checked above"),
     }
 }
 
+/// Ensure `obj[name]` is a CST array; bail on shape conflict (existing
+/// non-array value), append a fresh empty array when the key is missing.
+fn ensure_array_for_pinned(obj: &CstObject, name: &str) -> Result<CstArray> {
+    if let Some(arr) = obj.array_value(name) {
+        return Ok(arr);
+    }
+    if obj.get(name).is_some() {
+        bail!("{name} is not an array but path expects one");
+    }
+    let prop: CstObjectProp = obj.append(name, CstInputValue::Array(Vec::new()));
+    Ok(prop
+        .array_value()
+        .expect("just appended array via CstInputValue::Array"))
+}
+
+/// Find the array element whose `key` matches the pinned `SelectorValue`,
+/// or append a new object seeded with the pinning key (typed). Returns
+/// the matched / new object handle ready for further descent or replace.
+fn find_or_seed_pinned_item(arr: &CstArray, key: &str, value: &SelectorValue) -> CstObject {
+    for elem in arr.elements() {
+        let Some(elem_obj) = elem.as_object() else {
+            continue;
+        };
+        if cst_object_matches(&elem_obj, key, value) {
+            return elem_obj;
+        }
+    }
+    // Seed a new object with just the typed pinning key. The wrapping
+    // append handles indentation and trailing-comma policy from siblings.
+    let seeded = CstInputValue::Object(vec![(key.to_string(), selector_value_to_cst_input(value))]);
+    let new_node = arr.append(seeded);
+    new_node
+        .as_object()
+        .expect("just appended CstInputValue::Object")
+}
+
+/// Pinned-at-leaf write: replace the entire matched object with `item`'s
+/// content, ensuring the pinning key remains so the next selector match
+/// still finds the item. `item` must itself be an object (caller error
+/// otherwise).
+fn replace_pinned_target_with_object(
+    target: &CstObject,
+    pin_key: &str,
+    pin_value: &SelectorValue,
+    item: JsonValue,
+) -> Result<()> {
+    let JsonValue::Object(map) = item else {
+        bail!(
+            "pinned-selector leaf write requires an object value, got {}",
+            json_type_name(&item)
+        );
+    };
+    // Build the replacement property list, ensuring the pinning key is
+    // present (callers transferring values across docs may not include it).
+    let mut props: Vec<(String, CstInputValue)> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), value_to_cst_input(v)))
+        .collect();
+    if !props.iter().any(|(k, _)| k == pin_key) {
+        props.insert(
+            0,
+            (pin_key.to_string(), selector_value_to_cst_input(pin_value)),
+        );
+    }
+    let target_clone = target.clone();
+    target_clone.replace_with(CstInputValue::Object(props));
+    Ok(())
+}
+
 fn json_expand_walk(
-    obj: &JsonMap<String, JsonValue>,
+    obj: &CstObject,
     remaining: &[Segment],
     identity: Vec<SelectorValue>,
     resolved: Vec<Segment>,
@@ -1115,49 +1208,51 @@ fn json_expand_walk(
 
     match &seg.select {
         None => {
-            let Some(item) = obj.get(&seg.name) else {
-                return Ok(());
-            };
-            let Some(next) = item.as_object() else {
+            let Some(next_obj) = obj.object_value(&seg.name) else {
                 return Ok(());
             };
             let mut new_resolved = resolved;
             new_resolved.push(seg.clone());
-            json_expand_walk(next, rest, identity, new_resolved, out)?;
+            json_expand_walk(&next_obj, rest, identity, new_resolved, out)?;
         }
         Some(ItemSelector::Pinned { key, value }) => {
-            let Some(arr) = obj.get(&seg.name).and_then(|v| v.as_array()) else {
+            let Some(arr) = obj.array_value(&seg.name) else {
                 return Ok(());
             };
-            let count = arr
+            let elements = arr.elements();
+            let matches: Vec<CstObject> = elements
                 .iter()
-                .filter(|it| {
-                    it.as_object()
-                        .map(|o| json_matches_pinned(o, key, value))
-                        .unwrap_or(false)
+                .filter_map(|el| {
+                    let elem_obj = el.as_object()?;
+                    if cst_object_matches(&elem_obj, key, value) {
+                        Some(elem_obj)
+                    } else {
+                        None
+                    }
                 })
-                .count();
-            if count > 1 {
-                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value}");
+                .collect();
+            if matches.len() > 1 {
+                bail!(
+                    "ambiguous pinned selector at {seg}: {} items where {key}={value}",
+                    matches.len()
+                );
             }
-            let Some(matched) = arr.iter().find_map(|it| {
-                it.as_object()
-                    .filter(|o| json_matches_pinned(o, key, value))
-            }) else {
+            let Some(matched) = matches.into_iter().next() else {
                 return Ok(());
             };
             let mut new_resolved = resolved;
             new_resolved.push(seg.clone());
-            json_expand_walk(matched, rest, identity, new_resolved, out)?;
+            json_expand_walk(&matched, rest, identity, new_resolved, out)?;
         }
         Some(ItemSelector::Wildcard { key }) => {
-            let Some(arr) = obj.get(&seg.name).and_then(|v| v.as_array()) else {
+            let Some(arr) = obj.array_value(&seg.name) else {
                 return Ok(());
             };
+            let elements = arr.elements();
             let mut counts: BTreeMap<SelectorValue, usize> = BTreeMap::new();
-            for it in arr {
-                if let Some(map) = it.as_object()
-                    && let Some(v) = json_item_selector_value(map, key)
+            for el in &elements {
+                if let Some(elem_obj) = el.as_object()
+                    && let Some(v) = cst_object_selector_value(&elem_obj, key)
                 {
                     *counts.entry(v).or_default() += 1;
                 }
@@ -1173,11 +1268,11 @@ fn json_expand_walk(
                     dups.join(", ")
                 );
             }
-            for it in arr {
-                let Some(map) = it.as_object() else {
+            for el in &elements {
+                let Some(elem_obj) = el.as_object() else {
                     continue;
                 };
-                let Some(value) = json_item_selector_value(map, key) else {
+                let Some(value) = cst_object_selector_value(&elem_obj, key) else {
                     continue;
                 };
                 let mut branch_id = identity.clone();
@@ -1190,7 +1285,7 @@ fn json_expand_walk(
                         value,
                     }),
                 });
-                json_expand_walk(map, rest, branch_id, branch_resolved, out)?;
+                json_expand_walk(&elem_obj, rest, branch_id, branch_resolved, out)?;
             }
         }
     }
@@ -1910,13 +2005,17 @@ enabled = true
     }
 
     #[test]
-    fn json_render_falls_back_to_two_space_for_minified_input() {
+    fn json_render_preserves_minified_format() {
+        // CST round-trip preserves whatever format the source uses —
+        // minified input stays minified, the renderer doesn't impose
+        // pretty-print on a file that wasn't pretty-printed.
         let doc = json_doc(r#"{"a":1,"b":{"c":2}}"#);
         let rendered = doc.render();
         assert!(
-            rendered.contains("\n  \"a\""),
-            "expected 2-space default for minified input: {rendered}"
+            !rendered.contains("\n  \"a\""),
+            "minified input should not be re-pretty-printed: {rendered}"
         );
+        assert!(rendered.starts_with(r#"{"a":1"#), "got: {rendered}");
     }
 
     #[test]
