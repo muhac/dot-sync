@@ -135,6 +135,10 @@ Pinned and wildcard selectors:
   `null`; an absent key is "missing". `pull` / `push` / `sync` treat them
   as different values, so an explicit `null` propagates instead of being
   dropped. Use this to deliberately overwrite a target's value with `null`.
+- **Int vs float in selectors.** `[k=8080]` matches `"k": 8080` only —
+  not `"k": 8080.0`. `serde_json` distinguishes integer and float
+  representations, and selector matching follows that distinction. Floats
+  are not supported as selector values at all.
 - Object key order is preserved on parse and round-trip (`preserve_order`
   feature of `serde_json`).
 - Whitespace and indentation are not preserved; the renderer emits
