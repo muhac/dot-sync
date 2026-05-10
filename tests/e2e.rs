@@ -1076,6 +1076,21 @@ fn jsonc_push_preserves_block_and_inline_comments() {
 }
 
 #[test]
+fn jsonc_format_alias_dispatches_to_json_backend() {
+    // `format: jsonc` is accepted as an alias for `format: json` so a
+    // user with VS Code / tsconfig files can self-document the fact that
+    // the file contains comments / trailing commas.
+    let fixture = Fixture::load("json", "jsonc_format_alias");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
 fn jsonc_push_preserves_trailing_commas() {
     // Source and target both use trailing commas inside the array. After
     // a pinned-selector update the trailing-comma style must follow the

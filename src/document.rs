@@ -126,11 +126,16 @@ pub enum Format {
 
 /// Parse the format string from `.sync.yaml` into the typed `Format` enum,
 /// failing fast (before any file I/O) with a list of supported format names.
+///
+/// `json` and `jsonc` are aliases — both go through the JSONC-aware parser.
+/// `jsonc` lets a user with VS Code / `tsconfig` files self-document the
+/// fact that comments and trailing commas are expected, even though the
+/// underlying handling is identical to `json`.
 pub fn parse_format(format: &str) -> Result<Format> {
     match format {
         "toml" => Ok(Format::Toml),
-        "json" => Ok(Format::Json),
-        other => bail!("unsupported format: {other}; supported formats: toml, json"),
+        "json" | "jsonc" => Ok(Format::Json),
+        other => bail!("unsupported format: {other}; supported formats: toml, json, jsonc"),
     }
 }
 
@@ -1296,11 +1301,26 @@ fn json_expand_walk(
 mod tests {
     use toml_edit::value;
 
-    use super::{Document, TomlDocument};
+    use super::{Document, Format, TomlDocument, parse_format};
     use crate::path::{FieldPath, SelectorValue};
 
     fn s(v: &str) -> SelectorValue {
         SelectorValue::String(v.to_string())
+    }
+
+    #[test]
+    fn parse_format_accepts_known_names() {
+        assert_eq!(parse_format("toml").unwrap(), Format::Toml);
+        assert_eq!(parse_format("json").unwrap(), Format::Json);
+        // jsonc is an alias for json — same backend, more honest naming.
+        assert_eq!(parse_format("jsonc").unwrap(), Format::Json);
+    }
+
+    #[test]
+    fn parse_format_rejects_unknown_names() {
+        let err = parse_format("yaml").unwrap_err().to_string();
+        assert!(err.contains("yaml"), "msg: {err}");
+        assert!(err.contains("toml, json, jsonc"), "msg: {err}");
     }
 
     #[test]

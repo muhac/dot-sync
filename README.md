@@ -59,14 +59,16 @@ directory. Paths in `source` are resolved relative to that file. Paths in
 `target` may use `~` for the current user's home directory.
 
 **Supporting formats:**
-- **TOML** — format-preserving via `toml_edit` (whitespace, key order, comments).
-- **JSON / JSONC** — format-preserving via `jsonc-parser`. Object key
-  order, comments (`//` and `/* */`), trailing commas, blank lines, and
-  original indentation all round-trip through `pull` / `push` / `sync`.
-  Strict JSON, JSONC (the dialect VS Code / `tsconfig.json` use), and
-  files with trailing commas are all accepted. JSON5 (single-quoted
-  strings, unquoted keys, hex / Infinity / NaN literals) is not
-  supported.
+- **TOML** (`format: toml`) — format-preserving via `toml_edit`
+  (whitespace, key order, comments).
+- **JSON / JSONC** (`format: json` or `format: jsonc` — same backend,
+  use whichever name better describes the target file) — format-preserving
+  via `jsonc-parser`. Object key order, comments (`//` and `/* */`),
+  trailing commas, blank lines, and original indentation all round-trip
+  through `pull` / `push` / `sync`. Strict JSON, JSONC (the dialect VS
+  Code / `tsconfig.json` use), and files with trailing commas are all
+  accepted. JSON5 (single-quoted strings, unquoted keys, hex / Infinity
+  / NaN literals) is not supported.
 
 ## Concepts
 
