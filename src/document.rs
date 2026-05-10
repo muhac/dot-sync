@@ -736,12 +736,19 @@ use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstArray, CstInputValue, CstObject, CstObjectProp, CstRootNode};
 use serde_json::Value as JsonValue;
 
+/// Format-preserving JSON / JSONC document.
+///
+/// **Single-threaded only.** `CstRootNode` is `Rc<…>`-based with interior
+/// mutability, so `JsonDocument` is intentionally `!Send + !Sync`. The
+/// sync engine processes targets sequentially today; if that ever
+/// changes, the storage needs to switch to an `Arc`-based variant or
+/// each target needs its own document instance per thread (cheap — just
+/// re-parse from the file).
 pub struct JsonDocument {
     /// CST root. Holds the full source text plus parsed structure with
-    /// all trivia (comments, whitespace) attached. `CstRootNode` is
-    /// `Rc`-based with interior mutability — `&mut self` on the trait
-    /// methods is honored at the struct level even though the underlying
-    /// CST mutates through `&self` accessors.
+    /// all trivia (comments, whitespace) attached. `&mut self` on the
+    /// trait methods is honored at the struct level even though the
+    /// underlying CST mutates through `&self` accessors.
     root: CstRootNode,
 }
 
