@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod discovery;
 mod document;
 mod path;
 mod restore;
