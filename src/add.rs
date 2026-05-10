@@ -69,7 +69,8 @@ pub fn run(args: AddArgs) -> Result<()> {
     };
 
     if new_paths.is_empty() {
-        eprintln!("no fields selected — .sync.yaml left unchanged");
+        let prefix = if args.dry_run { "dry run: " } else { "" };
+        eprintln!("{prefix}no fields selected — .sync.yaml left unchanged");
         return Ok(());
     }
 
