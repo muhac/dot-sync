@@ -838,7 +838,9 @@ fn summarize_json_item(item: &JsonValue) -> String {
         JsonValue::Number(n) => n.to_string(),
         JsonValue::String(s) => serde_json::Value::String(s.clone()).to_string(),
         // Compact rendering for arrays/objects so reports stay one line.
-        JsonValue::Array(_) | JsonValue::Object(_) => serde_json::to_string(item).unwrap_or_default(),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            serde_json::to_string(item).unwrap_or_default()
+        }
     };
     if rendered.is_empty() {
         rendered = json_type_name(item).to_string();
@@ -870,10 +872,7 @@ fn json_matches_pinned(obj: &JsonMap<String, JsonValue>, key: &str, value: &Sele
 /// is one of the supported scalar types. Floats / arrays / objects / null
 /// are skipped (the item is excluded from wildcard expansion), mirroring
 /// the TOML side's behavior on unsupported types.
-fn json_item_selector_value(
-    obj: &JsonMap<String, JsonValue>,
-    key: &str,
-) -> Option<SelectorValue> {
+fn json_item_selector_value(obj: &JsonMap<String, JsonValue>, key: &str) -> Option<SelectorValue> {
     match obj.get(key)? {
         JsonValue::String(s) => Some(SelectorValue::String(s.clone())),
         JsonValue::Number(n) => n.as_i64().map(SelectorValue::Int),
@@ -964,10 +963,9 @@ fn json_table_conflict_walk(
                 });
             };
             // Missing matched item is not a conflict — `set` will append.
-            let matched = arr.iter().find_map(|it| {
-                it.as_object()
-                    .filter(|o| json_matches_pinned(o, key, pv))
-            })?;
+            let matched = arr
+                .iter()
+                .find_map(|it| it.as_object().filter(|o| json_matches_pinned(o, key, pv)))?;
             json_table_conflict_walk(matched, rest, prefix)
         }
         Some(ItemSelector::Wildcard { .. }) => {
@@ -1048,9 +1046,7 @@ fn json_descend_set(root: &mut JsonValue, segments: &[Segment], item: JsonValue)
                     );
                 }
                 *item_val = item;
-                let map = item_val
-                    .as_object_mut()
-                    .expect("just placed object");
+                let map = item_val.as_object_mut().expect("just placed object");
                 if !json_matches_pinned(map, key, pv) {
                     map.insert(key.clone(), selector_value_to_json(pv));
                 }
@@ -1112,10 +1108,10 @@ fn json_expand_walk(
             if count > 1 {
                 bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value}");
             }
-            let Some(matched) = arr
-                .iter()
-                .find_map(|it| it.as_object().filter(|o| json_matches_pinned(o, key, value)))
-            else {
+            let Some(matched) = arr.iter().find_map(|it| {
+                it.as_object()
+                    .filter(|o| json_matches_pinned(o, key, value))
+            }) else {
                 return Ok(());
             };
             let mut new_resolved = resolved;
@@ -1337,7 +1333,11 @@ host = "alpha"
         );
         let port_path = FieldPath::parse("servers[port=8080].port").unwrap();
         assert_eq!(
-            doc.get(&port_path).unwrap().as_value().unwrap().as_integer(),
+            doc.get(&port_path)
+                .unwrap()
+                .as_value()
+                .unwrap()
+                .as_integer(),
             Some(8080)
         );
     }
@@ -1750,18 +1750,9 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 3);
-        assert_eq!(
-            resolved[0].identity,
-            vec![s("anthropic"), s("opus")]
-        );
-        assert_eq!(
-            resolved[1].identity,
-            vec![s("openai"), s("gpt-4")]
-        );
-        assert_eq!(
-            resolved[2].identity,
-            vec![s("openai"), s("gpt-5")]
-        );
+        assert_eq!(resolved[0].identity, vec![s("anthropic"), s("opus")]);
+        assert_eq!(resolved[1].identity, vec![s("openai"), s("gpt-4")]);
+        assert_eq!(resolved[2].identity, vec![s("openai"), s("gpt-5")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"anthropic\"].models[id=\"opus\"].enabled"
@@ -1850,10 +1841,14 @@ enabled = true
     #[test]
     fn json_render_uses_pretty_with_trailing_newline() {
         let mut doc = JsonDocument::empty();
-        doc.set(&FieldPath::parse("a.b").unwrap(), json!(1)).unwrap();
+        doc.set(&FieldPath::parse("a.b").unwrap(), json!(1))
+            .unwrap();
         let rendered = doc.render();
         assert!(rendered.ends_with('\n'));
-        assert!(rendered.contains("  "), "expected 2-space indent: {rendered}");
+        assert!(
+            rendered.contains("  "),
+            "expected 2-space indent: {rendered}"
+        );
     }
 
     #[test]

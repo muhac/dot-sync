@@ -936,11 +936,7 @@ fn config_rejects_unknown_keys() {
 #[test]
 fn json_basic_sync_bootstraps_missing_target() {
     let fixture = Fixture::load("json", "basic_sync");
-    fixture
-        .command()
-        .args(["sync", "agent"])
-        .assert()
-        .success();
+    fixture.command().args(["sync", "agent"]).assert().success();
     fixture.assert_file_eq("target.json", "target.expected.json");
 }
 
@@ -1032,10 +1028,6 @@ fn json_push_propagates_explicit_null_from_source() {
 #[test]
 fn json_push_preserves_unmanaged_target_fields() {
     let fixture = Fixture::load("json", "preserves_unmanaged");
-    fixture
-        .command()
-        .args(["push", "agent"])
-        .assert()
-        .success();
+    fixture.command().args(["push", "agent"]).assert().success();
     fixture.assert_file_eq("target.json", "target.expected.json");
 }
