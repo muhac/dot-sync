@@ -2463,6 +2463,135 @@ targets:
 }
 
 #[test]
+fn gitconfig_restore_rolls_back_to_pre_push_snapshot() {
+    // restore is backend-agnostic — it just copies a recovery
+    // snapshot (or persistent .bak.*) over the destination atomically.
+    // This e2e verifies the dispatch reaches gitconfig targets without
+    // the format-specific Document trait getting in the way.
+    let dir = TempDir::new().unwrap();
+    let snap = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    let original_target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("target.gitconfig"), original_target);
+
+    // Push produces a recovery snapshot of the original "vim".
+    let mut push = dot_sync_in(dir.path());
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:"));
+    let post_push = read_file(&dir.path().join("target.gitconfig"));
+    assert!(post_push.contains("editor = nvim"), "got: {post_push}");
+
+    // Restore newest → rolls target back to the pre-push contents.
+    let mut restore = dot_sync_in(dir.path());
+    override_temp_dir(&mut restore, snap.path());
+    restore
+        .args(["restore", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"));
+    assert_eq!(
+        read_file(&dir.path().join("target.gitconfig")),
+        original_target
+    );
+}
+
+#[test]
+fn gitconfig_add_accepts_multiple_field_flags() {
+    // Plain happy path: `add` with several --field flags writes them
+    // all into the target's sync list. Locks the multi-field path
+    // for the gitconfig backend specifically.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n[core]\n\teditor = vim\n[alias]\n\tco = checkout\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+            "--field",
+            "core.editor",
+            "--field",
+            "alias.co",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: gitconfig"), "yaml: {yaml}");
+    for field in ["user.email", "core.editor", "alias.co"] {
+        assert!(yaml.contains(field), "missing {field} in yaml: {yaml}");
+    }
+}
+
+#[test]
+fn gitconfig_add_dry_run_prints_yaml_without_writing() {
+    // `add --dry-run` previews the would-be `.sync.yaml` to stdout
+    // and leaves the filesystem untouched. Already covered for
+    // toml/json elsewhere; pin it for gitconfig too.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("format: gitconfig"))
+        .stdout(predicate::str::contains("user.email"));
+
+    // `add` always bootstraps an empty `.sync.yaml` if missing — even
+    // on dry-run — but the new target / field must not be persisted.
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(
+        !yaml.contains("gitsync"),
+        "dry-run leaked the target into .sync.yaml: {yaml}"
+    );
+    assert!(
+        !yaml.contains("user.email"),
+        "dry-run leaked the field into .sync.yaml: {yaml}"
+    );
+}
+
+#[test]
 fn gitconfig_add_then_push_uses_inferred_format() {
     // End-to-end: bootstrap a fresh `.sync.yaml` via add (format
     // inferred from extension), then run push and confirm it actually
