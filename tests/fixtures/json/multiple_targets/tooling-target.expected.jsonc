@@ -1,0 +1,7 @@
+{
+  "editor": {
+    // local override
+    "lineWidth": 100,
+    "tabSize": 2
+  }
+}

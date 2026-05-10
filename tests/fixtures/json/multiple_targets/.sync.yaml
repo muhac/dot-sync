@@ -1,0 +1,13 @@
+targets:
+  agent:
+    format: json
+    source: agent-source.json
+    target: agent-target.json
+    sync:
+      - tui.theme
+  tooling:
+    format: jsonc
+    source: tooling-source.jsonc
+    target: tooling-target.jsonc
+    sync:
+      - editor.tabSize

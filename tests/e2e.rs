@@ -1346,6 +1346,167 @@ fn json_sync_fail_on_conflict_preflights_all_targets_before_writing() {
 }
 
 #[test]
+fn json_pinned_selector_multi_match_errors_with_target_context() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - mcpServers[name="github"].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.json"),
+        r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to process target agent"))
+        .stderr(predicate::str::contains(
+            "source pattern 'mcpServers[name=\"github\"].enabled'",
+        ))
+        .stderr(predicate::str::contains("ambiguous pinned"))
+        .stderr(predicate::str::contains("2 items where name=\"github\""));
+
+    // No write — preflight aborts before any file change.
+    assert_eq!(read_file(&dir.path().join("target.json")), "{}");
+}
+
+#[test]
+fn json_wildcard_selector_duplicate_identifier_errors() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - mcpServers[name].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.json"),
+        r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous wildcard"))
+        .stderr(predicate::str::contains("\"github\"×2"));
+}
+
+#[test]
+fn json_multiple_targets_process_all_when_name_is_omitted() {
+    // Two targets in the same config — one strict json, one jsonc with
+    // comments. Push without a name processes both and writes each one
+    // independently, exercising the per-target dispatch loop.
+    let fixture = Fixture::load("json", "multiple_targets");
+
+    fixture
+        .command()
+        .args(["push"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent push apply"))
+        .stdout(predicate::str::contains("tooling push apply"));
+
+    fixture.assert_file_eq("agent-target.json", "agent-target.expected.json");
+    fixture.assert_file_eq("tooling-target.jsonc", "tooling-target.expected.jsonc");
+}
+
+#[test]
+fn json_parent_discovery_finds_config_in_ancestor_directory() {
+    // CLI runs from a nested subdirectory; the `.sync.yaml` lives at the
+    // fixture root. Discovery walks up the parent chain — same behavior
+    // as the TOML parent_discovery test.
+    let fixture = Fixture::load("json", "parent_discovery");
+    fs::create_dir_all(fixture.path().join("nested/worktree")).unwrap();
+
+    fixture
+        .command_in("nested/worktree")
+        .args(["sync", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: max_bytes"));
+
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_backup_creates_timestamped_copy_before_writing() {
+    let fixture = Fixture::load("json", "backup_write");
+    let original_target = fixture.read("target.json");
+
+    fixture
+        .command()
+        .args(["push", "agent", "--backup"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: max_bytes"));
+
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let backups = fs::read_dir(fixture.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "expected one .bak.* file");
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
+fn json_malformed_source_emits_parse_error_with_path() {
+    // Malformed JSON in the source file. Engine surfaces our wrapped
+    // jsonc-parser error including the file path so the user can find
+    // the offending file.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("source.json"), r#"{ "max_bytes": "#);
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse JSONC"))
+        .stderr(predicate::str::contains("source.json"));
+}
+
+#[test]
+fn json_malformed_yaml_config_exits_with_parse_error() {
+    let fixture = Fixture::load("json", "malformed_config");
+    fixture
+        .command()
+        .args(["sync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse"));
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
