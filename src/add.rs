@@ -189,6 +189,7 @@ fn infer_format_from_path(p: &str) -> Option<&'static str> {
         "toml" => Some("toml"),
         "json" => Some("json"),
         "jsonc" => Some("jsonc"),
+        "gitconfig" => Some("gitconfig"),
         _ => None,
     }
 }
@@ -302,6 +303,7 @@ mod tests {
         assert_eq!(infer_format_from_path("a.toml"), Some("toml"));
         assert_eq!(infer_format_from_path("a.json"), Some("json"));
         assert_eq!(infer_format_from_path("a.jsonc"), Some("jsonc"));
+        assert_eq!(infer_format_from_path("a.gitconfig"), Some("gitconfig"));
         assert_eq!(infer_format_from_path("a.yaml"), None);
         assert_eq!(infer_format_from_path("noext"), None);
     }
