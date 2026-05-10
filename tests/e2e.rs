@@ -1026,6 +1026,24 @@ fn json_push_propagates_explicit_null_from_source() {
 }
 
 #[test]
+fn json_sync_source_wins_overrides_non_null_target_with_explicit_null() {
+    // Target has `feature.value = "non-null"`, source has `feature.value = null`.
+    // `sync --source-wins` must overwrite the target's value with explicit
+    // null — the engine sees both sides as `Some(_)` and follows the
+    // conflict policy, treating Null as a real value (not as "missing").
+    let fixture = Fixture::load("json", "null_overrides_value");
+    fixture
+        .command()
+        .args(["sync", "agent", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: feature.value",
+        ));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
 fn json_push_preserves_unmanaged_target_fields() {
     let fixture = Fixture::load("json", "preserves_unmanaged");
     fixture.command().args(["push", "agent"]).assert().success();
