@@ -41,7 +41,7 @@ pub enum ItemSelector {
 /// Typed literal for pinned selectors and wildcard identities. Comparison is
 /// **strict**: `String("8080")` and `Int(8080)` are never equal. Syntax mirrors
 /// the type — `[k="x"]` for strings, `[k=8080]` for ints, `[k=true]` for bools.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SelectorValue {
     String(String),
     Int(i64),
