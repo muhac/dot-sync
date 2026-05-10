@@ -640,6 +640,53 @@ fn sync_conflict_flags_are_mutually_exclusive() {
 }
 
 #[test]
+fn sync_fail_on_conflict_preflights_all_targets_before_writing() {
+    // Two targets: alpha would write cleanly, beta has a conflict. Without a
+    // global preflight, alpha's writes happen before beta bails — violating
+    // the "write nothing" promise.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  alpha:
+    format: toml
+    source: alpha-source.toml
+    target: alpha-target.toml
+    sync:
+      - field
+  beta:
+    format: toml
+    source: beta-source.toml
+    target: beta-target.toml
+    sync:
+      - field
+"#,
+    );
+    write_file(&dir.path().join("alpha-source.toml"), "field = \"new\"\n");
+    write_file(&dir.path().join("alpha-target.toml"), "");
+    write_file(&dir.path().join("beta-source.toml"), "field = \"src\"\n");
+    write_file(&dir.path().join("beta-target.toml"), "field = \"tgt\"\n");
+
+    dot_sync_in(dir.path())
+        .args(["sync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("beta sync preflight"))
+        .stdout(predicate::str::contains("conflict: field"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    assert_eq!(
+        read_normalized(&dir.path().join("alpha-target.toml")),
+        "",
+        "alpha-target must be untouched when beta has a conflict"
+    );
+    assert_eq!(
+        read_normalized(&dir.path().join("beta-target.toml")),
+        "field = \"tgt\"\n"
+    );
+}
+
+#[test]
 fn restore_lists_then_writes_newest_snapshot() {
     let fixture = Fixture::load("toml", "dry_run_no_write");
     let snap = TempDir::new().unwrap();

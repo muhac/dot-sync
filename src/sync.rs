@@ -74,11 +74,57 @@ pub fn run(
     options: SyncOptions,
 ) -> Result<()> {
     let targets = select_targets(config, name)?;
+
+    // For fail-on-conflict, every selected target must be checked before
+    // any write happens. Otherwise an earlier target could be modified
+    // while a later one bails, violating the "write nothing" promise.
+    if matches!(direction, Direction::Sync)
+        && matches!(options.conflict, ConflictMode::FailOnConflict)
+    {
+        preflight_fail_on_conflict(&targets)?;
+    }
+
     for target in targets {
         run_target(target, direction, options)
             .with_context(|| format!("failed to process target {}", target.name))?;
     }
     Ok(())
+}
+
+fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
+    let mut violators: Vec<(String, Vec<Conflict>)> = Vec::new();
+    for target in targets {
+        let conflicts = target_conflicts(target)?;
+        if !conflicts.is_empty() {
+            violators.push((target.name.clone(), conflicts));
+        }
+    }
+    if violators.is_empty() {
+        return Ok(());
+    }
+    for (name, conflicts) in &violators {
+        println!("{name} sync preflight");
+        print_conflicts(conflicts);
+    }
+    let total: usize = violators.iter().map(|(_, c)| c.len()).sum();
+    bail!(
+        "fail-on-conflict: {total} conflicting field(s) across {} target(s)",
+        violators.len()
+    );
+}
+
+fn target_conflicts(target: &TargetConfig) -> Result<Vec<Conflict>> {
+    AnyDocument::validate_format(&target.format).map_err(|error| {
+        anyhow!(
+            "target '{}' uses format '{}': {error}",
+            target.name,
+            target.format
+        )
+    })?;
+    let source = AnyDocument::load(&target.format, &target.source, true)?;
+    let target_doc = AnyDocument::load(&target.format, &target.target, true)?;
+    let sync_paths = parse_paths(target)?;
+    Ok(collect_conflicts(&source, &target_doc, &sync_paths))
 }
 
 fn select_targets<'a>(
@@ -312,11 +358,11 @@ fn sync(
     Ok(changes)
 }
 
-fn collect_conflicts<'a>(
+fn collect_conflicts(
     source: &dyn Document,
     target: &dyn Document,
-    paths: &'a [ParsedPath],
-) -> Vec<Conflict<'a>> {
+    paths: &[ParsedPath],
+) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
     for path in paths {
         let (Some(s), Some(t)) = (source.get(&path.path), target.get(&path.path)) else {
@@ -326,7 +372,7 @@ fn collect_conflicts<'a>(
             continue;
         }
         conflicts.push(Conflict {
-            path: &path.raw,
+            path: path.raw.clone(),
             source_value: summarize_item(Some(&s)),
             target_value: summarize_item(Some(&t)),
         });
@@ -334,7 +380,7 @@ fn collect_conflicts<'a>(
     conflicts
 }
 
-fn print_conflicts(conflicts: &[Conflict<'_>]) {
+fn print_conflicts(conflicts: &[Conflict]) {
     for conflict in conflicts {
         println!("  conflict: {}", conflict.path);
         println!("    source: {}", conflict.source_value);
@@ -343,8 +389,8 @@ fn print_conflicts(conflicts: &[Conflict<'_>]) {
 }
 
 #[derive(Debug)]
-struct Conflict<'a> {
-    path: &'a str,
+struct Conflict {
+    path: String,
     source_value: String,
     target_value: String,
 }
