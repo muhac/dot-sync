@@ -785,6 +785,127 @@ fn restore_pick_out_of_range_fails() {
 }
 
 #[test]
+fn push_pinned_array_selector_updates_one_item() {
+    let fixture = Fixture::load("toml", "array_pinned_sync");
+
+    fixture
+        .command()
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: mcp_servers[name=\"github\"].enabled",
+        ));
+
+    fixture.assert_file_eq("target.toml", "target.expected.toml");
+}
+
+#[test]
+fn push_wildcard_array_selector_pairs_items_by_identifier() {
+    let fixture = Fixture::load("toml", "array_wildcard_sync");
+
+    fixture
+        .command()
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        // linear: both have it, source's value wins → target changes.
+        .stdout(predicate::str::contains(
+            "changed target: mcp_servers[name=\"linear\"].enabled",
+        ))
+        // github: source-only, push fills target.
+        .stdout(predicate::str::contains(
+            "added target: mcp_servers[name=\"github\"].enabled",
+        ));
+
+    let after = fixture.read("target.toml");
+    // linear flipped to source's value.
+    assert!(after.contains("name = \"linear\""));
+    assert!(after.contains("enabled = false"));
+    // github appended.
+    assert!(after.contains("name = \"github\""));
+    // supabase preserved (push doesn't touch target-only items beyond the listed field).
+    assert!(after.contains("name = \"supabase\""));
+}
+
+#[test]
+fn pinned_selector_multi_match_errors_with_target_context() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - mcp_servers[name="github"].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.toml"),
+        r#"[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#,
+    );
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to process target codex"))
+        .stderr(predicate::str::contains(
+            "source pattern 'mcp_servers[name=\"github\"].enabled'",
+        ))
+        .stderr(predicate::str::contains("ambiguous pinned"))
+        .stderr(predicate::str::contains("2 items where name=\"github\""));
+
+    // No write happened on either side.
+    assert_eq!(read_file(&dir.path().join("target.toml")), "");
+}
+
+#[test]
+fn wildcard_selector_duplicate_identifier_errors() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - mcp_servers[name].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.toml"),
+        r#"[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#,
+    );
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous wildcard"))
+        .stderr(predicate::str::contains("\"github\"×2"));
+}
+
+#[test]
 fn config_rejects_unknown_keys() {
     let dir = TempDir::new().unwrap();
     write_file(

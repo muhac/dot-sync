@@ -83,7 +83,35 @@ targets:
       - tui.status_line
       - tui.theme
       - plugins."github@openai-curated".enabled
+      - mcp_servers[name="github"].enabled    # specific item by key
+      - mcp_servers[name].enabled              # all items, paired by key
 ```
+
+### Path syntax
+
+| Form | Meaning |
+| --- | --- |
+| `tui.theme` | Plain object navigation. |
+| `plugins."github@openai-curated".enabled` | Quoted segment, for keys with `.` `[` or whitespace. |
+| `arr[name="github"].enabled` | Pin to the array item where `name == "github"`; sync just its `enabled` field. Stable across reorderings. |
+| `arr[name].enabled` | Wildcard: fan out across every item in `arr`, pairing source / target items by `name`. |
+
+Pinned and wildcard selectors:
+
+- The identifier value (`"github"`) is matched as a string. Numeric / boolean
+  identifiers are not yet supported.
+- **Multi-match is an error.** Two array items sharing the same identifier
+  value (e.g. two `mcp_servers` both named `github`) is treated as data
+  corruption and the sync bails before any write — surgical sync requires
+  unambiguous identity.
+- When the identifier matches an item that exists on one side but not the other,
+  the missing side gets a new array entry seeded with the identifier — the
+  "fill missing" rule from `pull`/`sync` extended to array members.
+- Writes go into TOML `[[arrays]]` form. Inline `arr = [{...}]` arrays are
+  read-only for now.
+- Plain index syntax (`arr[0]`) is intentionally not supported — array
+  positions shift when data changes, so index-based sync is destructive in
+  the cases that matter most.
 
 ## Commands
 
