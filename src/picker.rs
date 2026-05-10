@@ -298,7 +298,10 @@ mod tests {
         assert!(dump.contains("[ ]"), "checkbox glyph missing:\n{dump}");
         // Subsection "origin" appears with quotes (matches our
         // discovery output for non-special-char subsections).
-        assert!(dump.contains("\"origin\""), "subsection label missing:\n{dump}");
+        assert!(
+            dump.contains("\"origin\""),
+            "subsection label missing:\n{dump}"
+        );
     }
 
     #[test]

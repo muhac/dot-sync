@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::AddArgs;
 use crate::discovery::FieldTree;
-use crate::document::{Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format};
+use crate::document::{
+    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+};
 use crate::path::FieldPath;
 use crate::picker::{self, PickerOutcome};
 

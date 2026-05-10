@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format};
+use crate::document::{
+    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+};
 use crate::path::{FieldPath, SelectorValue};
 
 #[derive(Debug, Clone, Copy)]

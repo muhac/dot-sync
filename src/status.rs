@@ -3,7 +3,9 @@ use std::fs;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format};
+use crate::document::{
+    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+};
 use crate::path::FieldPath;
 
 pub fn run(config: &DotSyncConfig, name: Option<&str>) -> Result<()> {

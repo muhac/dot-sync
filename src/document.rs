@@ -1861,9 +1861,7 @@ fn path_to_gitconfig_key(path: &FieldPath) -> Result<GitConfigKey> {
             subsection: Some((*subsection).to_string()),
             key: (*key).to_string(),
         }),
-        _ => bail!(
-            "gitconfig path has too many segments (max 3 — section.subsection.key): {path}"
-        ),
+        _ => bail!("gitconfig path has too many segments (max 3 — section.subsection.key): {path}"),
     }
 }
 
@@ -1937,7 +1935,9 @@ impl Document for GitConfigDocument {
         // than silently mangle the file. Same "data corruption" stance
         // that the array-selector backends take on duplicate
         // identifiers.
-        if let Ok(values) = self.file.raw_values_by(key.section.as_str(), sub, key.key.as_str())
+        if let Ok(values) = self
+            .file
+            .raw_values_by(key.section.as_str(), sub, key.key.as_str())
             && values.len() > 1
         {
             bail!(
@@ -1995,9 +1995,7 @@ impl Document for GitConfigDocument {
         // which is handled at `set` time. Selector segments
         // (`arr[name="x"]` or `arr[name]`) can never resolve here.
         if pattern.segments().iter().any(|s| s.select.is_some()) {
-            bail!(
-                "gitconfig has no arrays of objects; selector path '{pattern}' is not supported"
-            );
+            bail!("gitconfig has no arrays of objects; selector path '{pattern}' is not supported");
         }
         Ok(vec![ResolvedPath {
             identity: Vec::new(),
@@ -2029,8 +2027,7 @@ impl Document for GitConfigDocument {
             // entirely — they won't round-trip through dot-sync's
             // single-value sync model, and surfacing them in the
             // picker would be a footgun.
-            let mut seen: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for value_name in body.value_names() {
                 let key = value_name.to_string();
                 if !seen.insert(key.clone()) {
@@ -2066,10 +2063,8 @@ impl Document for GitConfigDocument {
                         // can't address `[remote "origin"]` as a value,
                         // only its keys. VirtualGroup matches the
                         // "select children individually, no whole" cycle.
-                        section_children.push(FieldNode::virtual_group(
-                            format!("\"{sub}\""),
-                            sub_children,
-                        ));
+                        section_children
+                            .push(FieldNode::virtual_group(format!("\"{sub}\""), sub_children));
                     }
                 }
             }
@@ -3677,9 +3672,7 @@ mod gitconfig_tests {
 
     #[test]
     fn get_reads_section_subsection_key() {
-        let (_dir, doc) = doc_from(
-            "[remote \"origin\"]\n\turl = https://example.com/foo\n",
-        );
+        let (_dir, doc) = doc_from("[remote \"origin\"]\n\turl = https://example.com/foo\n");
         let path = FieldPath::parse("remote.origin.url").unwrap();
         assert_eq!(doc.get(&path), Some("https://example.com/foo".to_string()));
     }
@@ -3690,9 +3683,7 @@ mod gitconfig_tests {
         // them via the existing quoted-segment syntax. The key under
         // [includeIf "gitdir:~/work/"] is reachable as
         // includeIf."gitdir:~/work/".path.
-        let (_dir, doc) = doc_from(
-            "[includeIf \"gitdir:~/work/\"]\n\tpath = ~/.gitconfig-work\n",
-        );
+        let (_dir, doc) = doc_from("[includeIf \"gitdir:~/work/\"]\n\tpath = ~/.gitconfig-work\n");
         let path = FieldPath::parse("includeIf.\"gitdir:~/work/\".path").unwrap();
         assert_eq!(doc.get(&path), Some("~/.gitconfig-work".to_string()));
     }
@@ -3759,7 +3750,8 @@ mod gitconfig_tests {
 ";
         let (_dir, mut doc) = doc_from(original);
         let path = FieldPath::parse("remote.origin.url").unwrap();
-        doc.set(&path, "https://new.example.com".to_string()).unwrap();
+        doc.set(&path, "https://new.example.com".to_string())
+            .unwrap();
         assert_eq!(
             doc.render(),
             "[remote \"origin\"]\n\turl = https://new.example.com\n",
@@ -3809,7 +3801,10 @@ mod gitconfig_tests {
             .unwrap();
         let rendered = doc.render();
         assert!(rendered.contains("[remote \"origin\"]"), "got: {rendered}");
-        assert!(rendered.contains("[remote \"upstream\"]"), "got: {rendered}");
+        assert!(
+            rendered.contains("[remote \"upstream\"]"),
+            "got: {rendered}"
+        );
         assert_eq!(doc.get(&path), Some("https://example.com/up".to_string()));
     }
 
@@ -3829,7 +3824,10 @@ mod gitconfig_tests {
         let path = FieldPath::parse("orphan").unwrap();
         let err = doc.set(&path, "x".to_string()).unwrap_err();
         let s = err.to_string();
-        assert!(s.contains("section.key") || s.contains("missing a key"), "msg: {s}");
+        assert!(
+            s.contains("section.key") || s.contains("missing a key"),
+            "msg: {s}"
+        );
     }
 
     #[test]
@@ -3883,11 +3881,17 @@ mod gitconfig_tests {
         let doc = GitConfigDocument::empty();
         let pinned = FieldPath::parse("arr[k=\"v\"].field").unwrap();
         let err = doc.expand(&pinned).unwrap_err();
-        assert!(err.to_string().contains("no arrays of objects"), "msg: {err}");
+        assert!(
+            err.to_string().contains("no arrays of objects"),
+            "msg: {err}"
+        );
 
         let wildcard = FieldPath::parse("arr[k].field").unwrap();
         let err = doc.expand(&wildcard).unwrap_err();
-        assert!(err.to_string().contains("no arrays of objects"), "msg: {err}");
+        assert!(
+            err.to_string().contains("no arrays of objects"),
+            "msg: {err}"
+        );
     }
 
     // ----- discover_field_tree -----
@@ -3948,8 +3952,14 @@ mod gitconfig_tests {
         );
         let tree = doc.discover_field_tree();
         let paths = paths_in(&tree);
-        assert!(paths.contains(&"remote.origin.url".to_string()), "{paths:?}");
-        assert!(paths.contains(&"remote.upstream.url".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"remote.origin.url".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&"remote.upstream.url".to_string()),
+            "{paths:?}"
+        );
         // remote → [origin (vgroup), upstream (vgroup)]
         assert_eq!(tree.roots.len(), 1);
         let remote = &tree.roots[0];
@@ -3977,7 +3987,10 @@ mod gitconfig_tests {
         );
         let tree = doc.discover_field_tree();
         let paths = paths_in(&tree);
-        assert!(paths.contains(&"remote.origin.url".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"remote.origin.url".to_string()),
+            "{paths:?}"
+        );
         assert!(
             !paths.contains(&"remote.origin.fetch".to_string()),
             "multivar fetch should be hidden, got {paths:?}"
@@ -4199,10 +4212,7 @@ mod gitconfig_tests {
         let original = "[alias]\n\tco = checkout HEAD --quiet\n";
         let (_dir, doc) = doc_from(original);
         let path = FieldPath::parse("alias.co").unwrap();
-        assert_eq!(
-            doc.get(&path),
-            Some("checkout HEAD --quiet".to_string())
-        );
+        assert_eq!(doc.get(&path), Some("checkout HEAD --quiet".to_string()));
         // Round-trip render is byte-stable.
         assert_eq!(doc.render(), original);
     }
@@ -4212,10 +4222,7 @@ mod gitconfig_tests {
         let (_dir, mut doc) = doc_from("[alias]\n\tco = checkout\n");
         let path = FieldPath::parse("alias.co").unwrap();
         doc.set(&path, "checkout HEAD --quiet".to_string()).unwrap();
-        assert_eq!(
-            doc.get(&path),
-            Some("checkout HEAD --quiet".to_string())
-        );
+        assert_eq!(doc.get(&path), Some("checkout HEAD --quiet".to_string()));
     }
 
     #[test]
@@ -4287,7 +4294,10 @@ mod gitconfig_tests {
             Err(e) => e,
         };
         let s = err.to_string();
-        assert!(s.contains("multi-line") || s.contains("continuation"), "msg: {s}");
+        assert!(
+            s.contains("multi-line") || s.contains("continuation"),
+            "msg: {s}"
+        );
     }
 
     #[test]
@@ -4364,7 +4374,10 @@ mod gitconfig_tests {
         let tree = doc.discover_field_tree();
         for path_str in paths_in(&tree) {
             let path = FieldPath::parse(&path_str).unwrap();
-            assert!(doc.get(&path).is_some(), "no value at picker path {path_str}");
+            assert!(
+                doc.get(&path).is_some(),
+                "no value at picker path {path_str}"
+            );
         }
     }
 }

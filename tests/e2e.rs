@@ -2167,7 +2167,9 @@ fn gitconfig_push_updates_synced_keys_and_preserves_unmanaged_lines() {
         .stdout(predicate::str::contains("changed target: alias.co"))
         .stdout(predicate::str::contains("added target: alias.st"))
         .stdout(predicate::str::contains("changed target: core.editor"))
-        .stdout(predicate::str::contains("changed target: remote.origin.url"));
+        .stdout(predicate::str::contains(
+            "changed target: remote.origin.url",
+        ));
 
     fixture.assert_file_eq("target.gitconfig", "target.expected.gitconfig");
 }
@@ -2184,7 +2186,9 @@ fn gitconfig_pull_updates_source_and_leaves_target_alone() {
         .success()
         .stdout(predicate::str::contains("changed source: alias.co"))
         .stdout(predicate::str::contains("changed source: core.editor"))
-        .stdout(predicate::str::contains("changed source: remote.origin.url"));
+        .stdout(predicate::str::contains(
+            "changed source: remote.origin.url",
+        ));
 
     fixture.assert_file_eq("source.gitconfig", "source.expected.gitconfig");
     assert_eq!(fixture.read("target.gitconfig"), target_before);
