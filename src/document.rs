@@ -1796,8 +1796,19 @@ impl Document for GitConfigDocument {
         Some(value.to_string())
     }
 
-    fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
-        unimplemented!("GitConfigDocument::set — wired in next commit")
+    fn set(&mut self, path: &FieldPath, item: String) -> Result<()> {
+        let key = path_to_gitconfig_key(path)?;
+        let sub = key.subsection.as_deref().map(bstr::BStr::new);
+        // gix-config's `File<'static>` requires owned key + value
+        // material — `String → ValueName<'static>` and `BString` cover
+        // that. The library validates section / key names against
+        // git's grammar (alphanumeric + dash, leading alpha) and
+        // returns its own error; surface that verbatim.
+        let value: &bstr::BStr = bstr::BStr::new(item.as_bytes());
+        self.file
+            .set_raw_value_by(key.section.as_str(), sub, key.key, value)
+            .map_err(|e| anyhow::anyhow!("failed to set gitconfig path '{path}': {e}"))?;
+        Ok(())
     }
 
     fn table_conflict(&self, _path: &FieldPath) -> Option<TableConflict> {
@@ -3462,5 +3473,122 @@ mod gitconfig_tests {
         let too_long = FieldPath::parse("a.b.c.d").unwrap();
         assert_eq!(doc.get(&too_short), None);
         assert_eq!(doc.get(&too_long), None);
+    }
+
+    // ----- set -----
+
+    #[test]
+    fn set_updates_existing_scalar_in_place() {
+        // The byte-exact assertion locks in that gix-config replaces only
+        // the value bytes — surrounding comments, blank lines, and tab
+        // indentation are untouched.
+        let original = "\
+# header
+[user]
+\tname = Alice
+\t# inline
+\temail = old@example.com
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new@example.com".to_string()).unwrap();
+
+        let expected = "\
+# header
+[user]
+\tname = Alice
+\t# inline
+\temail = new@example.com
+";
+        assert_eq!(doc.render(), expected);
+    }
+
+    #[test]
+    fn set_updates_value_inside_subsection() {
+        let original = "\
+[remote \"origin\"]
+\turl = https://old.example.com
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        doc.set(&path, "https://new.example.com".to_string()).unwrap();
+        assert_eq!(
+            doc.render(),
+            "[remote \"origin\"]\n\turl = https://new.example.com\n",
+        );
+    }
+
+    #[test]
+    fn set_inserts_new_key_into_existing_section() {
+        let original = "\
+[core]
+\teditor = vim
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("core.autocrlf").unwrap();
+        doc.set(&path, "input".to_string()).unwrap();
+        // Round-trip: the read-back value matches what we just wrote.
+        assert_eq!(doc.get(&path), Some("input".to_string()));
+        // Original section header + existing key both preserved.
+        let rendered = doc.render();
+        assert!(rendered.contains("[core]"), "got: {rendered}");
+        assert!(rendered.contains("editor = vim"), "got: {rendered}");
+        assert!(rendered.contains("autocrlf = input"), "got: {rendered}");
+    }
+
+    #[test]
+    fn set_inserts_new_section_when_missing() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("alias.co").unwrap();
+        doc.set(&path, "checkout".to_string()).unwrap();
+        let rendered = doc.render();
+        // Existing content preserved.
+        assert!(rendered.contains("[user]"), "got: {rendered}");
+        assert!(rendered.contains("email = a@b"), "got: {rendered}");
+        // New section + key appended.
+        assert!(rendered.contains("[alias]"), "got: {rendered}");
+        assert!(rendered.contains("co = checkout"), "got: {rendered}");
+        // Round-trip read.
+        assert_eq!(doc.get(&path), Some("checkout".to_string()));
+    }
+
+    #[test]
+    fn set_inserts_new_subsection_when_missing() {
+        let original = "[remote \"origin\"]\n\turl = https://example.com/foo\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.upstream.url").unwrap();
+        doc.set(&path, "https://example.com/up".to_string())
+            .unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("[remote \"origin\"]"), "got: {rendered}");
+        assert!(rendered.contains("[remote \"upstream\"]"), "got: {rendered}");
+        assert_eq!(doc.get(&path), Some("https://example.com/up".to_string()));
+    }
+
+    #[test]
+    fn set_works_on_empty_document() {
+        // Bootstrapping path: an `allow_missing` load of an absent file
+        // produces an empty document; subsequent sets must work.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "bob@example.com".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn set_rejects_path_with_too_few_segments() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("orphan").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("section.key") || s.contains("missing a key"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_rejects_path_with_too_many_segments() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("a.b.c.d").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        assert!(err.to_string().contains("too many segments"), "msg: {err}");
     }
 }
