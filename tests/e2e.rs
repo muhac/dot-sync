@@ -1136,6 +1136,133 @@ fn jsonc_vscode_settings_round_trips_real_world_shape() {
 }
 
 #[test]
+fn json_dry_run_reports_changes_without_writing_files() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let original_target = fixture.read("target.json");
+
+    fixture
+        .command()
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run: no files written"))
+        .stdout(predicate::str::contains("would change target: max_bytes"))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    // Target file is exactly as-was: dry-run never writes.
+    assert_eq!(fixture.read("target.json"), original_target);
+}
+
+#[test]
+fn json_dry_run_reports_added_fields() {
+    let fixture = Fixture::load("json", "preserves_unmanaged");
+    fixture
+        .command()
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would change target: tui.theme"))
+        .stdout(predicate::str::contains("source: \"monokai\""));
+}
+
+#[test]
+fn json_dry_run_does_not_emit_recovery_snapshot() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote ").not());
+
+    assert!(!snap.path().join("dot-sync").exists());
+}
+
+#[test]
+fn json_push_missing_source_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: missing.json
+    target: target.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("source file does not exist"))
+        .stderr(predicate::str::contains(
+            "run pull/sync if you want to bootstrap it",
+        ));
+}
+
+#[test]
+fn json_pull_missing_target_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: missing.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("source.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["pull", "agent", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target file does not exist"))
+        .stderr(predicate::str::contains(
+            "run push/sync if you want to bootstrap it",
+        ));
+}
+
+#[test]
+fn json_write_emits_recovery_snapshot_for_existing_files() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    let assert = cmd
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"))
+        .stdout(predicate::str::contains("recovery:"));
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let snapshot_line = output
+        .lines()
+        .find(|line| line.contains("recovery:"))
+        .unwrap();
+    let snapshot_path = PathBuf::from(snapshot_line.split_once("recovery:").unwrap().1.trim());
+    assert!(
+        snapshot_path.starts_with(snap.path().join("dot-sync")),
+        "snapshot {snapshot_path:?} not under {:?}",
+        snap.path().join("dot-sync"),
+    );
+    assert!(snapshot_path.exists(), "snapshot file missing");
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
