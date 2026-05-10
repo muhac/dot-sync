@@ -31,6 +31,14 @@ impl fmt::Display for Direction {
 pub struct SyncOptions {
     pub dry_run: bool,
     pub backup: bool,
+    pub conflict: ConflictMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictMode {
+    TargetWins,
+    SourceWins,
+    FailOnConflict,
 }
 
 #[derive(Debug)]
@@ -116,7 +124,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     let changes = match direction {
         Direction::Pull => pull(&mut source, &target_doc, &sync_paths)?,
         Direction::Push => push(&source, &mut target_doc, &sync_paths)?,
-        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths)?,
+        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths, options.conflict)?,
     };
 
     report_changes(target, direction, options, &changes, &warnings);
@@ -251,7 +259,16 @@ fn sync(
     source: &mut dyn Document,
     target: &mut dyn Document,
     paths: &[ParsedPath],
+    mode: ConflictMode,
 ) -> Result<Vec<Change>> {
+    if matches!(mode, ConflictMode::FailOnConflict) {
+        let conflicts = collect_conflicts(source, target, paths);
+        if !conflicts.is_empty() {
+            print_conflicts(&conflicts);
+            bail!("fail-on-conflict: {} conflicting field(s)", conflicts.len());
+        }
+    }
+
     let mut changes = Vec::new();
     for path in paths {
         let source_item = source.get(&path.path);
@@ -259,12 +276,33 @@ fn sync(
         match (source_item, target_item) {
             (None, None) => continue,
             (Some(s), Some(t)) if same_item(&s, &t) => continue,
-            (_, Some(_)) => {
+            (Some(_), Some(_)) => {
+                // Both sides have a value and they differ — conflict mode picks the winner.
+                let (into, from, dest) = match mode {
+                    ConflictMode::TargetWins => (
+                        source as &mut dyn Document,
+                        target as &dyn Document,
+                        Destination::Source,
+                    ),
+                    ConflictMode::SourceWins => (
+                        target as &mut dyn Document,
+                        source as &dyn Document,
+                        Destination::Target,
+                    ),
+                    ConflictMode::FailOnConflict => unreachable!("checked above"),
+                };
+                if let Some(change) = apply_one_way(into, from, path, dest)? {
+                    changes.push(change);
+                }
+            }
+            (None, Some(_)) => {
+                // Only target has the value; fill source regardless of mode.
                 if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
                     changes.push(change);
                 }
             }
             (Some(_), None) => {
+                // Only source has the value; fill target regardless of mode.
                 if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
                     changes.push(change);
                 }
@@ -272,6 +310,43 @@ fn sync(
         }
     }
     Ok(changes)
+}
+
+fn collect_conflicts<'a>(
+    source: &dyn Document,
+    target: &dyn Document,
+    paths: &'a [ParsedPath],
+) -> Vec<Conflict<'a>> {
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let (Some(s), Some(t)) = (source.get(&path.path), target.get(&path.path)) else {
+            continue;
+        };
+        if same_item(&s, &t) {
+            continue;
+        }
+        conflicts.push(Conflict {
+            path: &path.raw,
+            source_value: summarize_item(Some(&s)),
+            target_value: summarize_item(Some(&t)),
+        });
+    }
+    conflicts
+}
+
+fn print_conflicts(conflicts: &[Conflict<'_>]) {
+    for conflict in conflicts {
+        println!("  conflict: {}", conflict.path);
+        println!("    source: {}", conflict.source_value);
+        println!("    target: {}", conflict.target_value);
+    }
+}
+
+#[derive(Debug)]
+struct Conflict<'a> {
+    path: &'a str,
+    source_value: String,
+    target_value: String,
 }
 
 fn apply_one_way(
@@ -714,6 +789,7 @@ project_doc_fallback_filenames = ["CLAUDE.md"]
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -750,6 +826,7 @@ theme = "target"
             &mut source,
             &mut target,
             &parsed(&["tui.theme", "plugins.\"github@openai-curated\".enabled"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -786,6 +863,7 @@ tui_theme = "monokai"
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -817,9 +895,115 @@ tui_theme = "monokai"
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn sync_source_wins_overwrites_target_on_conflict() {
+        let mut source = toml_from("project_doc_max_bytes = 1\n");
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+
+        let changes = sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::SourceWins,
+        )
+        .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].destination, Destination::Target));
+        let new_target = target
+            .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+            .unwrap();
+        assert_eq!(new_target.as_value().unwrap().as_integer(), Some(1));
+        let preserved_source = source
+            .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+            .unwrap();
+        assert_eq!(
+            preserved_source.as_value().unwrap().as_integer(),
+            Some(1),
+            "source value should be untouched under source-wins"
+        );
+    }
+
+    #[test]
+    fn sync_source_wins_still_fills_missing_source() {
+        let mut source = toml_from("");
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+
+        sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::SourceWins,
+        )
+        .unwrap();
+
+        assert_eq!(
+            source
+                .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+                .unwrap()
+                .as_value()
+                .unwrap()
+                .as_integer(),
+            Some(65536),
+            "missing-on-source case fills regardless of mode"
+        );
+    }
+
+    #[test]
+    fn sync_fail_on_conflict_bails_without_writing() {
+        let mut source = toml_from(
+            r#"
+project_doc_max_bytes = 1
+project_doc_fallback_filenames = ["AGENTS.md"]
+"#,
+        );
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+        let original_source = source.render();
+        let original_target = target.render();
+
+        let err = sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::FailOnConflict,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("fail-on-conflict"));
+        assert_eq!(source.render(), original_source);
+        assert_eq!(target.render(), original_target);
+    }
+
+    #[test]
+    fn sync_fail_on_conflict_succeeds_when_no_conflict() {
+        let mut source = toml_from("project_doc_max_bytes = 65536\n");
+        let mut target = toml_from(
+            r#"
+project_doc_max_bytes = 65536
+project_doc_fallback_filenames = ["AGENTS.md"]
+"#,
+        );
+
+        sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::FailOnConflict,
+        )
+        .unwrap();
+
+        assert!(
+            source
+                .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
+                .is_some(),
+            "missing-on-source case still fills under fail-on-conflict"
+        );
     }
 
     #[test]
@@ -842,6 +1026,7 @@ tui_theme = "monokai"
             SyncOptions {
                 dry_run: false,
                 backup: true,
+                conflict: ConflictMode::TargetWins,
             },
         )
         .unwrap();
@@ -869,6 +1054,7 @@ tui_theme = "monokai"
             SyncOptions {
                 dry_run: true,
                 backup: true,
+                conflict: ConflictMode::TargetWins,
             },
         )
         .unwrap_err();

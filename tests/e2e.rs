@@ -575,6 +575,61 @@ fn dry_run_does_not_emit_recovery_snapshot() {
 }
 
 #[test]
+fn sync_source_wins_overwrites_target_value() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: project_doc_max_bytes",
+        ))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    assert_eq!(
+        fixture.read("target.toml"),
+        "project_doc_max_bytes = 65536\n"
+    );
+    assert_eq!(
+        fixture.read("source.toml"),
+        "project_doc_max_bytes = 65536\n"
+    );
+}
+
+#[test]
+fn sync_fail_on_conflict_aborts() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let original_target = fixture.read("target.toml");
+    let original_source = fixture.read("source.toml");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: project_doc_max_bytes"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    assert_eq!(fixture.read("target.toml"), original_target);
+    assert_eq!(fixture.read("source.toml"), original_source);
+}
+
+#[test]
+fn sync_conflict_flags_are_mutually_exclusive() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--target-wins", "--source-wins"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
 fn config_rejects_unknown_keys() {
     let dir = TempDir::new().unwrap();
     write_file(

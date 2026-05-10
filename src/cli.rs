@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "dot-sync")]
@@ -22,6 +22,25 @@ pub struct SyncFlags {
     pub backup: bool,
 }
 
+#[derive(Debug, Args)]
+#[command(group = ArgGroup::new("conflict").required(false).multiple(false))]
+pub struct SyncCmdFlags {
+    #[command(flatten)]
+    pub common: SyncFlags,
+
+    /// On conflicting listed fields, keep target's value (default).
+    #[arg(long, group = "conflict")]
+    pub target_wins: bool,
+
+    /// On conflicting listed fields, overwrite target with source's value.
+    #[arg(long, group = "conflict")]
+    pub source_wins: bool,
+
+    /// Bail out if any listed field differs between source and target.
+    #[arg(long, group = "conflict")]
+    pub fail_on_conflict: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show configuration and file health without syncing.
@@ -37,5 +56,5 @@ pub enum Command {
     Push(#[command(flatten)] SyncFlags),
 
     /// Reconcile selected fields between source and target in both directions.
-    Sync(#[command(flatten)] SyncFlags),
+    Sync(#[command(flatten)] SyncCmdFlags),
 }
