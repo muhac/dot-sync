@@ -85,7 +85,27 @@ pub fn run(args: AddArgs) -> Result<()> {
     });
     // For an existing target, format / paths are not changed even if
     // the user passed --format / --source / --target — those flags only
-    // serve as fallbacks when the target is new. Keep it deterministic.
+    // serve as fallbacks when the target is new. Keep it deterministic
+    // and warn the user so it's not a silent surprise.
+    if existing.is_some() {
+        let mut ignored: Vec<&str> = Vec::new();
+        if args.format.is_some() {
+            ignored.push("--format");
+        }
+        if args.source.is_some() {
+            ignored.push("--source");
+        }
+        if args.target.is_some() {
+            ignored.push("--target");
+        }
+        if !ignored.is_empty() {
+            eprintln!(
+                "warning: target '{}' already exists; {} ignored (use a different target name to create a fresh entry)",
+                args.name,
+                ignored.join(" / "),
+            );
+        }
+    }
     let mut added = 0usize;
     for path in new_path_strings {
         if !entry.sync.iter().any(|p| p == &path) {
