@@ -1,0 +1,7 @@
+targets:
+  vscode:
+    format: jsonc
+    source: source.jsonc
+    target: settings.jsonc
+    sync:
+      - editor.tabSize

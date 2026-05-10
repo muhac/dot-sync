@@ -1,0 +1,8 @@
+{
+  // local override (managed by sync)
+  "feature": {
+    // keep this exact value carefully
+    "enabled": true,
+    "name": "demo"
+  }
+}

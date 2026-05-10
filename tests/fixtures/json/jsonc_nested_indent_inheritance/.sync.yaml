@@ -1,0 +1,7 @@
+targets:
+  agent:
+    format: jsonc
+    source: source.jsonc
+    target: target.jsonc
+    sync:
+      - existing.deep.newer

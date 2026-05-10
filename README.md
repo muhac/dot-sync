@@ -59,12 +59,16 @@ directory. Paths in `source` are resolved relative to that file. Paths in
 `target` may use `~` for the current user's home directory.
 
 **Supporting formats:**
-- **TOML** — format-preserving via `toml_edit` (whitespace, key order, comments).
-- **JSON** — key-order-preserving via `serde_json` with the `preserve_order`
-  feature. The renderer sniffs the source file's indent style (2-space,
-  4-space, tab, …) and reuses it; minified or empty inputs fall back to
-  2-space pretty-print. Always emits a trailing newline. Comments /
-  trailing commas / JSON5 / JSONC are not supported.
+- **TOML** (`format: toml`) — format-preserving via `toml_edit`
+  (whitespace, key order, comments).
+- **JSON / JSONC** (`format: json` or `format: jsonc` — same backend,
+  use whichever name better describes the target file) — format-preserving
+  via `jsonc-parser`. Object key order, comments (`//` and `/* */`),
+  trailing commas, blank lines, and original indentation all round-trip
+  through `pull` / `push` / `sync`. Strict JSON, JSONC (the dialect VS
+  Code / `tsconfig.json` use), and files with trailing commas are all
+  accepted. JSON5 (single-quoted strings, unquoted keys, hex / Infinity
+  / NaN literals) is not supported.
 
 ## Concepts
 
@@ -138,16 +142,20 @@ Pinned and wildcard selectors:
   as different values, so an explicit `null` propagates instead of being
   dropped. Use this to deliberately overwrite a target's value with `null`.
 - **Int vs float in selectors.** `[k=8080]` matches `"k": 8080` only —
-  not `"k": 8080.0`. `serde_json` distinguishes integer and float
-  representations, and selector matching follows that distinction. Floats
-  are not supported as selector values at all.
-- Object key order is preserved on parse and round-trip (`preserve_order`
-  feature of `serde_json`).
-- **Indent is preserved** by sniffing the first indented line of the source
-  file. 4-space, tab, or other consistent styles round-trip unchanged. A
-  minified or empty input falls back to 2-space pretty-print.
-- Other whitespace (blank lines between keys, alignment columns, etc) is
-  not preserved.
+  not `"k": 8080.0`. Integer and float representations are distinct, and
+  selector matching follows that distinction. Floats are not supported
+  as selector values at all.
+- **JSONC support.** Line (`// …`) and block (`/* … */`) comments,
+  trailing commas inside arrays and objects, and blank lines round-trip
+  through sync. Comments stay attached to the source / target side they
+  originally lived on — sync moves *values*, not the surrounding trivia.
+- **Indent and trailing-comma style** are inferred from existing
+  structure when new entries are added — a 4-space / tab-indented file
+  keeps its style, a file using trailing commas keeps using them.
+- **What's not preserved.** String escape sequences in *replaced* string
+  values are re-emitted in canonical form (e.g. `"A"` becomes `"A"`).
+  JSON5-only syntax (single-quoted strings, unquoted keys, hex / Infinity
+  / NaN literals) is rejected by the parser.
 
 ## Commands
 

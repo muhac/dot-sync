@@ -1,0 +1,7 @@
+{
+  // managed source — these comments stay on the source side only
+  "feature": {
+    /* explanation block that should never leak across */
+    "enabled": true
+  }
+}

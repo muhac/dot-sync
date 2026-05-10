@@ -1,0 +1,21 @@
+{
+  // Editor
+  "editor.fontSize": 14,
+  "editor": {
+    // tabs vs spaces — keep at 2 by default
+    "tabSize": 4,
+    "fontFamily": "Menlo, monospace"
+  },
+
+  // Files
+  "files.autoSave": "onFocusChange",
+  "files.exclude": {
+    "**/.git": true,
+    "**/.DS_Store": true,
+  },
+
+  /*
+   * Workbench appearance, do not touch
+   */
+  "workbench.colorTheme": "Monokai"
+}

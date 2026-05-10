@@ -1047,3 +1047,596 @@ fn json_push_preserves_unmanaged_target_fields() {
     fixture.command().args(["push", "agent"]).assert().success();
     fixture.assert_file_eq("target.json", "target.expected.json");
 }
+
+#[test]
+fn jsonc_push_preserves_line_comments_around_modified_value() {
+    // Both line comments (top-of-file and same-line) and the surrounding
+    // structure must round-trip while only `feature.enabled` flips.
+    let fixture = Fixture::load("json", "jsonc_comments_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_push_preserves_block_and_inline_comments() {
+    // Multi-line block comment at the top + inline `/* */` after a value.
+    let fixture = Fixture::load("json", "jsonc_block_comment_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: tui.theme"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_pull_preserves_source_side_comments() {
+    // Pull writes the *source* file (target → source). Source-side
+    // comments and block-comment trivia must survive the write — same
+    // CST round-trip guarantee as push, just on the other side.
+    let fixture = Fixture::load("json", "jsonc_pull_preserves_source_comments");
+    fixture
+        .command()
+        .args(["pull", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: feature.enabled"));
+    fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
+}
+
+#[test]
+fn jsonc_new_key_appended_does_not_strand_neighbor_comment() {
+    // Target has `{"a": 1 // keep existing trailing comment\n}`. Source
+    // adds key `b`. Locks the current jsonc-parser placement: comment
+    // stays attached to `a`, new key is appended without disturbing it.
+    let fixture = Fixture::load("json", "jsonc_new_key_with_neighbor_comment");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: b"));
+    let after = fixture.read("target.jsonc");
+    assert!(
+        after.contains("// keep existing trailing comment"),
+        "comment must survive: {after}"
+    );
+    assert!(after.contains("\"a\": 1"), "a:1 must survive: {after}");
+    assert!(after.contains("\"b\": 2"), "b:2 must be added: {after}");
+    // Comment is on the same line as `a: 1`, before any new key.
+    let comment_pos = after.find("// keep").unwrap();
+    let b_pos = after.find("\"b\"").unwrap();
+    assert!(
+        comment_pos < b_pos,
+        "comment must precede the appended key in source order: {after}"
+    );
+}
+
+#[test]
+fn jsonc_vscode_settings_round_trips_real_world_shape() {
+    // Representative VS Code settings.jsonc — top-of-section line
+    // comments, `// inline comment, blank lines between sections,
+    // trailing commas inside nested objects, multi-line block comments.
+    // Sync only `editor.tabSize`. Everything else (sibling keys, all
+    // comments, blank lines, trailing commas) must round-trip unchanged.
+    let fixture = Fixture::load("json", "jsonc_vscode_settings");
+    fixture
+        .command()
+        .args(["push", "vscode"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: editor.tabSize"));
+    fixture.assert_file_eq("settings.jsonc", "settings.expected.jsonc");
+}
+
+#[test]
+fn json_dry_run_reports_changes_without_writing_files() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let original_target = fixture.read("target.json");
+
+    fixture
+        .command()
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run: no files written"))
+        .stdout(predicate::str::contains("would change target: max_bytes"))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    // Target file is exactly as-was: dry-run never writes.
+    assert_eq!(fixture.read("target.json"), original_target);
+}
+
+#[test]
+fn json_dry_run_reports_added_fields() {
+    let fixture = Fixture::load("json", "preserves_unmanaged");
+    fixture
+        .command()
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would change target: tui.theme"))
+        .stdout(predicate::str::contains("source: \"monokai\""));
+}
+
+#[test]
+fn json_dry_run_does_not_emit_recovery_snapshot() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["push", "agent", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote ").not());
+
+    assert!(!snap.path().join("dot-sync").exists());
+}
+
+#[test]
+fn json_push_missing_source_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: missing.json
+    target: target.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("source file does not exist"))
+        .stderr(predicate::str::contains(
+            "run pull/sync if you want to bootstrap it",
+        ));
+}
+
+#[test]
+fn json_pull_missing_target_has_actionable_error() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: missing.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("source.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["pull", "agent", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target file does not exist"))
+        .stderr(predicate::str::contains(
+            "run push/sync if you want to bootstrap it",
+        ));
+}
+
+#[test]
+fn json_write_emits_recovery_snapshot_for_existing_files() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    let assert = cmd
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"))
+        .stdout(predicate::str::contains("recovery:"));
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let snapshot_line = output
+        .lines()
+        .find(|line| line.contains("recovery:"))
+        .unwrap();
+    let snapshot_path = PathBuf::from(snapshot_line.split_once("recovery:").unwrap().1.trim());
+    assert!(
+        snapshot_path.starts_with(snap.path().join("dot-sync")),
+        "snapshot {snapshot_path:?} not under {:?}",
+        snap.path().join("dot-sync"),
+    );
+    assert!(snapshot_path.exists(), "snapshot file missing");
+}
+
+#[test]
+fn json_sync_source_wins_overwrites_target_value() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "agent", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: max_bytes"))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    let target = fixture.read("target.json");
+    assert!(
+        target.contains("65536"),
+        "target should now hold source's value: {target}"
+    );
+}
+
+#[test]
+fn json_sync_fail_on_conflict_aborts() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let original_target = fixture.read("target.json");
+    let original_source = fixture.read("source.json");
+
+    fixture
+        .command()
+        .args(["sync", "agent", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: max_bytes"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // Both files untouched — preflight aborts before any write.
+    assert_eq!(fixture.read("target.json"), original_target);
+    assert_eq!(fixture.read("source.json"), original_source);
+}
+
+#[test]
+fn json_sync_fail_on_conflict_preflights_all_targets_before_writing() {
+    // Two targets: alpha would write cleanly, beta has a conflict. The
+    // global preflight must abort beta and prevent alpha's write — same
+    // "write nothing" guarantee as the TOML side.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  alpha:
+    format: json
+    source: alpha-source.json
+    target: alpha-target.json
+    sync:
+      - field
+  beta:
+    format: json
+    source: beta-source.json
+    target: beta-target.json
+    sync:
+      - field
+"#,
+    );
+    write_file(&dir.path().join("alpha-source.json"), r#"{"field": "new"}"#);
+    write_file(&dir.path().join("alpha-target.json"), "{}");
+    write_file(&dir.path().join("beta-source.json"), r#"{"field": "src"}"#);
+    write_file(&dir.path().join("beta-target.json"), r#"{"field": "tgt"}"#);
+
+    dot_sync_in(dir.path())
+        .args(["sync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("beta sync preflight"))
+        .stdout(predicate::str::contains("conflict: field"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // alpha must be untouched even though only beta had the conflict.
+    assert_eq!(read_normalized(&dir.path().join("alpha-target.json")), "{}");
+    assert_eq!(
+        read_normalized(&dir.path().join("beta-target.json")),
+        r#"{"field": "tgt"}"#
+    );
+}
+
+#[test]
+fn json_pinned_selector_multi_match_errors_with_target_context() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - mcpServers[name="github"].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.json"),
+        r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to process target agent"))
+        .stderr(predicate::str::contains(
+            "source pattern 'mcpServers[name=\"github\"].enabled'",
+        ))
+        .stderr(predicate::str::contains("ambiguous pinned"))
+        .stderr(predicate::str::contains("2 items where name=\"github\""));
+
+    // No write — preflight aborts before any file change.
+    assert_eq!(read_file(&dir.path().join("target.json")), "{}");
+}
+
+#[test]
+fn json_wildcard_selector_duplicate_identifier_errors() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - mcpServers[name].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.json"),
+        r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+    );
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous wildcard"))
+        .stderr(predicate::str::contains("\"github\"×2"));
+}
+
+#[test]
+fn json_multiple_targets_process_all_when_name_is_omitted() {
+    // Two targets in the same config — one strict json, one jsonc with
+    // comments. Push without a name processes both and writes each one
+    // independently, exercising the per-target dispatch loop.
+    let fixture = Fixture::load("json", "multiple_targets");
+
+    fixture
+        .command()
+        .args(["push"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent push apply"))
+        .stdout(predicate::str::contains("tooling push apply"));
+
+    fixture.assert_file_eq("agent-target.json", "agent-target.expected.json");
+    fixture.assert_file_eq("tooling-target.jsonc", "tooling-target.expected.jsonc");
+}
+
+#[test]
+fn json_parent_discovery_finds_config_in_ancestor_directory() {
+    // CLI runs from a nested subdirectory; the `.sync.yaml` lives at the
+    // fixture root. Discovery walks up the parent chain — same behavior
+    // as the TOML parent_discovery test.
+    let fixture = Fixture::load("json", "parent_discovery");
+    fs::create_dir_all(fixture.path().join("nested/worktree")).unwrap();
+
+    fixture
+        .command_in("nested/worktree")
+        .args(["sync", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: max_bytes"));
+
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_backup_creates_timestamped_copy_before_writing() {
+    let fixture = Fixture::load("json", "backup_write");
+    let original_target = fixture.read("target.json");
+
+    fixture
+        .command()
+        .args(["push", "agent", "--backup"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: max_bytes"));
+
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let backups = fs::read_dir(fixture.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "expected one .bak.* file");
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
+fn json_malformed_source_emits_parse_error_with_path() {
+    // Malformed JSON in the source file. Engine surfaces our wrapped
+    // jsonc-parser error including the file path so the user can find
+    // the offending file.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - max_bytes
+"#,
+    );
+    write_file(&dir.path().join("source.json"), r#"{ "max_bytes": "#);
+    write_file(&dir.path().join("target.json"), "{}");
+
+    dot_sync_in(dir.path())
+        .args(["push", "agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse JSONC"))
+        .stderr(predicate::str::contains("source.json"));
+}
+
+#[test]
+fn json_malformed_yaml_config_exits_with_parse_error() {
+    let fixture = Fixture::load("json", "malformed_config");
+    fixture
+        .command()
+        .args(["sync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse"));
+}
+
+#[test]
+fn jsonc_push_preserves_multi_line_comment_run_above_key() {
+    // Three stacked `//` comments above a key, plus two more above the
+    // nested key whose value gets flipped. None of them should be
+    // stranded, duplicated, or reordered.
+    let fixture = Fixture::load("json", "jsonc_multi_line_comment_run");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_push_preserves_indent_when_creating_nested_objects() {
+    // Target uses 4-space indent and has a partial structure. Source
+    // wants to write `existing.deep.newer` where `deep` doesn't exist
+    // on the target side. The newly created intermediate object must
+    // inherit the file's 4-space indent style at every nesting level.
+    let fixture = Fixture::load("json", "jsonc_nested_indent_inheritance");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "added target: existing.deep.newer",
+        ));
+    let after = fixture.read("target.jsonc");
+    // Existing structure stays at 4-space.
+    assert!(
+        after.contains("\n    \"existing\""),
+        "outer key kept 4-space indent: {after}"
+    );
+    assert!(
+        after.contains("\n        \"a\""),
+        "nested existing.a kept 8-space indent: {after}"
+    );
+    // New `deep` key sits at the same level as `a` (8 spaces).
+    assert!(
+        after.contains("\n        \"deep\""),
+        "newly created `deep` should sit at 8-space indent: {after}"
+    );
+    // `newer` inside the new `deep` object inherits the file's step
+    // size, so it lives at 12 spaces.
+    assert!(
+        after.contains("\n            \"newer\""),
+        "newer inside new `deep` should be at 12-space indent: {after}"
+    );
+}
+
+#[test]
+fn jsonc_cross_dialect_does_not_leak_comments_across_sides() {
+    // Source is JSONC with both line and block comments. Target is
+    // strict JSON (no comments). Push moves the value — but the source's
+    // comments must NOT leak into the target file, and the source's
+    // own comments must stay untouched (push doesn't write source).
+    let fixture = Fixture::load("json", "jsonc_cross_dialect");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+
+    // Target gets the new value, no comments leaked.
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let target_after = fixture.read("target.json");
+    assert!(
+        !target_after.contains("//"),
+        "target must not gain a // comment from source: {target_after}"
+    );
+    assert!(
+        !target_after.contains("/*"),
+        "target must not gain a /* comment from source: {target_after}"
+    );
+
+    // Source untouched (push direction doesn't write source).
+    fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
+}
+
+#[test]
+fn json_push_propagates_float_values_without_truncation() {
+    // Source has a float value; push must write the same float to the
+    // target, not truncate to int. End-to-end check that
+    // `value_to_cst_input` and the safe walker both preserve the float.
+    let fixture = Fixture::load("json", "float_source_value");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: llm.temperature"));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let after = fixture.read("target.json");
+    assert!(
+        after.contains("0.7"),
+        "target should hold the float literal 0.7: {after}"
+    );
+}
+
+#[test]
+fn jsonc_format_alias_dispatches_to_json_backend() {
+    // `format: jsonc` is accepted as an alias for `format: json` so a
+    // user with VS Code / tsconfig files can self-document the fact that
+    // the file contains comments / trailing commas.
+    let fixture = Fixture::load("json", "jsonc_format_alias");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_push_preserves_trailing_commas() {
+    // Source and target both use trailing commas inside the array. After
+    // a pinned-selector update the trailing-comma style must follow the
+    // existing source-side policy (`uses_trailing_commas()` infers it).
+    let fixture = Fixture::load("json", "jsonc_trailing_comma_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: tools[name=\"parse\"].enabled",
+        ));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}

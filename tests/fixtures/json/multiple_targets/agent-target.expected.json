@@ -1,0 +1,6 @@
+{
+  "model": "gpt-5.2",
+  "tui": {
+    "theme": "monokai"
+  }
+}

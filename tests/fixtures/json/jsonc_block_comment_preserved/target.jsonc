@@ -1,0 +1,9 @@
+{
+  /*
+   * Block comment at the top of the file.
+   * Multi-line, with indentation.
+   */
+  "tui": {
+    "theme": "old" /* inline comment */
+  }
+}

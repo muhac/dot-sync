@@ -1,0 +1,8 @@
+{
+  // managed source — comments must survive a pull
+  "feature": {
+    /* keep this trail */
+    "enabled": false,
+    "name": "demo"
+  }
+}

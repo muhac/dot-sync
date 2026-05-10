@@ -1,0 +1,7 @@
+targets:
+  agent:
+    format: json
+    source: source.jsonc
+    target: target.jsonc
+    sync:
+      - feature.enabled
