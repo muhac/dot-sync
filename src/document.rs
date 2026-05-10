@@ -2328,8 +2328,46 @@ impl Document for EnvDocument {
         })
     }
 
-    fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
-        unimplemented!("EnvDocument::set — wired in next commit")
+    fn set(&mut self, path: &FieldPath, item: String) -> Result<()> {
+        let key = path_to_env_key(path)?;
+        // Update in place if the key exists. When the same key appears
+        // more than once, target the last occurrence — same "later wins"
+        // model as `get`.
+        let mut last_idx: Option<usize> = None;
+        for (idx, line) in self.lines.iter().enumerate() {
+            if let EnvLine::Entry(e) = line
+                && e.key == key
+            {
+                last_idx = Some(idx);
+            }
+        }
+        if let Some(idx) = last_idx {
+            if let EnvLine::Entry(e) = &mut self.lines[idx] {
+                e.quote = pick_quote_style(&item, e.quote);
+                e.value = item;
+                e.modified = true;
+            }
+            return Ok(());
+        }
+        // No existing entry: append. Pick a quote style automatically
+        // — bare when safe, double-quoted when the value would otherwise
+        // round-trip wrong (leading/trailing whitespace, trailing
+        // backslash, leading quote char). New entries never get the
+        // `export` prefix — that's a user-style decision dot-sync
+        // doesn't try to guess.
+        let entry = EnvEntry {
+            raw: String::new(),
+            export: false,
+            quote: auto_quote_style(&item),
+            key,
+            value: item,
+            modified: true,
+        };
+        self.lines.push(EnvLine::Entry(entry));
+        // Ensure the file as a whole ends with a newline so the new
+        // entry stays on its own line and subsequent edits start fresh.
+        self.trailing_newline = true;
+        Ok(())
     }
 
     fn table_conflict(&self, _path: &FieldPath) -> Option<TableConflict> {
@@ -2386,6 +2424,41 @@ impl Document for EnvDocument {
 
     fn discover_field_tree(&self) -> FieldTree {
         unimplemented!("EnvDocument::discover_field_tree — wired in a later commit")
+    }
+}
+
+/// Heuristic quote style for a new env value. Bare is the default;
+/// upgrade to double-quoted when the value's edges would confuse the
+/// bare parser (leading whitespace gets trimmed, trailing whitespace
+/// gets trimmed, trailing `\` is rejected as a continuation
+/// attempt, leading `"` / `'` is misread as the start of a quoted
+/// value).
+fn auto_quote_style(value: &str) -> QuoteStyle {
+    let needs_double = value.starts_with(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        || value.ends_with(|c: char| c.is_whitespace() || c == '\\');
+    if needs_double {
+        QuoteStyle::Double
+    } else {
+        QuoteStyle::None
+    }
+}
+
+/// Pick the quote style for an updated entry. Prefer to preserve the
+/// user's existing style; upgrade when the new value can't live there.
+/// - `None` (bare): keep if safe, else `Double`.
+/// - `Single`: keep if value has no `'`, else `Double`.
+/// - `Double`: always fine — escapes handle anything.
+fn pick_quote_style(new_value: &str, existing: QuoteStyle) -> QuoteStyle {
+    match existing {
+        QuoteStyle::Double => QuoteStyle::Double,
+        QuoteStyle::Single => {
+            if new_value.contains('\'') {
+                QuoteStyle::Double
+            } else {
+                QuoteStyle::Single
+            }
+        }
+        QuoteStyle::None => auto_quote_style(new_value),
     }
 }
 
@@ -5103,5 +5176,184 @@ EMPTY=
             .expand(&FieldPath::parse("bad-key").unwrap())
             .unwrap_err();
         assert!(err.to_string().contains("POSIX"), "msg: {err}");
+    }
+
+    // ----- set -----
+
+    #[test]
+    fn set_updates_bare_value_in_place_byte_exact_around() {
+        // Surrounding comments / blanks / unrelated entries survive
+        // verbatim — only the targeted entry's bytes change.
+        let original = "\
+# header
+KEY1=alpha
+KEY2=old
+KEY3=gamma
+";
+        let (_dir, mut doc) = doc_from(original);
+        doc.set(&FieldPath::parse("KEY2").unwrap(), "new".to_string())
+            .unwrap();
+        assert_eq!(
+            doc.render(),
+            "\
+# header
+KEY1=alpha
+KEY2=new
+KEY3=gamma
+"
+        );
+    }
+
+    #[test]
+    fn set_preserves_double_quote_style() {
+        let (_dir, mut doc) = doc_from("MSG=\"old value\"\n");
+        doc.set(&FieldPath::parse("MSG").unwrap(), "new value".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "MSG=\"new value\"\n");
+    }
+
+    #[test]
+    fn set_preserves_single_quote_style() {
+        let (_dir, mut doc) = doc_from("MSG='old'\n");
+        doc.set(&FieldPath::parse("MSG").unwrap(), "new".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "MSG='new'\n");
+    }
+
+    #[test]
+    fn set_upgrades_single_to_double_when_value_contains_apostrophe() {
+        // Single-quoted entries can't hold `'` (POSIX has no escape
+        // inside single quotes). Upgrade to double on the fly so the
+        // file stays parseable.
+        let (_dir, mut doc) = doc_from("MSG='hello'\n");
+        doc.set(&FieldPath::parse("MSG").unwrap(), "it's fine".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "MSG=\"it's fine\"\n");
+    }
+
+    #[test]
+    fn set_preserves_export_prefix() {
+        let (_dir, mut doc) = doc_from("export PATH=/usr/bin\n");
+        doc.set(
+            &FieldPath::parse("PATH").unwrap(),
+            "/usr/local/bin".to_string(),
+        )
+        .unwrap();
+        assert_eq!(doc.render(), "export PATH=/usr/local/bin\n");
+    }
+
+    #[test]
+    fn set_appends_new_entry_at_end() {
+        let (_dir, mut doc) = doc_from("EXISTING=1\n");
+        doc.set(&FieldPath::parse("NEW").unwrap(), "value".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "EXISTING=1\nNEW=value\n");
+    }
+
+    #[test]
+    fn set_appends_to_empty_document() {
+        let mut doc = EnvDocument::empty();
+        doc.set(&FieldPath::parse("FIRST").unwrap(), "1".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "FIRST=1\n");
+    }
+
+    #[test]
+    fn set_auto_quotes_value_with_leading_whitespace() {
+        // Bare parser strips leading whitespace, so a value starting
+        // with whitespace must round-trip via double quotes.
+        let mut doc = EnvDocument::empty();
+        doc.set(&FieldPath::parse("PADDED").unwrap(), " value".to_string())
+            .unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("PADDED=\" value\""), "got: {rendered}");
+        // Read-back round-trips.
+        assert_eq!(
+            doc.get(&FieldPath::parse("PADDED").unwrap()),
+            Some(" value".to_string())
+        );
+    }
+
+    #[test]
+    fn set_auto_quotes_value_with_trailing_backslash() {
+        // Trailing backslash on a bare value is rejected at load.
+        // For round-trip safety, set must wrap such values in quotes.
+        let mut doc = EnvDocument::empty();
+        doc.set(&FieldPath::parse("WEIRD").unwrap(), "value\\".to_string())
+            .unwrap();
+        let rendered = doc.render();
+        // Re-load to confirm round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, &rendered).unwrap();
+        let reloaded = EnvDocument::load(&path, false).unwrap();
+        assert_eq!(
+            reloaded.get(&FieldPath::parse("WEIRD").unwrap()),
+            Some("value\\".to_string())
+        );
+    }
+
+    #[test]
+    fn set_updates_only_last_occurrence_of_duplicate_key() {
+        // Mirror `get`: when a key appears multiple times, only the
+        // last entry is updated. Earlier shadowed entries stay
+        // unchanged so the file's history-of-values is preserved.
+        let original = "KEY=first\nKEY=second\nKEY=third\n";
+        let (_dir, mut doc) = doc_from(original);
+        doc.set(&FieldPath::parse("KEY").unwrap(), "winner".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "KEY=first\nKEY=second\nKEY=winner\n");
+        assert_eq!(
+            doc.get(&FieldPath::parse("KEY").unwrap()),
+            Some("winner".to_string())
+        );
+    }
+
+    #[test]
+    fn set_rejects_invalid_path_arity() {
+        let mut doc = EnvDocument::empty();
+        let err = doc
+            .set(&FieldPath::parse("section.KEY").unwrap(), "v".to_string())
+            .unwrap_err();
+        assert!(err.to_string().contains("1 segment"), "msg: {err}");
+    }
+
+    #[test]
+    fn set_rejects_non_posix_key() {
+        let mut doc = EnvDocument::empty();
+        let err = doc
+            .set(&FieldPath::parse("bad-key").unwrap(), "v".to_string())
+            .unwrap_err();
+        assert!(err.to_string().contains("POSIX"), "msg: {err}");
+    }
+
+    #[test]
+    fn set_rejects_selector_path() {
+        let mut doc = EnvDocument::empty();
+        let err = doc
+            .set(
+                &FieldPath::parse("arr[k=\"v\"].field").unwrap(),
+                "x".to_string(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("flat key-value"), "msg: {err}");
+    }
+
+    #[test]
+    fn set_then_get_round_trips_value_with_double_quote_inside() {
+        let mut doc = EnvDocument::empty();
+        let value = r#"he said "hi""#;
+        doc.set(&FieldPath::parse("MSG").unwrap(), value.to_string())
+            .unwrap();
+        // After render+reload, value comes back identical.
+        let rendered = doc.render();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, &rendered).unwrap();
+        let reloaded = EnvDocument::load(&path, false).unwrap();
+        assert_eq!(
+            reloaded.get(&FieldPath::parse("MSG").unwrap()),
+            Some(value.to_string())
+        );
     }
 }
