@@ -1,0 +1,10 @@
+{
+  // first line of context
+  // second line giving more detail
+  // third line with the important caveat
+  "feature": {
+    // inline-above explanation
+    // continuing on the next line
+    "enabled": true
+  }
+}

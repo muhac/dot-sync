@@ -1507,6 +1507,23 @@ fn json_malformed_yaml_config_exits_with_parse_error() {
 }
 
 #[test]
+fn jsonc_push_preserves_multi_line_comment_run_above_key() {
+    // Three stacked `//` comments above a key, plus two more above the
+    // nested key whose value gets flipped. None of them should be
+    // stranded, duplicated, or reordered.
+    let fixture = Fixture::load("json", "jsonc_multi_line_comment_run");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: feature.enabled",
+        ));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
