@@ -2028,3 +2028,121 @@ fn add_warns_when_existing_target_overrides_are_passed() {
     assert!(!yaml.contains("format: json"), "yaml: {yaml}");
     assert!(yaml.contains("source: source.toml"), "yaml: {yaml}");
 }
+
+// =====================================================================
+// Hidden completions / man subcommands + after_help blocks
+// =====================================================================
+
+#[test]
+fn completions_bash_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_dot-sync()"))
+        .stdout(predicate::str::contains("complete -F _dot-sync"));
+}
+
+#[test]
+fn completions_zsh_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#compdef dot-sync"));
+}
+
+#[test]
+fn completions_fish_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete "));
+}
+
+#[test]
+fn completions_powershell_emits_non_empty_script() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "powershell"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Register-ArgumentCompleter"));
+}
+
+#[test]
+fn completions_rejects_unknown_shell() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .args(["completions", "tcsh"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value 'tcsh'"));
+}
+
+#[test]
+fn man_emits_roff_source_with_dot_sync_section() {
+    Command::cargo_bin("dot-sync")
+        .unwrap()
+        .arg("man")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".TH dot-sync"))
+        .stdout(predicate::str::contains(".SH NAME"))
+        .stdout(predicate::str::contains("Sync selected fields"));
+}
+
+#[test]
+fn completions_and_man_hidden_from_main_help() {
+    // Both generation subcommands are `#[command(hide = true)]` so
+    // they don't clutter the main --help output. Surface them via
+    // README + the install.sh --with-completions flag instead.
+    let out = Command::cargo_bin("dot-sync")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let commands_section: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .take_while(|l| !l.starts_with("Options:"))
+        .collect();
+    let dump = commands_section.join("\n");
+    assert!(
+        !dump.contains("completions"),
+        "completions should be hidden from main help: {dump}"
+    );
+    assert!(
+        !dump.contains("man "),
+        "man should be hidden from main help: {dump}"
+    );
+}
+
+#[test]
+fn each_subcommand_help_shows_examples_block() {
+    // after_help blocks: each user-visible subcommand has an
+    // `Examples:` line in its own --help output.
+    for sub in ["status", "pull", "push", "sync", "restore", "add"] {
+        let out = Command::cargo_bin("dot-sync")
+            .unwrap()
+            .args([sub, "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("Examples:"),
+            "expected `Examples:` in `{sub} --help`:\n{stdout}"
+        );
+    }
+}
