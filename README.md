@@ -69,6 +69,13 @@ directory. Paths in `source` are resolved relative to that file. Paths in
   Code / `tsconfig.json` use), and files with trailing commas are all
   accepted. JSON5 (single-quoted strings, unquoted keys, hex / Infinity
   / NaN literals) is not supported.
+- **gitconfig** (`format: gitconfig`) — git's INI dialect, used by
+  `~/.gitconfig` and per-repo `.git/config`. Format-preserving via
+  `gix-config` (gitoxide): comments (`#` / `;`), blank lines, tab /
+  space indentation, and `[section "subsection"]` quoting all
+  round-trip through edits. Common case for syncing aliases, editor
+  preferences, or include rules across machines while leaving
+  `user.email`, signing keys, and credential helpers per-machine.
 
 ## Concepts
 
@@ -103,6 +110,17 @@ targets:
       - mcpServers[name="github"].enabled      # string identifier
       - servers[port=8080].host                # integer identifier
       - features[primary=true].host            # boolean identifier
+
+  git:
+    format: gitconfig
+    source: git.sync.gitconfig
+    target: ~/.gitconfig
+    sync:
+      - alias.co
+      - alias.st
+      - core.editor
+      - merge.tool
+      - includeIf."gitdir:~/work/".path        # quoted subsection
 ```
 
 ### Path syntax
@@ -157,6 +175,73 @@ Pinned and wildcard selectors:
   JSON5-only syntax (single-quoted strings, unquoted keys, hex / Infinity
   / NaN literals) is rejected by the parser.
 
+### gitconfig specifics
+
+- **Path arity.** Two segments address `section.key`
+  (`user.email`, `core.editor`); three address
+  `section.subsection.key` (`remote.origin.url`,
+  `branch."feature.x".remote`). Single-segment and 4+ segment paths
+  are rejected — gitconfig has no top-level keys outside a section
+  and no nested values under a key.
+- **Subsections with special characters.** Use the existing
+  quoted-segment syntax: `includeIf."gitdir:~/work/".path`. Quoting
+  is required when the subsection contains `.` `[` `]` `"` or
+  whitespace.
+- **Case-sensitive matching (diverges from git).** git itself
+  treats section / subsection / key names case-insensitively, but
+  dot-sync's path syntax is case-sensitive across all backends, and
+  forcing gitconfig into the same model catches typos in
+  `.sync.yaml`. If the path's section / subsection / key bytes
+  don't exactly match what's in the file, `get` returns absent and
+  `set` bails with a `case-mismatches existing section` error
+  pointing at the offender. Use the case from your file (the `add`
+  picker emits canonical case automatically).
+- **No array selectors.** gitconfig has no arrays of objects, so
+  `arr[name="x"]` / `arr[name]` are rejected. The closest construct
+  — multivar (multiple `remote.origin.fetch =` lines under one
+  section) — is treated as data corruption for surgical sync. Any
+  attempt to sync a path that resolves to a multivar key bails with
+  a clear error; the interactive `add` picker hides multivar keys
+  outright.
+- **Boolean polysemy.** git accepts `true` / `yes` / `on` / `1` as
+  the same logical value, but dot-sync compares string contents
+  byte-for-byte. Whatever literal is in the source file is what
+  gets written to the target. If the two sides write the same
+  boolean differently (`true` vs `yes`), they won't compare equal
+  and dot-sync will treat them as a conflict.
+- **Section name validation.** Section / key names must match
+  git's grammar (alphanumeric + dash, leading alphabetic for keys);
+  `gix-config` rejects e.g. `new_section` (underscore) at write
+  time.
+- **Mixed indentation, end-of-line comments.** Tab-indented and
+  space-indented sections coexist and round-trip byte-identically.
+  Trailing `;` and `#` comments on a value line are preserved on
+  read (`get` returns the value alone) and on write (the comment
+  stays put after a `set`).
+- **Backslash-continued multi-line values are rejected.** git
+  allows ending a value line with `\` to continue on the next, but
+  `gix-config` 0.56 parses these incorrectly and would mangle the
+  file on the first write. dot-sync detects the marker bytes at
+  load time and refuses the file rather than silently corrupt it
+  — inline the value or remove the continuation. This guard
+  drops out once gitoxide ships a fix.
+- **Cosmetic quirk on insert.** When a new key lands inside an
+  existing section, `gix-config` places the line at the very end of
+  the section's body — after any trailing blank line. The data is
+  semantically correct (the key still belongs to that section), but
+  the resulting file looks slightly strange:
+
+  ```
+  [alias]
+  \tco = checkout
+
+  \tst = status        # new line — note the blank above
+  [remote "origin"]
+  ```
+
+  Manually moving the new line up past the blank is fine; the file
+  parses identically.
+
 ## Commands
 
 ```sh
@@ -190,7 +275,7 @@ dot-sync add codex \
 ```
 
 Format is inferred from the source / target extension when `--format`
-is omitted (`.toml` / `.json` / `.jsonc`). Append fields to an existing
+is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig`). Append fields to an existing
 target with just `--field`:
 
 ```sh

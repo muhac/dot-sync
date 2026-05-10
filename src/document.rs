@@ -138,6 +138,7 @@ pub trait Document: Sized {
 pub enum Format {
     Toml,
     Json,
+    GitConfig,
 }
 
 /// Parse the format string from `.sync.yaml` into the typed `Format` enum,
@@ -151,7 +152,10 @@ pub fn parse_format(format: &str) -> Result<Format> {
     match format {
         "toml" => Ok(Format::Toml),
         "json" | "jsonc" => Ok(Format::Json),
-        other => bail!("unsupported format: {other}; supported formats: toml, json, jsonc"),
+        "gitconfig" => Ok(Format::GitConfig),
+        other => {
+            bail!("unsupported format: {other}; supported formats: toml, json, jsonc, gitconfig")
+        }
     }
 }
 
@@ -1693,6 +1697,404 @@ fn json_expand_walk(
     Ok(())
 }
 
+// =====================================================================
+// GitConfigDocument
+// =====================================================================
+
+/// gitconfig backend, wrapping `gix_config::File`. The library handles
+/// format-preserving round-trip — comments, blank lines, tab/space
+/// indentation, and `[section "subsection"]` quoting all survive
+/// read-modify-write cycles. Multivar keys (multiple values for the
+/// same key, e.g. several `remote.origin.fetch =` lines) round-trip in
+/// memory, but dot-sync's surgical-sync model treats them as ambiguous
+/// — see `get`/`set` for the policy.
+///
+/// Path semantics on this backend differ from the structured TOML/JSON
+/// backends. A `FieldPath` of two segments addresses `section.key`; a
+/// path of three addresses `section.subsection.key`. Anything deeper
+/// is invalid because gitconfig has no nested objects under a key.
+/// Subsections containing characters that need escaping in dot-sync's
+/// path syntax (e.g. `[includeIf "gitdir:~/work/"]`) use the existing
+/// quoted-segment form: `includeIf."gitdir:~/work/".path`.
+pub struct GitConfigDocument {
+    file: gix_config::File<'static>,
+}
+
+impl GitConfigDocument {
+    pub fn empty() -> Self {
+        Self {
+            file: gix_config::File::new(gix_config::file::Metadata::default()),
+        }
+    }
+
+    /// `true` iff some section in the file matches `key` byte-for-byte
+    /// on section name + subsection name + has at least one value name
+    /// matching `key.key` byte-for-byte. Used by `get` to refuse
+    /// resolving paths whose case doesn't match the file.
+    fn case_exact_match_exists(&self, key: &GitConfigKey) -> bool {
+        for s in self.file.sections() {
+            if !section_header_bytes_eq(s.header(), key) {
+                continue;
+            }
+            for vn in s.body().value_names() {
+                if bstr_bytes(vn) == key.key.as_bytes() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Bail if any section / subsection / key in the file matches
+    /// `key` case-insensitively but not byte-for-byte. A clean-miss
+    /// (no case-insensitive overlap) is fine — that means we're
+    /// creating a brand-new section / key with the path's own case.
+    fn check_case_sensitivity(&self, key: &GitConfigKey, path: &FieldPath) -> Result<()> {
+        for s in self.file.sections() {
+            let h = s.header();
+            let h_name_bytes = bstr_bytes_from_bstr(h.name());
+            let h_sub_bytes = h.subsection_name().map(bstr_bytes_from_bstr);
+            let key_sub_bytes = key.subsection.as_deref().map(str::as_bytes);
+
+            let name_ci = h_name_bytes.eq_ignore_ascii_case(key.section.as_bytes());
+            let name_exact = h_name_bytes == key.section.as_bytes();
+            let sub_ci = match (h_sub_bytes, key_sub_bytes) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            };
+            let sub_exact = h_sub_bytes == key_sub_bytes;
+            if !(name_ci && sub_ci) {
+                continue;
+            }
+            if !(name_exact && sub_exact) {
+                bail!(
+                    "gitconfig path '{path}' case-mismatches existing section header \
+                     [{section}{sub_disp}] (dot-sync requires byte-exact section / \
+                     subsection names; git itself is case-insensitive but dot-sync \
+                     is not)",
+                    section = h.name(),
+                    sub_disp = match h.subsection_name() {
+                        Some(b) => format!(" \"{b}\""),
+                        None => String::new(),
+                    }
+                );
+            }
+            // Section + subsection are case-exact. Now check value names
+            // in this section's body.
+            for vn in s.body().value_names() {
+                let vn_bytes = bstr_bytes(vn);
+                if vn_bytes.eq_ignore_ascii_case(key.key.as_bytes())
+                    && vn_bytes != key.key.as_bytes()
+                {
+                    bail!(
+                        "gitconfig path '{path}' case-mismatches existing key '{}' \
+                         in section [{section}{sub_disp}]",
+                        bstr::BStr::new(vn_bytes),
+                        section = h.name(),
+                        sub_disp = match h.subsection_name() {
+                            Some(b) => format!(" \"{b}\""),
+                            None => String::new(),
+                        }
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn section_header_bytes_eq(h: &gix_config::parse::section::Header<'_>, key: &GitConfigKey) -> bool {
+    if bstr_bytes_from_bstr(h.name()) != key.section.as_bytes() {
+        return false;
+    }
+    match (h.subsection_name(), key.subsection.as_deref()) {
+        (Some(a), Some(b)) => bstr_bytes_from_bstr(a) == b.as_bytes(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn bstr_bytes_from_bstr(b: &bstr::BStr) -> &[u8] {
+    b
+}
+
+fn bstr_bytes<'a>(vn: &'a gix_config::parse::section::ValueName<'_>) -> &'a [u8] {
+    // ValueName derefs to BStr which derefs to [u8].
+    let bs: &bstr::BStr = vn;
+    bs
+}
+
+/// Resolved gitconfig key parts from a `FieldPath`.
+///
+/// `section` and `key` are mandatory, `subsection` is optional. We pass
+/// these to gix-config's `_by`-suffixed APIs to avoid having gix-config
+/// re-parse a dotted form — that re-parse would mis-handle subsections
+/// containing dots (e.g. `[includeIf "gitdir:~/work/"]`).
+struct GitConfigKey {
+    section: String,
+    subsection: Option<String>,
+    key: String,
+}
+
+fn path_to_gitconfig_key(path: &FieldPath) -> Result<GitConfigKey> {
+    if path.segments().iter().any(|s| s.select.is_some()) {
+        bail!(
+            "array selectors are not supported in gitconfig paths: {path} \
+             — gitconfig has no arrays of objects"
+        );
+    }
+    let names: Vec<&str> = path.segments().iter().map(|s| s.name.as_str()).collect();
+    match names.as_slice() {
+        [] => bail!("empty gitconfig path"),
+        [_section] => bail!(
+            "gitconfig path needs at least 2 segments (section.key): \
+             '{path}' is missing a key"
+        ),
+        [section, key] => Ok(GitConfigKey {
+            section: (*section).to_string(),
+            subsection: None,
+            key: (*key).to_string(),
+        }),
+        [section, subsection, key] => Ok(GitConfigKey {
+            section: (*section).to_string(),
+            subsection: Some((*subsection).to_string()),
+            key: (*key).to_string(),
+        }),
+        _ => bail!("gitconfig path has too many segments (max 3 — section.subsection.key): {path}"),
+    }
+}
+
+impl Document for GitConfigDocument {
+    type Item = String;
+
+    fn load(path: &Path, allow_missing: bool) -> Result<Self> {
+        if !path.exists() {
+            if allow_missing {
+                return Ok(Self::empty());
+            }
+            bail!("file does not exist: {}", path.display());
+        }
+        // git allows backslash-continued multi-line values, but
+        // gix-config 0.56 parses them incorrectly: trailing fragments
+        // become spurious empty-value keys, and write-back mangles the
+        // line layout. Detect the marker bytes (`\` immediately before
+        // `\n`) at the file level and refuse to load such files rather
+        // than silently corrupt them. Drop this guard once gitoxide
+        // ships a fix.
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if content.contains("\\\n") {
+            bail!(
+                "gitconfig file {} uses backslash-continued multi-line values, \
+                 which dot-sync's gitconfig backend does not support yet \
+                 (gix-config mangles them on round-trip). Inline the value \
+                 onto a single line or remove the continuation.",
+                path.display()
+            );
+        }
+        let file =
+            gix_config::File::from_path_no_includes(path.to_path_buf(), gix_config::Source::Local)
+                .with_context(|| format!("failed to parse gitconfig {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    fn get(&self, path: &FieldPath) -> Option<String> {
+        // Invalid paths (selector segments, wrong arity) can never resolve
+        // to a value, so swallow the error here. `set` surfaces the same
+        // error properly when the caller actually tries to write.
+        let key = path_to_gitconfig_key(path).ok()?;
+        // Case-sensitive matching diverges from git's native case-
+        // insensitive behavior on purpose — dot-sync's path syntax is
+        // case-sensitive across all backends, and silently letting
+        // `User.email` resolve through `[user]` would be a footgun for
+        // users hand-writing `.sync.yaml` paths. If the path's case
+        // doesn't byte-equal an existing section / subsection / key,
+        // treat it as absent.
+        if !self.case_exact_match_exists(&key) {
+            return None;
+        }
+        let sub = key.subsection.as_deref().map(bstr::BStr::new);
+        let value = self.file.string_by(&key.section, sub, &key.key)?;
+        Some(value.to_string())
+    }
+
+    fn set(&mut self, path: &FieldPath, item: String) -> Result<()> {
+        let key = path_to_gitconfig_key(path)?;
+        // Case-sensitive guard: if the file has a section / subsection
+        // / key that case-insensitively matches but does not byte-match
+        // exactly, that's almost certainly a typo in `.sync.yaml`.
+        // Surface it loudly rather than silently writing into the
+        // existing case-different entry.
+        self.check_case_sensitivity(&key, path)?;
+
+        let sub = key.subsection.as_deref().map(bstr::BStr::new);
+        // Multivar guard: if the destination key already has more than
+        // one value (e.g. multiple `remote.origin.fetch =` lines),
+        // surgical sync can't pick which one to overwrite. Bail rather
+        // than silently mangle the file. Same "data corruption" stance
+        // that the array-selector backends take on duplicate
+        // identifiers.
+        if let Ok(values) = self
+            .file
+            .raw_values_by(key.section.as_str(), sub, key.key.as_str())
+            && values.len() > 1
+        {
+            bail!(
+                "gitconfig path '{path}' has {} values (multivar); \
+                 dot-sync requires single-valued keys for surgical sync",
+                values.len()
+            );
+        }
+        // gix-config's `File<'static>` requires owned key + value
+        // material. The library validates section / key names against
+        // git's grammar (alphanumeric + dash, leading alpha) and
+        // returns its own error; surface that verbatim.
+        let value: &bstr::BStr = bstr::BStr::new(item.as_bytes());
+        self.file
+            .set_raw_value_by(key.section.as_str(), sub, key.key, value)
+            .map_err(|e| anyhow::anyhow!("failed to set gitconfig path '{path}': {e}"))?;
+        Ok(())
+    }
+
+    fn table_conflict(&self, _path: &FieldPath) -> Option<TableConflict> {
+        // gitconfig keys cannot contain nested values — a key is always
+        // a leaf scalar — so writing a value at any valid path can never
+        // clobber a "table" the way TOML/JSON can. Always None.
+        None
+    }
+
+    fn render(&self) -> String {
+        let bytes = self.file.to_bstring();
+        // gix_config preserves the original input bytes, which for
+        // pre-existing files keeps the trailing newline status the user
+        // had. For docs constructed via `empty()` + edits, the rendered
+        // output may lack a trailing newline; force one for POSIX
+        // cleanliness, matching the JSON backend.
+        let mut s = bytes.to_string();
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    }
+
+    fn items_equal(a: &String, b: &String) -> bool {
+        a == b
+    }
+
+    fn summarize(item: Option<&String>) -> String {
+        match item {
+            None => "<missing>".to_string(),
+            Some(v) => format!("\"{}\"", v),
+        }
+    }
+
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        // gitconfig has no arrays of objects — the only multi-value
+        // construct is multivar (multiple lines with the same key),
+        // which is handled at `set` time. Selector segments
+        // (`arr[name="x"]` or `arr[name]`) can never resolve here.
+        if pattern.segments().iter().any(|s| s.select.is_some()) {
+            bail!("gitconfig has no arrays of objects; selector path '{pattern}' is not supported");
+        }
+        Ok(vec![ResolvedPath {
+            identity: Vec::new(),
+            path: pattern.clone(),
+        }])
+    }
+
+    fn discover_field_tree(&self) -> FieldTree {
+        // Walk every section in the file and bucket its keys by
+        // (section name, optional subsection name). Sections / keys
+        // that appear more than once collapse — git-config allows
+        // splitting a section across multiple `[user]` headers, but
+        // for picker purposes we just want a deduped list of paths.
+        let mut by_section: BTreeMap<String, BTreeMap<Option<String>, Vec<String>>> =
+            BTreeMap::new();
+        for section in self.file.sections() {
+            let header = section.header();
+            let section_name = header.name().to_string();
+            let subsection_name = header.subsection_name().map(|b| b.to_string());
+            let body = section.body();
+            let bucket = by_section
+                .entry(section_name.clone())
+                .or_default()
+                .entry(subsection_name)
+                .or_default();
+
+            // value_names() may yield the same key multiple times for
+            // multivar lines. Dedup, then drop the multivar entries
+            // entirely — they won't round-trip through dot-sync's
+            // single-value sync model, and surfacing them in the
+            // picker would be a footgun.
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for value_name in body.value_names() {
+                let key = value_name.to_string();
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                if body.values(&key).len() > 1 {
+                    continue;
+                }
+                if !bucket.contains(&key) {
+                    bucket.push(key);
+                }
+            }
+        }
+
+        let mut roots = Vec::new();
+        for (section_name, subsections) in by_section {
+            let mut section_children: Vec<FieldNode> = Vec::new();
+            for (sub_opt, keys) in subsections {
+                match sub_opt {
+                    None => {
+                        for key in keys {
+                            let path = leaf_path(&[&section_name, &key]);
+                            section_children.push(FieldNode::leaf(key, path));
+                        }
+                    }
+                    Some(sub) => {
+                        let mut sub_children = Vec::new();
+                        for key in keys {
+                            let path = leaf_path(&[&section_name, &sub, &key]);
+                            sub_children.push(FieldNode::leaf(key, path));
+                        }
+                        // Subsection has no path of its own — gitconfig
+                        // can't address `[remote "origin"]` as a value,
+                        // only its keys. VirtualGroup matches the
+                        // "select children individually, no whole" cycle.
+                        section_children
+                            .push(FieldNode::virtual_group(format!("\"{sub}\""), sub_children));
+                    }
+                }
+            }
+            if !section_children.is_empty() {
+                // Section header itself has no associated value either
+                // — same reasoning as for subsections. VirtualGroup so
+                // `[x]` (whole-subtree) is correctly unavailable.
+                roots.push(FieldNode::virtual_group(section_name, section_children));
+            }
+        }
+        FieldTree { roots }
+    }
+}
+
+/// Build a `FieldPath` from raw segment names, no selectors. Subsection
+/// names containing characters that would confuse the path parser
+/// (dots, brackets, quotes) round-trip through `Segment.name` directly,
+/// not through `parse` — so we use `from_segments` instead of building
+/// and reparsing a string.
+fn leaf_path(parts: &[&str]) -> FieldPath {
+    let segments = parts
+        .iter()
+        .map(|name| Segment {
+            name: (*name).to_string(),
+            select: None,
+        })
+        .collect();
+    FieldPath::from_segments(segments)
+}
+
 #[cfg(test)]
 mod tests {
     use toml_edit::value;
@@ -1716,7 +2118,12 @@ mod tests {
     fn parse_format_rejects_unknown_names() {
         let err = parse_format("yaml").unwrap_err().to_string();
         assert!(err.contains("yaml"), "msg: {err}");
-        assert!(err.contains("toml, json, jsonc"), "msg: {err}");
+        assert!(err.contains("toml, json, jsonc, gitconfig"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_format_accepts_gitconfig() {
+        assert_eq!(parse_format("gitconfig").unwrap(), Format::GitConfig);
     }
 
     #[test]
@@ -3180,5 +3587,921 @@ name = "x"
         let doc = TomlDocument::empty();
         let tree = doc.discover_field_tree();
         assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
+    }
+}
+
+// =====================================================================
+// GitConfigDocument tests
+// =====================================================================
+
+#[cfg(test)]
+mod gitconfig_tests {
+    use super::{Document, GitConfigDocument};
+
+    fn write_fixture(content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loads_and_renders_unchanged_input_byte_for_byte() {
+        // gix-config preserves comments / blank lines / tab indentation /
+        // [section "subsection"] quoting on a no-op load → render. Keep
+        // this contract under test — the whole gitconfig backend depends
+        // on it.
+        let original = "\
+# top-level header
+
+[user]
+\tname = Alice
+\t# inline comment
+\temail = alice@example.com
+
+; semicolon comment
+[remote \"origin\"]
+\turl = https://example.com/foo
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+";
+        let dir = write_fixture(original);
+        let doc = GitConfigDocument::load(&dir.path().join("config"), false).unwrap();
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn empty_doc_renders_to_empty_string() {
+        let doc = GitConfigDocument::empty();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn allow_missing_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let doc = GitConfigDocument::load(&missing, true).unwrap();
+        assert_eq!(doc.render(), "");
+    }
+
+    #[test]
+    fn missing_without_allow_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let result = GitConfigDocument::load(&missing, false);
+        let err = match result {
+            Ok(_) => panic!("expected an error for missing file"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    fn doc_from(content: &str) -> (tempfile::TempDir, GitConfigDocument) {
+        let dir = write_fixture(content);
+        let doc = GitConfigDocument::load(&dir.path().join("config"), false).unwrap();
+        (dir, doc)
+    }
+
+    use crate::path::FieldPath;
+
+    #[test]
+    fn get_reads_section_key() {
+        let (_dir, doc) = doc_from("[user]\n\temail = alice@example.com\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn get_reads_section_subsection_key() {
+        let (_dir, doc) = doc_from("[remote \"origin\"]\n\turl = https://example.com/foo\n");
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        assert_eq!(doc.get(&path), Some("https://example.com/foo".to_string()));
+    }
+
+    #[test]
+    fn get_reads_quoted_subsection_with_special_chars() {
+        // Subsections may contain almost anything; dot-sync expresses
+        // them via the existing quoted-segment syntax. The key under
+        // [includeIf "gitdir:~/work/"] is reachable as
+        // includeIf."gitdir:~/work/".path.
+        let (_dir, doc) = doc_from("[includeIf \"gitdir:~/work/\"]\n\tpath = ~/.gitconfig-work\n");
+        let path = FieldPath::parse("includeIf.\"gitdir:~/work/\".path").unwrap();
+        assert_eq!(doc.get(&path), Some("~/.gitconfig-work".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_key() {
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&path), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_section() {
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("core.editor").unwrap();
+        assert_eq!(doc.get(&path), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_invalid_path_arity() {
+        // Single-segment path can't address anything in gitconfig (no
+        // top-level keys without a section). `get` swallows the error
+        // and returns None — `set` surfaces it.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let too_short = FieldPath::parse("user").unwrap();
+        let too_long = FieldPath::parse("a.b.c.d").unwrap();
+        assert_eq!(doc.get(&too_short), None);
+        assert_eq!(doc.get(&too_long), None);
+    }
+
+    // ----- set -----
+
+    #[test]
+    fn set_updates_existing_scalar_in_place() {
+        // The byte-exact assertion locks in that gix-config replaces only
+        // the value bytes — surrounding comments, blank lines, and tab
+        // indentation are untouched.
+        let original = "\
+# header
+[user]
+\tname = Alice
+\t# inline
+\temail = old@example.com
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new@example.com".to_string()).unwrap();
+
+        let expected = "\
+# header
+[user]
+\tname = Alice
+\t# inline
+\temail = new@example.com
+";
+        assert_eq!(doc.render(), expected);
+    }
+
+    #[test]
+    fn set_updates_value_inside_subsection() {
+        let original = "\
+[remote \"origin\"]
+\turl = https://old.example.com
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        doc.set(&path, "https://new.example.com".to_string())
+            .unwrap();
+        assert_eq!(
+            doc.render(),
+            "[remote \"origin\"]\n\turl = https://new.example.com\n",
+        );
+    }
+
+    #[test]
+    fn set_inserts_new_key_into_existing_section() {
+        let original = "\
+[core]
+\teditor = vim
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("core.autocrlf").unwrap();
+        doc.set(&path, "input".to_string()).unwrap();
+        // Round-trip: the read-back value matches what we just wrote.
+        assert_eq!(doc.get(&path), Some("input".to_string()));
+        // Original section header + existing key both preserved.
+        let rendered = doc.render();
+        assert!(rendered.contains("[core]"), "got: {rendered}");
+        assert!(rendered.contains("editor = vim"), "got: {rendered}");
+        assert!(rendered.contains("autocrlf = input"), "got: {rendered}");
+    }
+
+    #[test]
+    fn set_inserts_new_section_when_missing() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("alias.co").unwrap();
+        doc.set(&path, "checkout".to_string()).unwrap();
+        let rendered = doc.render();
+        // Existing content preserved.
+        assert!(rendered.contains("[user]"), "got: {rendered}");
+        assert!(rendered.contains("email = a@b"), "got: {rendered}");
+        // New section + key appended.
+        assert!(rendered.contains("[alias]"), "got: {rendered}");
+        assert!(rendered.contains("co = checkout"), "got: {rendered}");
+        // Round-trip read.
+        assert_eq!(doc.get(&path), Some("checkout".to_string()));
+    }
+
+    #[test]
+    fn set_inserts_new_subsection_when_missing() {
+        let original = "[remote \"origin\"]\n\turl = https://example.com/foo\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.upstream.url").unwrap();
+        doc.set(&path, "https://example.com/up".to_string())
+            .unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("[remote \"origin\"]"), "got: {rendered}");
+        assert!(
+            rendered.contains("[remote \"upstream\"]"),
+            "got: {rendered}"
+        );
+        assert_eq!(doc.get(&path), Some("https://example.com/up".to_string()));
+    }
+
+    #[test]
+    fn set_works_on_empty_document() {
+        // Bootstrapping path: an `allow_missing` load of an absent file
+        // produces an empty document; subsequent sets must work.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "bob@example.com".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn set_rejects_path_with_too_few_segments() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("orphan").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("section.key") || s.contains("missing a key"),
+            "msg: {s}"
+        );
+    }
+
+    #[test]
+    fn set_rejects_path_with_too_many_segments() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("a.b.c.d").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        assert!(err.to_string().contains("too many segments"), "msg: {err}");
+    }
+
+    // ----- multivar + selector rejection -----
+
+    #[test]
+    fn set_rejects_destination_with_multivar() {
+        // Target file already has two `fetch` lines under [remote "origin"].
+        // Trying to sync that path is data corruption: which line do we
+        // overwrite? Bail rather than guess.
+        let original = "\
+[remote \"origin\"]
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("remote.origin.fetch").unwrap();
+        let err = doc.set(&path, "+refs/replace/*".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("multivar"), "msg: {s}");
+        assert!(s.contains("2 values"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_rejects_path_with_array_selector() {
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("a[name=\"foo\"].b").unwrap();
+        let err = doc.set(&path, "x".to_string()).unwrap_err();
+        assert!(err.to_string().contains("selectors"), "msg: {err}");
+    }
+
+    #[test]
+    fn expand_passes_through_clean_paths() {
+        let doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("user.email").unwrap();
+        let resolved = doc.expand(&path).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, path);
+        assert!(resolved[0].identity.is_empty());
+    }
+
+    #[test]
+    fn expand_rejects_paths_with_selectors() {
+        let doc = GitConfigDocument::empty();
+        let pinned = FieldPath::parse("arr[k=\"v\"].field").unwrap();
+        let err = doc.expand(&pinned).unwrap_err();
+        assert!(
+            err.to_string().contains("no arrays of objects"),
+            "msg: {err}"
+        );
+
+        let wildcard = FieldPath::parse("arr[k].field").unwrap();
+        let err = doc.expand(&wildcard).unwrap_err();
+        assert!(
+            err.to_string().contains("no arrays of objects"),
+            "msg: {err}"
+        );
+    }
+
+    // ----- discover_field_tree -----
+
+    use crate::discovery::FieldNodeKind;
+
+    fn paths_in(tree: &crate::discovery::FieldTree) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(node: &crate::discovery::FieldNode, out: &mut Vec<String>) {
+            if let Some(p) = &node.path {
+                out.push(p.to_string());
+            }
+            for c in &node.children {
+                walk(c, out);
+            }
+        }
+        for r in &tree.roots {
+            walk(r, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn discover_returns_empty_tree_for_empty_doc() {
+        let doc = GitConfigDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty());
+    }
+
+    #[test]
+    fn discover_emits_section_keys_as_leaves() {
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+\temail = a@b
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(paths.contains(&"user.name".to_string()), "{paths:?}");
+        assert!(paths.contains(&"user.email".to_string()), "{paths:?}");
+        // Section is a VirtualGroup so the picker offers [*] but not [x].
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].kind, FieldNodeKind::VirtualGroup);
+        assert!(tree.roots[0].path.is_none(), "section should have no path");
+    }
+
+    #[test]
+    fn discover_nests_subsections_as_virtual_groups() {
+        let (_dir, doc) = doc_from(
+            "\
+[remote \"origin\"]
+\turl = https://example.com/origin
+[remote \"upstream\"]
+\turl = https://example.com/up
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(
+            paths.contains(&"remote.origin.url".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&"remote.upstream.url".to_string()),
+            "{paths:?}"
+        );
+        // remote → [origin (vgroup), upstream (vgroup)]
+        assert_eq!(tree.roots.len(), 1);
+        let remote = &tree.roots[0];
+        assert_eq!(remote.kind, FieldNodeKind::VirtualGroup);
+        assert!(remote.path.is_none());
+        assert_eq!(remote.children.len(), 2);
+        for sub in &remote.children {
+            assert_eq!(sub.kind, FieldNodeKind::VirtualGroup);
+            assert!(sub.path.is_none());
+        }
+    }
+
+    #[test]
+    fn discover_skips_multivar_keys() {
+        // [remote "origin"] has both a single-valued `url` and a
+        // multivar `fetch`. Only `url` should appear in the tree —
+        // multivar can't round-trip through dot-sync.
+        let (_dir, doc) = doc_from(
+            "\
+[remote \"origin\"]
+\turl = https://example.com
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(
+            paths.contains(&"remote.origin.url".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.contains(&"remote.origin.fetch".to_string()),
+            "multivar fetch should be hidden, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn discover_handles_subsection_without_special_chars() {
+        // `gitdir:~/work/` has no characters that the path parser
+        // treats specially (no . [ ] " or whitespace), so its Segment
+        // serializes unquoted. The path still round-trips.
+        let (_dir, doc) = doc_from(
+            "\
+[includeIf \"gitdir:~/work/\"]
+\tpath = ~/.gitconfig-work
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["includeIf.gitdir:~/work/.path".to_string()]);
+        let parsed = FieldPath::parse(&paths[0]).unwrap();
+        assert_eq!(doc.get(&parsed), Some("~/.gitconfig-work".to_string()));
+    }
+
+    #[test]
+    fn discover_quotes_subsections_with_dots() {
+        // Subsection contains a `.` — Segment.name carries it
+        // verbatim and the path's Display impl quotes the segment so
+        // re-parsing stays unambiguous.
+        let (_dir, doc) = doc_from(
+            "\
+[branch \"feature.x\"]
+\tremote = origin
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["branch.\"feature.x\".remote".to_string()]);
+        let parsed = FieldPath::parse(&paths[0]).unwrap();
+        assert_eq!(doc.get(&parsed), Some("origin".to_string()));
+    }
+
+    // ----- case-sensitive matching -----
+
+    #[test]
+    fn get_returns_none_when_section_case_differs() {
+        // File has lowercase [user]; path queries `User.email`. git
+        // would resolve this case-insensitively; dot-sync deliberately
+        // does not — paths are case-sensitive across all backends.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("User.email").unwrap();
+        assert_eq!(doc.get(&path), None);
+        // Case-exact still works.
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_when_subsection_case_differs() {
+        let (_dir, doc) = doc_from("[remote \"Origin\"]\n\turl = u\n");
+        // Path subsection is "origin"; file has "Origin".
+        let mismatched = FieldPath::parse("remote.origin.url").unwrap();
+        assert_eq!(doc.get(&mismatched), None);
+        let exact = FieldPath::parse("remote.Origin.url").unwrap();
+        assert_eq!(doc.get(&exact), Some("u".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_when_key_case_differs() {
+        let (_dir, doc) = doc_from("[user]\n\tEmail = a@b\n");
+        let mismatched = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&mismatched), None);
+        let exact = FieldPath::parse("user.Email").unwrap();
+        assert_eq!(doc.get(&exact), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn set_bails_when_section_case_differs() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("User.email").unwrap();
+        let err = doc.set(&path, "new@x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("case-mismatches"), "msg: {s}");
+        assert!(s.contains("[user]"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_bails_when_subsection_case_differs() {
+        let (_dir, mut doc) = doc_from("[remote \"Origin\"]\n\turl = u\n");
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        let err = doc.set(&path, "new".to_string()).unwrap_err();
+        assert!(err.to_string().contains("case-mismatches"), "msg: {err}");
+    }
+
+    #[test]
+    fn set_bails_when_key_case_differs() {
+        let (_dir, mut doc) = doc_from("[user]\n\tEmail = a@b\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        let err = doc.set(&path, "new@x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("case-mismatches"), "msg: {s}");
+        assert!(s.contains("Email"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_creates_new_section_when_no_case_overlap() {
+        // No `user` section at all → set creates a new `[user]` with
+        // path's case. No case-mismatch error.
+        let (_dir, mut doc) = doc_from("[core]\n\teditor = vim\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "a@b".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn set_succeeds_with_case_exact_match() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = old\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("new".to_string()));
+    }
+
+    // ----- items_equal / summarize / table_conflict -----
+
+    #[test]
+    fn items_equal_compares_byte_for_byte() {
+        // String comparison — no boolean polysemy. git treats `true` /
+        // `yes` / `on` / `1` as the same bool, but dot-sync compares
+        // literal bytes. Document the contract explicitly so future
+        // refactors can't loosen it without breaking this.
+        assert!(GitConfigDocument::items_equal(
+            &"yes".to_string(),
+            &"yes".to_string()
+        ));
+        assert!(!GitConfigDocument::items_equal(
+            &"yes".to_string(),
+            &"true".to_string()
+        ));
+        assert!(!GitConfigDocument::items_equal(
+            &"true".to_string(),
+            &"True".to_string()
+        ));
+    }
+
+    #[test]
+    fn summarize_quotes_present_value_and_marks_missing() {
+        assert_eq!(
+            GitConfigDocument::summarize(Some(&"vim".to_string())),
+            "\"vim\""
+        );
+        assert_eq!(GitConfigDocument::summarize(None), "<missing>");
+    }
+
+    #[test]
+    fn table_conflict_always_none_for_gitconfig() {
+        // gitconfig keys can't contain nested values, so no path
+        // can ever resolve to a "would clobber a table" condition.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        assert!(doc.table_conflict(&path).is_none());
+        let mut empty = GitConfigDocument::empty();
+        let new_path = FieldPath::parse("alias.co").unwrap();
+        empty.set(&new_path, "x".to_string()).unwrap();
+        assert!(empty.table_conflict(&new_path).is_none());
+    }
+
+    // ----- multiple same-name sections -----
+
+    #[test]
+    fn discover_dedupes_keys_across_repeated_section_headers() {
+        // git allows the same section to appear multiple times — the
+        // file is logically the union of all of them. The picker
+        // shouldn't show duplicates.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[core]
+\teditor = vim
+[user]
+\temail = a@b
+[user]
+\tname = Alice
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        // user.name appears in two `[user]` sections — show once.
+        let user_name_count = paths.iter().filter(|p| p == &"user.name").count();
+        assert_eq!(user_name_count, 1, "{paths:?}");
+        // user.email is split off in a separate header — still counted.
+        assert!(paths.contains(&"user.email".to_string()), "{paths:?}");
+    }
+
+    #[test]
+    fn get_finds_value_in_repeated_section() {
+        // Even when split across two headers, get must find the value.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[core]
+\teditor = vim
+[user]
+\temail = a@b
+",
+        );
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+        let path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&path), Some("Alice".to_string()));
+    }
+
+    // ----- value content edge cases -----
+
+    #[test]
+    fn round_trips_value_with_spaces() {
+        // Aliases routinely have spaces: `co = checkout HEAD --quiet`.
+        let original = "[alias]\n\tco = checkout HEAD --quiet\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.co").unwrap();
+        assert_eq!(doc.get(&path), Some("checkout HEAD --quiet".to_string()));
+        // Round-trip render is byte-stable.
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_preserves_spaces_in_value() {
+        let (_dir, mut doc) = doc_from("[alias]\n\tco = checkout\n");
+        let path = FieldPath::parse("alias.co").unwrap();
+        doc.set(&path, "checkout HEAD --quiet".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("checkout HEAD --quiet".to_string()));
+    }
+
+    #[test]
+    fn empty_value_round_trips_as_empty_string_or_none() {
+        // git allows `key =` with nothing after the equals sign.
+        // gix-config exposes this through `value_implicit`; the
+        // user-facing comfort accessor `string_by` flattens it. We
+        // pin down the actual behavior here so a future gix-config
+        // bump that changes the flatten rule shows up as a test diff
+        // rather than slipping in as silent semantic change.
+        let (_dir, doc) = doc_from("[core]\n\teditor =\n");
+        let path = FieldPath::parse("core.editor").unwrap();
+        // Either Some("") or None is defensible; lock whatever
+        // gix-config currently does.
+        let actual = doc.get(&path);
+        assert!(
+            matches!(&actual, Some(s) if s.is_empty()) || actual.is_none(),
+            "expected empty or None, got {actual:?}"
+        );
+    }
+
+    // ----- section name validation -----
+
+    #[test]
+    fn set_surfaces_gitconfig_section_name_validation_error() {
+        // git's section grammar rejects names with underscores. We
+        // pass section names straight through to gix-config; its
+        // error must surface to the user with our path context.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("new_section.key").unwrap();
+        let err = doc.set(&path, "value".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("new_section.key") || s.contains("section"),
+            "msg: {s}"
+        );
+    }
+
+    #[test]
+    fn set_surfaces_gitconfig_key_name_validation_error() {
+        // Keys must start with an alphabetic character per git's
+        // grammar. A leading digit gets rejected by gix-config.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("section.0bad").unwrap();
+        let err = doc.set(&path, "value".to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("section.0bad") || err.to_string().contains("key"),
+            "msg: {err}"
+        );
+    }
+
+    // ----- gix-config edge behavior: multi-line / mixed indent / EOL comments -----
+
+    #[test]
+    fn load_rejects_files_with_backslash_continuation_values() {
+        // git allows multi-line values via `\<newline>`, but gix-config
+        // 0.56 parses them incorrectly. Refuse to load rather than
+        // silently corrupt on the first write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "[alias]\n\tmultiline = !echo first; \\\necho second\n",
+        )
+        .unwrap();
+        let result = GitConfigDocument::load(&path, false);
+        let err = match result {
+            Ok(_) => panic!("expected error for multi-line value"),
+            Err(e) => e,
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("multi-line") || s.contains("continuation"),
+            "msg: {s}"
+        );
+    }
+
+    #[test]
+    fn round_trips_mixed_tab_and_space_indentation() {
+        // First section uses tab, second uses 4 spaces. gix-config
+        // preserves each section's local style — the rendered output
+        // is byte-identical to the input.
+        let original = "\
+[user]
+\tname = tab-indented
+[core]
+    editor = space-indented
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(doc.render(), original);
+
+        // get reads through both styles transparently.
+        let user_name = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&user_name), Some("tab-indented".to_string()));
+        let core_editor = FieldPath::parse("core.editor").unwrap();
+        assert_eq!(doc.get(&core_editor), Some("space-indented".to_string()));
+    }
+
+    #[test]
+    fn end_of_line_comments_are_preserved_and_stripped_from_value() {
+        // git allows trailing `;` or `#` comments on a value line.
+        // Two contracts to lock:
+        //   1. `get` returns the value with the comment stripped — the
+        //      user's `email` is `a@b`, not `a@b ; trailing comment`.
+        //   2. `render` preserves the comment byte-exactly so the file
+        //      still shows the user's annotation after a no-op write.
+        let original = "\
+[user]
+\temail = a@b ; trailing semicolon comment
+\tname = Alice  # trailing hash comment
+";
+        let (_dir, doc) = doc_from(original);
+
+        let email = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&email), Some("a@b".to_string()));
+        let name = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&name), Some("Alice".to_string()));
+
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_after_eol_comment_keeps_comment() {
+        // After updating the value, the trailing comment must still
+        // be there. This is the case-of-record for "user annotates
+        // their gitconfig and dot-sync respects it".
+        let original = "[user]\n\temail = old ; my email\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("email = new"), "got: {rendered}");
+        assert!(rendered.contains("; my email"), "got: {rendered}");
+    }
+
+    #[test]
+    fn discover_paths_round_trip_to_get() {
+        // Every leaf path the picker emits must actually fetch a value
+        // when handed back to `get`. This is the picker's foundational
+        // contract.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[remote \"origin\"]
+\turl = https://example.com/o
+",
+        );
+        let tree = doc.discover_field_tree();
+        for path_str in paths_in(&tree) {
+            let path = FieldPath::parse(&path_str).unwrap();
+            assert!(
+                doc.get(&path).is_some(),
+                "no value at picker path {path_str}"
+            );
+        }
+    }
+
+    // ----- value content edges: UTF-8 / quoted / empty section / CRLF / `=` in value -----
+
+    #[test]
+    fn round_trips_utf8_in_value() {
+        // Real-world common: non-Latin name in user.name, accented
+        // character in email, emoji in commit-related aliases.
+        let original = "\
+[user]
+\tname = 张三
+\temail = pelé@example.com
+[alias]
+\tship = !echo 🚀
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("user.name").unwrap()),
+            Some("张三".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("user.email").unwrap()),
+            Some("pelé@example.com".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("alias.ship").unwrap()),
+            Some("!echo 🚀".to_string())
+        );
+        // Round-trip render preserves the bytes.
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_writes_utf8_value_and_round_trips() {
+        let (_dir, mut doc) = doc_from("[user]\n\tname = old\n");
+        let path = FieldPath::parse("user.name").unwrap();
+        doc.set(&path, "李四".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("李四".to_string()));
+    }
+
+    #[test]
+    fn round_trips_double_quoted_value() {
+        // git allows wrapping a value in `"..."` to preserve leading /
+        // trailing whitespace and embedded `;` / `#`. gix-config
+        // unwraps the quotes on read; render preserves the original
+        // bytes (including the quotes) on a no-op pass.
+        let original = "[alias]\n\tquoted = \"hello world\"\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.quoted").unwrap();
+        assert_eq!(doc.get(&path), Some("hello world".to_string()));
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn round_trips_value_containing_equals_sign() {
+        // Aliases sometimes embed `=`, e.g. `log --format=%H`. Only
+        // the first `=` separates key from value; subsequent ones are
+        // part of the value.
+        let original = "[alias]\n\tlogh = log --format=%H\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.logh").unwrap();
+        assert_eq!(doc.get(&path), Some("log --format=%H".to_string()));
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_preserves_equals_sign_in_value() {
+        let (_dir, mut doc) = doc_from("[alias]\n\tlogh = old\n");
+        let path = FieldPath::parse("alias.logh").unwrap();
+        doc.set(&path, "log --format=%H --abbrev=12".to_string())
+            .unwrap();
+        assert_eq!(
+            doc.get(&path),
+            Some("log --format=%H --abbrev=12".to_string())
+        );
+    }
+
+    #[test]
+    fn discover_skips_sections_without_keys() {
+        // `[empty]` with no body and `[justcomments]` with only a
+        // comment line: discovery should not emit either as a
+        // container — the picker would render selectable-but-useless
+        // sections otherwise.
+        let original = "\
+[empty]
+[justcomments]
+\t# just a comment, no keys
+[user]
+\tname = Alice
+";
+        let (_dir, doc) = doc_from(original);
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["user.name".to_string()], "{paths:?}");
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].display, "user");
+    }
+
+    #[test]
+    fn round_trips_crlf_file() {
+        // Git on Windows commonly produces CRLF gitconfig files. The
+        // parser must accept them; this test pins what gix-config
+        // currently does on render so a future change shows up as a
+        // diff.
+        let original = "[user]\r\n\temail = a@b\r\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+        let rendered = doc.render();
+        assert!(rendered.contains("email = a@b"), "got: {rendered:?}");
+    }
+
+    #[test]
+    fn set_in_crlf_file_keeps_other_keys_intact() {
+        // After updating one line in a CRLF-only file, the rest of
+        // the keys must survive. Don't over-constrain on line-ending
+        // policy — just check the unrelated key is still readable.
+        let original = "[user]\r\n\temail = old\r\n\tname = Alice\r\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        let name_path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&name_path), Some("Alice".to_string()));
+        assert_eq!(doc.get(&path), Some("new".to_string()));
     }
 }

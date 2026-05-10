@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::AddArgs;
 use crate::discovery::FieldTree;
-use crate::document::{Document, Format, JsonDocument, TomlDocument, parse_format};
+use crate::document::{
+    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+};
 use crate::path::FieldPath;
 use crate::picker::{self, PickerOutcome};
 
@@ -189,6 +191,7 @@ fn infer_format_from_path(p: &str) -> Option<&'static str> {
         "toml" => Some("toml"),
         "json" => Some("json"),
         "jsonc" => Some("jsonc"),
+        "gitconfig" => Some("gitconfig"),
         _ => None,
     }
 }
@@ -245,6 +248,10 @@ fn build_tree(fmt: Format, source: &Path, target: &Path) -> Result<FieldTree> {
             let doc = JsonDocument::load(chosen, false)?;
             Ok(doc.discover_field_tree())
         }
+        Format::GitConfig => {
+            let doc = GitConfigDocument::load(chosen, false)?;
+            Ok(doc.discover_field_tree())
+        }
     }
 }
 
@@ -298,6 +305,7 @@ mod tests {
         assert_eq!(infer_format_from_path("a.toml"), Some("toml"));
         assert_eq!(infer_format_from_path("a.json"), Some("json"));
         assert_eq!(infer_format_from_path("a.jsonc"), Some("jsonc"));
+        assert_eq!(infer_format_from_path("a.gitconfig"), Some("gitconfig"));
         assert_eq!(infer_format_from_path("a.yaml"), None);
         assert_eq!(infer_format_from_path("noext"), None);
     }

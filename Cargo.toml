@@ -13,11 +13,18 @@ path = "src/bin/ds.rs"
 
 [dependencies]
 anyhow = "1"
+bstr = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.2"
 dirs = "6"
+gix-config = "0.56"
+# Direct dep on gix-hash with `sha1` so the empty-`Kind` enum in
+# gix-hash 0.25.0 (gated behind sha1/sha256 features) gets a variant
+# under rustc ≥ 1.94's stricter exhaustivity check. gix-config does
+# not enable these features through its own feature graph.
+gix-hash = { version = "0.25", features = ["sha1"] }
 jsonc-parser = { version = "0.32.4", features = ["cst", "serde_json", "preserve_order"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }

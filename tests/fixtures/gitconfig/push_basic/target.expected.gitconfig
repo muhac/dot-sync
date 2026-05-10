@@ -1,0 +1,17 @@
+# local: do not sync user.email or signingkey
+
+[user]
+	name = Local User
+	email = local@example.com
+
+[core]
+	editor = nvim
+	excludesfile = ~/.gitignore_global
+
+[alias]
+	co = checkout
+
+	st = status
+[remote "origin"]
+	url = https://github.com/example/synced
+	fetch = +refs/heads/*:refs/remotes/origin/*

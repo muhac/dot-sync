@@ -1,0 +1,10 @@
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - alias.co
+      - alias.st
+      - core.editor
+      - remote.origin.url

@@ -2146,3 +2146,898 @@ fn each_subcommand_help_shows_examples_block() {
         );
     }
 }
+
+// =====================================================================
+// gitconfig backend
+// =====================================================================
+
+#[test]
+fn gitconfig_push_updates_synced_keys_and_preserves_unmanaged_lines() {
+    // Pulls in target.gitconfig that has user.email + excludesfile +
+    // a multivar fetch line. None of those are in the sync list, so
+    // they must round-trip untouched. Synced keys (alias.co, alias.st,
+    // core.editor, remote.origin.url) all change.
+    let fixture = Fixture::load("gitconfig", "push_basic");
+
+    fixture
+        .command()
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: alias.co"))
+        .stdout(predicate::str::contains("added target: alias.st"))
+        .stdout(predicate::str::contains("changed target: core.editor"))
+        .stdout(predicate::str::contains(
+            "changed target: remote.origin.url",
+        ));
+
+    fixture.assert_file_eq("target.gitconfig", "target.expected.gitconfig");
+}
+
+#[test]
+fn gitconfig_pull_updates_source_and_leaves_target_alone() {
+    let fixture = Fixture::load("gitconfig", "pull_basic");
+    let target_before = fixture.read("target.gitconfig");
+
+    fixture
+        .command()
+        .args(["pull", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: alias.co"))
+        .stdout(predicate::str::contains("changed source: core.editor"))
+        .stdout(predicate::str::contains(
+            "changed source: remote.origin.url",
+        ));
+
+    fixture.assert_file_eq("source.gitconfig", "source.expected.gitconfig");
+    assert_eq!(fixture.read("target.gitconfig"), target_before);
+}
+
+#[test]
+fn gitconfig_sync_target_wins_writes_source_only() {
+    // target.alias.co wins over source's; source.alias.st is missing
+    // and fills from target; target.core.editor wins on conflict.
+    // Target file stays untouched (default --target-wins, source side
+    // is the only one that changes).
+    let fixture = Fixture::load("gitconfig", "sync_target_wins");
+    let target_before = fixture.read("target.gitconfig");
+
+    fixture
+        .command()
+        .args(["sync", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: alias.co"))
+        .stdout(predicate::str::contains("added source: alias.st"))
+        .stdout(predicate::str::contains("changed source: core.editor"));
+
+    fixture.assert_file_eq("source.gitconfig", "source.expected.gitconfig");
+    assert_eq!(fixture.read("target.gitconfig"), target_before);
+}
+
+#[test]
+fn gitconfig_push_bails_when_target_has_multivar_at_synced_path() {
+    // Target has two `remote.origin.fetch =` lines. The user puts
+    // that path in `.sync.yaml`, which dot-sync treats as data
+    // corruption — bail rather than overwrite one of the two lines.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - remote.origin.fetch
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[remote \"origin\"]\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "\
+[remote \"origin\"]
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multivar"))
+        .stderr(predicate::str::contains("remote.origin.fetch"));
+}
+
+#[test]
+fn gitconfig_add_infers_format_from_extension() {
+    // `dot-sync add` with --source / --target ending in `.gitconfig`
+    // and no --format flag picks `gitconfig`.
+    let dir = TempDir::new().unwrap();
+    // Source must exist for non-interactive add (format check / path
+    // resolution doesn't read it, but other checks do — keep the
+    // fixture honest).
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("source: source.gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("target: target.gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("user.email"), "yaml: {yaml}");
+}
+
+#[test]
+fn gitconfig_sync_source_wins_overwrites_target_value() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["sync", "gitsync", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: core.editor"))
+        .stdout(predicate::str::contains("source: \"nvim\""))
+        .stdout(predicate::str::contains("target: \"vim\""));
+
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("editor = nvim"), "target: {target}");
+}
+
+#[test]
+fn gitconfig_sync_fail_on_conflict_aborts_writes() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    let source = "[core]\n\teditor = nvim\n";
+    let target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("source.gitconfig"), source);
+    write_file(&dir.path().join("target.gitconfig"), target);
+
+    dot_sync_in(dir.path())
+        .args(["sync", "gitsync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: core.editor"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // Neither file should have been touched.
+    assert_eq!(read_file(&dir.path().join("source.gitconfig")), source);
+    assert_eq!(read_file(&dir.path().join("target.gitconfig")), target);
+}
+
+#[test]
+fn gitconfig_status_lists_target_with_format_label() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+      - alias.co
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config:"))
+        .stdout(predicate::str::contains("gitsync"))
+        .stdout(predicate::str::contains("gitconfig"))
+        .stdout(predicate::str::contains("fields=2"));
+}
+
+#[test]
+fn gitconfig_push_dry_run_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    let source = "[core]\n\teditor = nvim\n";
+    let target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("source.gitconfig"), source);
+    write_file(&dir.path().join("target.gitconfig"), target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("would change target: core.editor"))
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote target").not());
+
+    // Both files unchanged.
+    assert_eq!(read_file(&dir.path().join("source.gitconfig")), source);
+    assert_eq!(read_file(&dir.path().join("target.gitconfig")), target);
+}
+
+#[test]
+fn gitconfig_push_backup_creates_persistent_timestamped_copy() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    let original_target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("target.gitconfig"), original_target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync", "--backup"])
+        .assert()
+        .success();
+
+    let backups = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "expected exactly one .bak.* file");
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
+fn gitconfig_restore_rolls_back_to_pre_push_snapshot() {
+    // restore is backend-agnostic — it just copies a recovery
+    // snapshot (or persistent .bak.*) over the destination atomically.
+    // This e2e verifies the dispatch reaches gitconfig targets without
+    // the format-specific Document trait getting in the way.
+    let dir = TempDir::new().unwrap();
+    let snap = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    let original_target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("target.gitconfig"), original_target);
+
+    // Push produces a recovery snapshot of the original "vim".
+    let mut push = dot_sync_in(dir.path());
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:"));
+    let post_push = read_file(&dir.path().join("target.gitconfig"));
+    assert!(post_push.contains("editor = nvim"), "got: {post_push}");
+
+    // Restore newest → rolls target back to the pre-push contents.
+    let mut restore = dot_sync_in(dir.path());
+    override_temp_dir(&mut restore, snap.path());
+    restore
+        .args(["restore", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"));
+    assert_eq!(
+        read_file(&dir.path().join("target.gitconfig")),
+        original_target
+    );
+}
+
+#[test]
+fn gitconfig_add_accepts_multiple_field_flags() {
+    // Plain happy path: `add` with several --field flags writes them
+    // all into the target's sync list. Locks the multi-field path
+    // for the gitconfig backend specifically.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n[core]\n\teditor = vim\n[alias]\n\tco = checkout\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+            "--field",
+            "core.editor",
+            "--field",
+            "alias.co",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: gitconfig"), "yaml: {yaml}");
+    for field in ["user.email", "core.editor", "alias.co"] {
+        assert!(yaml.contains(field), "missing {field} in yaml: {yaml}");
+    }
+}
+
+#[test]
+fn gitconfig_add_dry_run_prints_yaml_without_writing() {
+    // `add --dry-run` previews the would-be `.sync.yaml` to stdout
+    // and leaves the filesystem untouched. Already covered for
+    // toml/json elsewhere; pin it for gitconfig too.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("format: gitconfig"))
+        .stdout(predicate::str::contains("user.email"));
+
+    // `add` always bootstraps an empty `.sync.yaml` if missing — even
+    // on dry-run — but the new target / field must not be persisted.
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(
+        !yaml.contains("gitsync"),
+        "dry-run leaked the target into .sync.yaml: {yaml}"
+    );
+    assert!(
+        !yaml.contains("user.email"),
+        "dry-run leaked the field into .sync.yaml: {yaml}"
+    );
+}
+
+#[test]
+fn gitconfig_add_then_push_uses_inferred_format() {
+    // End-to-end: bootstrap a fresh `.sync.yaml` via add (format
+    // inferred from extension), then run push and confirm it actually
+    // reaches the gitconfig backend rather than tripping over an
+    // unsupported format.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[alias]\n\tco = checkout\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[alias]\n\tco = co-old\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "alias.co",
+        ])
+        .assert()
+        .success();
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: alias.co"));
+
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("co = checkout"), "target: {target}");
+}
+
+// =====================================================================
+// gitconfig backend — high-confidence coverage gaps
+// =====================================================================
+
+#[test]
+fn gitconfig_includes_are_opaque_pull_does_not_see_included_keys() {
+    // gitconfig has `[include] path = sub` directives that git itself
+    // follows when reading. dot-sync deliberately uses
+    // `from_path_no_includes` so it operates on exactly the file the
+    // user named — `target` is the byte-shaped resource being synced,
+    // not the merged include graph. Lock that contract: a key that
+    // only exists in an `included` sub-file must look absent to
+    // dot-sync, not silently fill from the include.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - alias.co
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[alias]\n\tco = checkout\n",
+    );
+    // Target itself has no [alias] block — it includes a sibling.
+    let included_path = dir.path().join("sub.gitconfig");
+    write_file(&included_path, "[alias]\n\tco = checkout-via-include\n");
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        &format!(
+            "[include]\n\tpath = {}\n",
+            // gitconfig values use forward slashes as path separators
+            // regardless of OS — git itself only accepts `/` here. On
+            // Windows, `Path::display()` emits `\`, which gix-config's
+            // value parser then chokes on (`\U`-style escape ambiguity).
+            included_path.display().to_string().replace('\\', "/")
+        ),
+    );
+    let original_sub = read_file(&included_path);
+
+    // A pull (target → source) sees the target file's alias.co as
+    // *absent* (the include is not followed). Per add-or-update
+    // semantics with no value on the "from" side, nothing happens
+    // on source — and the included sub-file must not be touched.
+    dot_sync_in(dir.path())
+        .args(["pull", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No changes."));
+
+    // The included file is byte-identical — dot-sync never reached it.
+    assert_eq!(read_file(&included_path), original_sub);
+}
+
+#[test]
+fn gitconfig_push_into_target_with_include_directive_does_not_touch_includee() {
+    // Symmetric to the previous test: pushing alias.co writes into
+    // the *named* target file, never into the file referenced by an
+    // [include] directive inside it.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - alias.co
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[alias]\n\tco = checkout-from-source\n",
+    );
+    let included_path = dir.path().join("sub.gitconfig");
+    write_file(&included_path, "[alias]\n\tco = original-included-value\n");
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        &format!(
+            "[include]\n\tpath = {}\n",
+            // gitconfig values use forward slashes as path separators
+            // regardless of OS — git itself only accepts `/` here. On
+            // Windows, `Path::display()` emits `\`, which gix-config's
+            // value parser then chokes on (`\U`-style escape ambiguity).
+            included_path.display().to_string().replace('\\', "/")
+        ),
+    );
+    let original_sub = read_file(&included_path);
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: alias.co"));
+
+    // Included file untouched.
+    assert_eq!(read_file(&included_path), original_sub);
+    // Target gained the new section directly — `[include]` is preserved.
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("[include]"), "target: {target}");
+    assert!(
+        target.contains("co = checkout-from-source"),
+        "target: {target}"
+    );
+}
+
+// ----- file permissions preservation (Unix only) -----
+
+#[cfg(unix)]
+#[test]
+fn gitconfig_push_preserves_target_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    let target_path = dir.path().join("target.gitconfig");
+    write_file(&target_path, "[core]\n\teditor = vim\n");
+    // 600 = owner read/write, no group/other access. The mode commonly
+    // applied to ~/.gitconfig when a credential helper is configured.
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success();
+
+    let mode_after = fs::metadata(&target_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode_after, 0o600,
+        "atomic write must preserve mode 600 across rename"
+    );
+}
+
+// ----- symlink target handling -----
+
+#[cfg(unix)]
+#[test]
+fn gitconfig_push_through_symlinked_target_writes_to_real_file() {
+    // Stow / chezmoi pattern: `~/.gitconfig` is a symlink into a
+    // dotfiles repo. dot-sync resolves the symlink before its
+    // atomic tmp+rename so writes land in the real file and the
+    // symlink survives. Without that resolution, the rename would
+    // replace the link itself — silently breaking the dotfiles
+    // organization.
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let real_path = dir.path().join("real.gitconfig");
+    let symlink_path = dir.path().join("target.gitconfig");
+    write_file(&real_path, "[core]\n\teditor = vim\n");
+    symlink(&real_path, &symlink_path).unwrap();
+
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success();
+
+    // Symlink survives.
+    let meta = fs::symlink_metadata(&symlink_path).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "atomic write must preserve the symlink, not replace it with a regular file"
+    );
+    // The real file got the update; reading through the symlink also
+    // sees it.
+    let real_after = read_file(&real_path);
+    assert!(real_after.contains("editor = nvim"), "got: {real_after}");
+    assert_eq!(read_file(&symlink_path), real_after);
+}
+
+// ----- bootstrap missing target / source -----
+
+#[test]
+fn gitconfig_push_creates_target_when_missing() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    // No target.gitconfig in the working dir.
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: core.editor"));
+
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("editor = nvim"), "got: {target}");
+}
+
+#[test]
+fn gitconfig_pull_creates_source_when_missing() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+    // No source.gitconfig.
+
+    dot_sync_in(dir.path())
+        .args(["pull", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added source: core.editor"));
+
+    let source = read_file(&dir.path().join("source.gitconfig"));
+    assert!(source.contains("editor = vim"), "got: {source}");
+}
+
+// ----- kitchen-sink real-shape fixture -----
+
+#[test]
+fn gitconfig_push_into_realistic_dotfile_preserves_unmanaged_content() {
+    // A representative ~/.gitconfig: credential helper, signing key,
+    // includeIf for a work directory, multiple remotes (one with
+    // multivar fetch — just to confirm we don't trip over it for
+    // unrelated keys), aliases, merge tool config, color settings.
+    //
+    // Push a small subset (alias.co, alias.st, core.editor) and
+    // assert byte-stability on every unmanaged section. Catches any
+    // accidental whole-file rewrite the simpler fixtures might miss.
+    let dir = TempDir::new().unwrap();
+    let target = "\
+# ~/.gitconfig — kitchen-sink shape
+# (this comment is unmanaged trivia and must survive)
+
+[user]
+\tname = Real User
+\temail = real@example.com
+\tsigningkey = ABC123DEF456
+
+[core]
+\teditor = vim
+\texcludesfile = ~/.gitignore_global
+\tautocrlf = input
+
+[credential]
+\thelper = osxkeychain
+
+[commit]
+\tgpgsign = true
+
+[gpg]
+\tprogram = /usr/bin/gpg
+
+[merge]
+\ttool = vimdiff
+\tconflictstyle = diff3
+
+[mergetool \"vimdiff\"]
+\tcmd = vim -d $LOCAL $MERGED $REMOTE
+
+[diff]
+\ttool = vimdiff
+
+[color]
+\tui = auto
+
+[alias]
+\tco = co-old
+\tlg = log --oneline --graph
+
+[remote \"origin\"]
+\turl = https://github.com/example/repo
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+
+[remote \"upstream\"]
+\turl = https://github.com/upstream/repo
+
+[includeIf \"gitdir:~/work/\"]
+\tpath = ~/.gitconfig-work
+
+[push]
+\tdefault = current
+";
+    write_file(&dir.path().join("target.gitconfig"), target);
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "\
+[alias]
+\tco = checkout
+\tst = status
+[core]
+\teditor = nvim
+",
+    );
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - alias.co
+      - alias.st
+      - core.editor
+",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success();
+
+    let after = read_file(&dir.path().join("target.gitconfig"));
+
+    // Every unmanaged section / line survives verbatim.
+    for needle in [
+        "# ~/.gitconfig — kitchen-sink shape",
+        "signingkey = ABC123DEF456",
+        "excludesfile = ~/.gitignore_global",
+        "autocrlf = input",
+        "helper = osxkeychain",
+        "gpgsign = true",
+        "program = /usr/bin/gpg",
+        "tool = vimdiff",
+        "conflictstyle = diff3",
+        "[mergetool \"vimdiff\"]",
+        "cmd = vim -d $LOCAL $MERGED $REMOTE",
+        "ui = auto",
+        "lg = log --oneline --graph",
+        "[remote \"origin\"]",
+        "url = https://github.com/example/repo",
+        "fetch = +refs/heads/*:refs/remotes/origin/*",
+        "fetch = +refs/tags/*:refs/tags/*",
+        "[remote \"upstream\"]",
+        "url = https://github.com/upstream/repo",
+        "[includeIf \"gitdir:~/work/\"]",
+        "path = ~/.gitconfig-work",
+        "default = current",
+    ] {
+        assert!(after.contains(needle), "missing {needle:?} in:\n{after}");
+    }
+
+    // Managed values updated.
+    assert!(after.contains("co = checkout"), "got:\n{after}");
+    assert!(after.contains("st = status"), "got:\n{after}");
+    assert!(after.contains("editor = nvim"), "got:\n{after}");
+    // Old values gone.
+    assert!(!after.contains("co = co-old"), "got:\n{after}");
+    assert!(!after.contains("editor = vim\n"), "got:\n{after}");
+}

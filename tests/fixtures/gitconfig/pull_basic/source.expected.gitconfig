@@ -1,0 +1,10 @@
+# dot-sync managed fragment
+
+[alias]
+	co = checkout
+
+[core]
+	editor = nvim
+
+[remote "origin"]
+	url = https://github.com/example/new

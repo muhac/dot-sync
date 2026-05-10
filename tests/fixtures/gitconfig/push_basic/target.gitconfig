@@ -1,0 +1,16 @@
+# local: do not sync user.email or signingkey
+
+[user]
+	name = Local User
+	email = local@example.com
+
+[core]
+	editor = vim
+	excludesfile = ~/.gitignore_global
+
+[alias]
+	co = co-old
+
+[remote "origin"]
+	url = https://github.com/example/old-fork
+	fetch = +refs/heads/*:refs/remotes/origin/*
