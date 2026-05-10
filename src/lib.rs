@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod discovery;
 mod document;
+mod generate;
 mod path;
 mod picker;
 mod picker_state;
@@ -23,11 +24,14 @@ use crate::sync::{ConflictMode, Direction, SyncOptions, run as run_sync};
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // `add` is the only command that runs without an existing
-    // `.sync.yaml` — it bootstraps the file when missing. Everything
-    // else loads the config first.
-    if let Command::Add(args) = cli.command {
-        return run_add(args);
+    // Commands that don't need an existing `.sync.yaml`:
+    // - `add` bootstraps the file when missing.
+    // - `completions` / `man` reflect on the static CLI tree only.
+    match cli.command {
+        Command::Add(args) => return run_add(args),
+        Command::Completions { shell } => return generate::completions(shell),
+        Command::Man => return generate::man(),
+        _ => {}
     }
 
     let loaded = DotSyncConfig::load_from_current_dir()?;
@@ -44,7 +48,9 @@ pub fn run() -> Result<()> {
             dispatch_sync(&loaded, Direction::Sync, cmd.common, mode)
         }
         Command::Restore(flags) => dispatch_restore(&loaded, flags),
-        Command::Add(_) => unreachable!("Add handled before config load"),
+        Command::Add(_) | Command::Completions { .. } | Command::Man => {
+            unreachable!("handled before config load")
+        }
     }
 }
 

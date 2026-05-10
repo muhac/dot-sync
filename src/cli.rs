@@ -128,4 +128,17 @@ pub enum Command {
     /// if it doesn't exist. With --field, runs non-interactively;
     /// without --field on a TTY, opens an interactive tree picker.
     Add(#[command(flatten)] AddArgs),
+
+    /// Print a shell completion script for `dot-sync` to stdout.
+    /// Hidden — surfaced via README rather than the main --help.
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the `dot-sync` man page (roff source) to stdout.
+    /// Hidden — surfaced via README rather than the main --help.
+    #[command(hide = true)]
+    Man,
 }
