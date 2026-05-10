@@ -282,6 +282,8 @@ fn apply_one_way(
         .unwrap_or_else(|| summarize_item(into_item.as_ref()));
     into.set(&path.path, from_item)?;
 
+    // Change records always read source-side / target-side from the user's
+    // perspective, regardless of which document we wrote into.
     let (source_value, target_value) = match destination {
         Destination::Source => (into_value, from_value),
         Destination::Target => (from_value, into_value),
