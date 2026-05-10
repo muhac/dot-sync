@@ -572,6 +572,26 @@ project_doc_fallback_filenames = ["AGENTS.md"]
     }
 
     #[test]
+    fn pull_overwrites_source_scalar_when_path_demands_table() {
+        let mut source = toml_from("settings = \"plain\"\n");
+        let target = toml_from("[settings]\ntheme = \"dark\"\n");
+
+        let changes = pull(&mut source, &target, &parsed(&["settings.theme"])).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let change = &changes[0];
+        assert!(matches!(change.action, Action::Change));
+        assert_eq!(change.source_value, "\"plain\"");
+        assert_eq!(change.target_value, "\"dark\"");
+        assert_eq!(
+            source
+                .get(&FieldPath::parse("settings.theme").unwrap())
+                .and_then(|item| item.as_value().and_then(|v| v.as_str().map(String::from))),
+            Some("dark".to_string())
+        );
+    }
+
+    #[test]
     fn push_preserves_unmanaged_target_fields() {
         let source = toml_from("project_doc_max_bytes = 65536\n");
         let mut target = toml_from(
