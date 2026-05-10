@@ -13,25 +13,74 @@ pub struct TableConflict {
     pub value: String,
 }
 
+/// Format-agnostic view of a structured config file that the sync engine
+/// drives. Each impl owns its native value type via the associated `Item`,
+/// so JSON / YAML / TOML do not have to share a lowest-common-denominator
+/// value enum.
+///
+/// Contract for implementers:
+///
+/// - **Surgical writes**: `set` must replace exactly the leaf value at `path`
+///   and leave every sibling field at every level along the path untouched.
+///   This is the core "surgical sync" promise — violating it breaks the whole
+///   product.
+/// - **`get` returns owned values**: callers may continue to consult the
+///   original document after a `set`, so returned `Item`s should be deep
+///   clones, not borrowed references.
+/// - **Format preservation**: `render` should preserve original whitespace,
+///   key order, and (where the format supports it) comments. `toml_edit`
+///   gives this for free; pure `serde_json` / `serde_yaml` do not, so JSON /
+///   YAML impls will need either a format-preserving parser or explicit
+///   accommodations documented at their call sites.
+/// - **Path semantics**: `FieldPath` segments are dotted keys for object
+///   navigation. Array indexing (`a[0]`, `a.*.b`) is **not** supported by the
+///   path syntax today; impls do not need to handle it.
+/// - **Missing vs explicit-null**: TOML has no `null` concept, so `get`
+///   returning `None` unambiguously means "absent". JSON has both an explicit
+///   `null` value and the absence of a key; the JSON impl must decide which
+///   it returns as `Some(Null)` versus `None`, and the sync rules treat the
+///   two cases differently. Document the choice at the impl site.
 pub trait Document: Sized {
-    /// Native value type for this format.
+    /// Native value type for this format. Engine code is generic over `D`,
+    /// so this type stays opaque outside the impl except via `items_equal`
+    /// and `summarize`.
     type Item;
 
+    /// Open the file at `path`. If `allow_missing` is true and the file does
+    /// not exist, return an empty document instead of erroring; the engine
+    /// uses this to bootstrap the absent side of a sync.
     fn load(path: &Path, allow_missing: bool) -> Result<Self>;
+
+    /// Return a deep clone of the value at `path`, or `None` if the path
+    /// resolves to no value.
     fn get(&self, path: &FieldPath) -> Option<Self::Item>;
+
+    /// Write `item` at `path`, creating any missing intermediate containers.
+    /// Sibling fields at every level along `path` must be preserved.
     fn set(&mut self, path: &FieldPath, item: Self::Item) -> Result<()>;
+
+    /// If the prefix of `path` is occupied by a non-table value (so writing
+    /// at `path` would clobber that value), return a `TableConflict`
+    /// describing the offender. Used to warn the user before a destructive
+    /// `set`.
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict>;
+
+    /// Serialize the document to a string for writing back to disk.
+    /// Should preserve the original formatting as faithfully as the
+    /// underlying parser allows.
     fn render(&self) -> String;
 
-    /// Compare two items for "already in sync" purposes. Defined on the trait
-    /// because not every native value type implements `PartialEq` (e.g.
-    /// `toml_edit::Item` doesn't), and what equality means can be
-    /// format-specific.
+    /// Compare two items for "already in sync" purposes. Defined on the
+    /// trait because not every native value type implements `PartialEq`
+    /// (e.g. `toml_edit::Item` doesn't), and equality semantics can be
+    /// format-specific (e.g. `1` vs `1.0`).
     fn items_equal(a: &Self::Item, b: &Self::Item) -> bool;
 
     /// Format-aware short rendering used in change reports. Returns
-    /// `<missing>` when the item is None so callers don't have to special-case
-    /// absent values.
+    /// `<missing>` when the item is `None` so callers do not have to
+    /// special-case absent values. Output should look like a literal in the
+    /// target format (TOML scalars in TOML syntax, JSON scalars in JSON
+    /// syntax) so users reading the report can match it back to the file.
     fn summarize(item: Option<&Self::Item>) -> String;
 }
 
