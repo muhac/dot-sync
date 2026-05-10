@@ -1892,8 +1892,14 @@ enabled = true
         let path = FieldPath::parse("servers[port=8080].host").unwrap();
         doc.set(&path, json!("alpha")).unwrap();
         assert_eq!(doc.get(&path).unwrap(), json!("alpha"));
+        // The seeded pinning key must round-trip as a JSON Number, not a
+        // String. Equality against `json!(8080)` already enforces this
+        // (Value's PartialEq is type-strict), but spell out the type
+        // expectation at the call site for parity with the TOML test.
         let port_path = FieldPath::parse("servers[port=8080].port").unwrap();
-        assert_eq!(doc.get(&port_path).unwrap(), json!(8080));
+        let port = doc.get(&port_path).unwrap();
+        assert_eq!(port.as_i64(), Some(8080), "port should be JSON Number");
+        assert!(port.is_number(), "port should not be stringified: {port:?}");
     }
 
     #[test]
