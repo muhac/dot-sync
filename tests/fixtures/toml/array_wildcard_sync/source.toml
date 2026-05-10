@@ -1,0 +1,7 @@
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "linear"
+enabled = false

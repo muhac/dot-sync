@@ -1,0 +1,7 @@
+[[mcp_servers]]
+name = "linear"
+enabled = true
+
+[[mcp_servers]]
+name = "supabase"
+enabled = true

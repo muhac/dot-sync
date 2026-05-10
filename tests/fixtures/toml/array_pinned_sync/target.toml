@@ -1,0 +1,8 @@
+[[mcp_servers]]
+name = "github"
+enabled = false
+url = "https://api.github.com"
+
+[[mcp_servers]]
+name = "linear"
+enabled = false
