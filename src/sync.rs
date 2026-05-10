@@ -672,8 +672,35 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("invalid write target: {}", resolved.display()))?;
     let tmp = resolved.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
 
+    // Capture the destination's existing Unix mode (if any) so the
+    // atomic rename doesn't silently demote permissions. Without this,
+    // a `~/.gitconfig` set to 0o600 (common when a credential helper is
+    // configured) gets clobbered to umask defaults (typically 0o644)
+    // on every write — a real data-safety regression. New files (no
+    // pre-existing destination) inherit umask defaults, matching
+    // `fs::write` semantics for first-time creation.
+    #[cfg(unix)]
+    let preserve_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(&resolved).ok().map(|m| m.permissions().mode())
+    };
+
     fs::write(&tmp, content)
         .with_context(|| format!("failed to stage write at {}", tmp.display()))?;
+
+    #[cfg(unix)]
+    if let Some(mode) = preserve_mode {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to preserve mode {mode:o} on staged write at {}",
+                    tmp.display()
+                )
+            });
+        }
+    }
 
     // POSIX rename is atomic only on the same filesystem; tmp lives next to
     // the (resolved) destination, so this is safe.
