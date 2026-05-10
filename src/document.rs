@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -343,9 +344,7 @@ fn expand_walk(
             };
             let count = count_pinned_matches(arr, key, value);
             if count > 1 {
-                bail!(
-                    "ambiguous pinned selector at {seg}: {count} items where {key}={value:?}"
-                );
+                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value:?}");
             }
             let Some(matched) = find_pinned_item(arr, key, value) else {
                 return Ok(());
@@ -359,8 +358,7 @@ fn expand_walk(
                 return Ok(());
             };
             // Pre-scan for duplicate identifier values across the array.
-            let mut counts: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             for item_table in iter_array_items(arr) {
                 if let Some(v) = item_table
                     .get(key)
