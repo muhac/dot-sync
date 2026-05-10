@@ -1178,17 +1178,21 @@ fn replace_pinned_target_with_object(
     // `name: "linear"` but the target path is `name="github"`). Without
     // this, the replaced item silently stops matching its own selector,
     // and the next sync pass appends a duplicate entry instead of finding
-    // it. Drop any existing entry under the pin key and prepend the
-    // canonical one.
+    // it.
+    //
+    // Override-in-place if the pin key is already in the payload —
+    // preserving the payload's key order — and append at the end if
+    // missing. The payload's order comes from `serde_json::Map` with
+    // `preserve_order` (an `IndexMap`), so `.iter()` is insertion order.
     let mut props: Vec<(String, CstInputValue)> = map
         .iter()
-        .filter(|(k, _)| k.as_str() != pin_key)
         .map(|(k, v)| (k.clone(), value_to_cst_input(v)))
         .collect();
-    props.insert(
-        0,
-        (pin_key.to_string(), selector_value_to_cst_input(pin_value)),
-    );
+    let pin_input = selector_value_to_cst_input(pin_value);
+    match props.iter().position(|(k, _)| k.as_str() == pin_key) {
+        Some(i) => props[i].1 = pin_input,
+        None => props.push((pin_key.to_string(), pin_input)),
+    }
     let target_clone = target.clone();
     target_clone.replace_with(CstInputValue::Object(props));
     Ok(())
@@ -2135,6 +2139,48 @@ enabled = true
         // And does NOT now match `name="linear"`.
         let linear = FieldPath::parse("mcpServers[name=\"linear\"].enabled").unwrap();
         assert!(doc.get(&linear).is_none());
+    }
+
+    #[test]
+    fn json_pinned_leaf_set_preserves_payload_key_order() {
+        // The pin key in the replacement payload is in the middle. The
+        // override must keep payload order intact (a, name, b), not
+        // reorder name to the front. Locks the in-place override behavior.
+        let mut doc = json_doc(r#"{"servers": [{"name": "github"}]}"#);
+        let path = FieldPath::parse("servers[name=\"github\"]").unwrap();
+        doc.set(&path, json!({ "a": 1, "name": "ignored", "b": 2 }))
+            .unwrap();
+
+        let rendered = doc.render();
+        let a_pos = rendered.find("\"a\"").expect("a present");
+        let name_pos = rendered.find("\"name\"").expect("name present");
+        let b_pos = rendered.find("\"b\"").expect("b present");
+        assert!(
+            a_pos < name_pos && name_pos < b_pos,
+            "expected payload order a < name < b, got: {rendered}"
+        );
+        // Pin key value still canonical despite payload override attempt.
+        let name = FieldPath::parse("servers[name=\"github\"].name").unwrap();
+        assert_eq!(doc.get(&name).unwrap(), json!("github"));
+    }
+
+    #[test]
+    fn json_pinned_leaf_set_appends_pin_key_when_payload_lacks_it() {
+        // Payload has no pin key at all; must append at end so the matched
+        // item still satisfies the selector after the write.
+        let mut doc = json_doc(r#"{"servers": [{"name": "github"}]}"#);
+        let path = FieldPath::parse("servers[name=\"github\"]").unwrap();
+        doc.set(&path, json!({ "host": "api.github.com" })).unwrap();
+
+        let rendered = doc.render();
+        let host_pos = rendered.find("\"host\"").expect("host present");
+        let name_pos = rendered.find("\"name\"").expect("name present");
+        assert!(
+            host_pos < name_pos,
+            "payload's host should come before appended pin key name: {rendered}"
+        );
+        let host = FieldPath::parse("servers[name=\"github\"].host").unwrap();
+        assert_eq!(doc.get(&host).unwrap(), json!("api.github.com"));
     }
 
     #[test]
