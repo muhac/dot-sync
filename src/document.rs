@@ -42,9 +42,14 @@ pub struct ResolvedPath {
 ///   gives this for free; pure `serde_json` / `serde_yaml` do not, so JSON /
 ///   YAML impls will need either a format-preserving parser or explicit
 ///   accommodations documented at their call sites.
-/// - **Path semantics**: `FieldPath` segments are dotted keys for object
-///   navigation. Array indexing (`a[0]`, `a.*.b`) is **not** supported by the
-///   path syntax today; impls do not need to handle it.
+/// - **Path semantics**: `FieldPath` segments are dotted keys, optionally
+///   carrying an `ItemSelector` for array navigation:
+///   `arr[name="github"].field` (pinned) and `arr[name].field` (wildcard).
+///   Pinned selectors resolve to a single deterministic concrete path that
+///   `get`/`set`/`table_conflict` must handle directly. Wildcard selectors
+///   are expanded by `expand` into a fan-out of pinned-form paths *before*
+///   they reach `get`/`set`, so `set` can bail on wildcard segments.
+///   Position-based indexing (`arr[0]`) is intentionally not supported.
 /// - **Missing vs explicit-null**: TOML has no `null` concept, so `get`
 ///   returning `None` unambiguously means "absent". JSON has both an explicit
 ///   `null` value and the absence of a key; the JSON impl must decide which
