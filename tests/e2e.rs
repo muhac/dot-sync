@@ -1093,6 +1093,34 @@ fn jsonc_pull_preserves_source_side_comments() {
 }
 
 #[test]
+fn jsonc_new_key_appended_does_not_strand_neighbor_comment() {
+    // Target has `{"a": 1 // keep existing trailing comment\n}`. Source
+    // adds key `b`. Locks the current jsonc-parser placement: comment
+    // stays attached to `a`, new key is appended without disturbing it.
+    let fixture = Fixture::load("json", "jsonc_new_key_with_neighbor_comment");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: b"));
+    let after = fixture.read("target.jsonc");
+    assert!(
+        after.contains("// keep existing trailing comment"),
+        "comment must survive: {after}"
+    );
+    assert!(after.contains("\"a\": 1"), "a:1 must survive: {after}");
+    assert!(after.contains("\"b\": 2"), "b:2 must be added: {after}");
+    // Comment is on the same line as `a: 1`, before any new key.
+    let comment_pos = after.find("// keep").unwrap();
+    let b_pos = after.find("\"b\"").unwrap();
+    assert!(
+        comment_pos < b_pos,
+        "comment must precede the appended key in source order: {after}"
+    );
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
