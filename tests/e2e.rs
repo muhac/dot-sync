@@ -2286,6 +2286,179 @@ fn gitconfig_add_infers_format_from_extension() {
 }
 
 #[test]
+fn gitconfig_sync_source_wins_overwrites_target_value() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["sync", "gitsync", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: core.editor"))
+        .stdout(predicate::str::contains("source: \"nvim\""))
+        .stdout(predicate::str::contains("target: \"vim\""));
+
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("editor = nvim"), "target: {target}");
+}
+
+#[test]
+fn gitconfig_sync_fail_on_conflict_aborts_writes() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    let source = "[core]\n\teditor = nvim\n";
+    let target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("source.gitconfig"), source);
+    write_file(&dir.path().join("target.gitconfig"), target);
+
+    dot_sync_in(dir.path())
+        .args(["sync", "gitsync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: core.editor"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // Neither file should have been touched.
+    assert_eq!(read_file(&dir.path().join("source.gitconfig")), source);
+    assert_eq!(read_file(&dir.path().join("target.gitconfig")), target);
+}
+
+#[test]
+fn gitconfig_status_lists_target_with_format_label() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+      - alias.co
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[core]\n\teditor = vim\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Config:"))
+        .stdout(predicate::str::contains("gitsync"))
+        .stdout(predicate::str::contains("gitconfig"))
+        .stdout(predicate::str::contains("fields=2"));
+}
+
+#[test]
+fn gitconfig_push_dry_run_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    let source = "[core]\n\teditor = nvim\n";
+    let target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("source.gitconfig"), source);
+    write_file(&dir.path().join("target.gitconfig"), target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("would change target: core.editor"))
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote target").not());
+
+    // Both files unchanged.
+    assert_eq!(read_file(&dir.path().join("source.gitconfig")), source);
+    assert_eq!(read_file(&dir.path().join("target.gitconfig")), target);
+}
+
+#[test]
+fn gitconfig_push_backup_creates_persistent_timestamped_copy() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - core.editor
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[core]\n\teditor = nvim\n",
+    );
+    let original_target = "[core]\n\teditor = vim\n";
+    write_file(&dir.path().join("target.gitconfig"), original_target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync", "--backup"])
+        .assert()
+        .success();
+
+    let backups = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "expected exactly one .bak.* file");
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
 fn gitconfig_add_then_push_uses_inferred_format() {
     // End-to-end: bootstrap a fresh `.sync.yaml` via add (format
     // inferred from extension), then run push and confirm it actually
