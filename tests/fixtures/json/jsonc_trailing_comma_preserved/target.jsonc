@@ -1,0 +1,6 @@
+{
+  "tools": [
+    { "name": "parse", "enabled": false, },
+    { "name": "lint", "enabled": false, },
+  ]
+}

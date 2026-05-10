@@ -1047,3 +1047,47 @@ fn json_push_preserves_unmanaged_target_fields() {
     fixture.command().args(["push", "agent"]).assert().success();
     fixture.assert_file_eq("target.json", "target.expected.json");
 }
+
+#[test]
+fn jsonc_push_preserves_line_comments_around_modified_value() {
+    // Both line comments (top-of-file and same-line) and the surrounding
+    // structure must round-trip while only `feature.enabled` flips.
+    let fixture = Fixture::load("json", "jsonc_comments_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_push_preserves_block_and_inline_comments() {
+    // Multi-line block comment at the top + inline `/* */` after a value.
+    let fixture = Fixture::load("json", "jsonc_block_comment_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: tui.theme"));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}
+
+#[test]
+fn jsonc_push_preserves_trailing_commas() {
+    // Source and target both use trailing commas inside the array. After
+    // a pinned-selector update the trailing-comma style must follow the
+    // existing source-side policy (`uses_trailing_commas()` infers it).
+    let fixture = Fixture::load("json", "jsonc_trailing_comma_preserved");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: tools[name=\"parse\"].enabled",
+        ));
+    fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
+}

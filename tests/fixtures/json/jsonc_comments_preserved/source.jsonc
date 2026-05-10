@@ -1,0 +1,7 @@
+{
+  // user-facing toggle
+  "feature": {
+    "enabled": true,
+    "name": "demo"
+  }
+}
