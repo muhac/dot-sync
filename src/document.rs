@@ -1068,6 +1068,120 @@ enabled = false
     }
 
     #[test]
+    fn expand_wildcard_at_last_segment_yields_whole_items() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "linear"
+enabled = false
+"#
+            .parse()
+            .unwrap(),
+        };
+        let pattern = FieldPath::parse("mcp_servers[name]").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].path.to_string(), "mcp_servers[name=\"github\"]");
+
+        // The resolved path returns the whole item when used with `get`.
+        let item = doc.get(&resolved[0].path).unwrap();
+        let table = item.as_table().expect("table");
+        assert_eq!(table.get("enabled").and_then(|i| i.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn expand_combines_wildcard_then_pinned_segments() {
+        let doc = TomlDocument {
+            doc: r#"
+[[providers]]
+name = "openai"
+
+[[providers.models]]
+id = "gpt-4"
+enabled = true
+
+[[providers.models]]
+id = "gpt-5"
+enabled = false
+
+[[providers]]
+name = "anthropic"
+
+[[providers.models]]
+id = "gpt-4"
+enabled = true
+"#
+            .parse()
+            .unwrap(),
+        };
+        // Wildcard then Pinned: every provider, but only its `gpt-4` model.
+        let pattern = FieldPath::parse("providers[name].models[id=\"gpt-4\"].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec!["anthropic".to_string()]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"anthropic\"].models[id=\"gpt-4\"].enabled"
+        );
+        assert_eq!(resolved[1].identity, vec!["openai".to_string()]);
+    }
+
+    #[test]
+    fn expand_combines_wildcard_then_wildcard_segments() {
+        let doc = TomlDocument {
+            doc: r#"
+[[providers]]
+name = "openai"
+
+[[providers.models]]
+id = "gpt-4"
+enabled = true
+
+[[providers.models]]
+id = "gpt-5"
+enabled = false
+
+[[providers]]
+name = "anthropic"
+
+[[providers.models]]
+id = "opus"
+enabled = true
+"#
+            .parse()
+            .unwrap(),
+        };
+        // Wildcard then Wildcard: identity is a 2-tuple of (provider, model).
+        let pattern = FieldPath::parse("providers[name].models[id].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(
+            resolved[0].identity,
+            vec!["anthropic".to_string(), "opus".to_string()]
+        );
+        assert_eq!(
+            resolved[1].identity,
+            vec!["openai".to_string(), "gpt-4".to_string()]
+        );
+        assert_eq!(
+            resolved[2].identity,
+            vec!["openai".to_string(), "gpt-5".to_string()]
+        );
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"anthropic\"].models[id=\"opus\"].enabled"
+        );
+    }
+
+    #[test]
     fn expand_skips_items_lacking_the_identifier_key() {
         let doc = TomlDocument {
             doc: r#"
