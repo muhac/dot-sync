@@ -253,9 +253,6 @@ fn sync(
     Ok(changes)
 }
 
-/// Copy the value at `path` from `from` into `into`, returning a Change record
-/// describing the write. Returns `None` if `from` has no value at `path` or if
-/// the values already match.
 fn apply_one_way(
     into: &mut dyn Document,
     from: &dyn Document,
