@@ -79,14 +79,6 @@ impl FieldPath {
     pub fn from_segments(segments: Vec<Segment>) -> Self {
         Self { segments }
     }
-
-    /// True if any segment carries a `Wildcard` selector. Used by the engine
-    /// to decide when expansion is needed.
-    pub fn has_wildcard(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|seg| matches!(seg.select, Some(ItemSelector::Wildcard { .. })))
-    }
 }
 
 impl fmt::Display for FieldPath {
@@ -367,12 +359,5 @@ mod tests {
     fn display_quotes_segments_that_need_it() {
         let path = FieldPath::parse("\"a.b\".c").unwrap();
         assert_eq!(path.to_string(), "\"a.b\".c");
-    }
-
-    #[test]
-    fn has_wildcard_detects_wildcard_segments() {
-        assert!(!FieldPath::parse("a.b").unwrap().has_wildcard());
-        assert!(!FieldPath::parse("a[k=\"x\"].b").unwrap().has_wildcard());
-        assert!(FieldPath::parse("a[k].b").unwrap().has_wildcard());
     }
 }

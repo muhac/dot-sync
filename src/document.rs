@@ -91,12 +91,17 @@ pub trait Document: Sized {
     /// format-specific (e.g. `1` vs `1.0`).
     fn items_equal(a: &Self::Item, b: &Self::Item) -> bool;
 
-    /// Resolve a path's wildcard selectors against this document, yielding
-    /// one `ResolvedPath` per matched item combination. For a pattern with no
-    /// wildcards, returns a single result whose path equals the input. The
-    /// engine merges resolved paths from source and target by `identity` to
-    /// pair items across documents.
-    fn expand(&self, pattern: &FieldPath) -> Vec<ResolvedPath>;
+    /// Resolve a path's selectors against this document, yielding one
+    /// `ResolvedPath` per matched item combination. For a pattern with no
+    /// selectors at all, returns a single entry whose path equals the input.
+    ///
+    /// **Multi-match is an error.** A `Pinned` selector matching more than one
+    /// array item, or a `Wildcard` selector encountering two items that share
+    /// the same identifier value, is treated as data corruption — surgical
+    /// sync requires unambiguous identity. The engine surrounds the call with
+    /// per-side context ("source pattern '<raw>'") so the eventual error
+    /// chain points at the exact pattern and the doc that owns the duplicate.
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>>;
 
     /// Format-aware short rendering used in change reports. Returns
     /// `<missing>` when the item is `None` so callers do not have to
@@ -183,12 +188,14 @@ impl Document for TomlDocument {
         }
     }
 
-    fn expand(&self, pattern: &FieldPath) -> Vec<ResolvedPath> {
-        if !pattern.has_wildcard() {
-            return vec![ResolvedPath {
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        // No selectors = no array navigation = no multi-match risk; skip the
+        // doc walk entirely.
+        if pattern.segments().iter().all(|s| s.select.is_none()) {
+            return Ok(vec![ResolvedPath {
                 identity: Vec::new(),
                 path: pattern.clone(),
-            }];
+            }]);
         }
         let mut out = Vec::new();
         expand_walk(
@@ -197,8 +204,8 @@ impl Document for TomlDocument {
             Vec::new(),
             Vec::new(),
             &mut out,
-        );
-        out
+        )?;
+        Ok(out)
     }
 }
 
@@ -288,61 +295,94 @@ fn iter_array_items(arr_item: &Item) -> Vec<&dyn TableLike> {
     }
 }
 
-/// Recursive expand walker. Emits a `ResolvedPath` once all wildcards have
+/// Recursive expand walker. Emits a `ResolvedPath` once all selectors have
 /// been substituted. Branches die when an intermediate container is missing
-/// while a wildcard remains downstream — there's no array to fan out from.
+/// — fill-missing semantics handle that case via the other side's expansion.
+///
+/// Returns `Err` when a `Pinned` selector matches more than one item, or a
+/// `Wildcard` segment finds two items with the same identifier value. See
+/// the `Document::expand` doc for the rationale.
 fn expand_walk(
     table: &dyn TableLike,
     remaining: &[Segment],
     identity: Vec<String>,
     resolved: Vec<Segment>,
     out: &mut Vec<ResolvedPath>,
-) {
-    let no_more_wildcards = remaining
-        .iter()
-        .all(|s| !matches!(s.select, Some(ItemSelector::Wildcard { .. })));
+) -> Result<()> {
+    let no_more_selectors = remaining.iter().all(|s| s.select.is_none());
 
-    if no_more_wildcards {
+    if no_more_selectors {
         let mut full = resolved;
         full.extend(remaining.iter().cloned());
         out.push(ResolvedPath {
             identity,
             path: FieldPath::from_segments(full),
         });
-        return;
+        return Ok(());
     }
 
     let (seg, rest) = remaining
         .split_first()
-        .expect("non-empty: wildcards exist downstream");
+        .expect("non-empty: selectors exist downstream");
 
     match &seg.select {
         None => {
             let Some(item) = table.get(&seg.name) else {
-                return;
+                return Ok(());
             };
             let Some(next) = item.as_table_like() else {
-                return;
+                return Ok(());
             };
             let mut new_resolved = resolved;
             new_resolved.push(seg.clone());
-            expand_walk(next, rest, identity, new_resolved, out);
+            expand_walk(next, rest, identity, new_resolved, out)?;
         }
         Some(ItemSelector::Pinned { key, value }) => {
             let Some(arr) = table.get(&seg.name) else {
-                return;
+                return Ok(());
             };
+            let count = count_pinned_matches(arr, key, value);
+            if count > 1 {
+                bail!(
+                    "ambiguous pinned selector at {}: {count} items where {key}={value:?}",
+                    format_segment_for_prefix(seg)
+                );
+            }
             let Some(matched) = find_pinned_item(arr, key, value) else {
-                return;
+                return Ok(());
             };
             let mut new_resolved = resolved;
             new_resolved.push(seg.clone());
-            expand_walk(matched.as_table_like(), rest, identity, new_resolved, out);
+            expand_walk(matched.as_table_like(), rest, identity, new_resolved, out)?;
         }
         Some(ItemSelector::Wildcard { key }) => {
             let Some(arr) = table.get(&seg.name) else {
-                return;
+                return Ok(());
             };
+            // Pre-scan for duplicate identifier values across the array.
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for item_table in iter_array_items(arr) {
+                if let Some(v) = item_table
+                    .get(key)
+                    .and_then(|i| i.as_value())
+                    .and_then(|v| v.as_str())
+                {
+                    *counts.entry(v.to_string()).or_default() += 1;
+                }
+            }
+            let dups: Vec<String> = counts
+                .iter()
+                .filter(|(_, c)| **c > 1)
+                .map(|(k, c)| format!("{k:?}×{c}"))
+                .collect();
+            if !dups.is_empty() {
+                bail!(
+                    "ambiguous wildcard at {}: duplicate {key} values: {}",
+                    format_segment_for_prefix(seg),
+                    dups.join(", ")
+                );
+            }
             for item_table in iter_array_items(arr) {
                 let Some(value) = item_table
                     .get(key)
@@ -361,9 +401,25 @@ fn expand_walk(
                         value: value.to_string(),
                     }),
                 });
-                expand_walk(item_table, rest, branch_id, branch_resolved, out);
+                expand_walk(item_table, rest, branch_id, branch_resolved, out)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn count_pinned_matches(arr_item: &Item, key: &str, value: &str) -> usize {
+    match arr_item {
+        Item::ArrayOfTables(arr) => arr
+            .iter()
+            .filter(|t| matches_pinned(*t, key, value))
+            .count(),
+        Item::Value(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_inline_table())
+            .filter(|t| matches_pinned(*t, key, value))
+            .count(),
+        _ => 0,
     }
 }
 
@@ -819,7 +875,7 @@ name = "linear"
     fn expand_returns_pattern_unchanged_for_no_wildcard() {
         let doc = TomlDocument::empty();
         let path = FieldPath::parse("tui.theme").unwrap();
-        let resolved = doc.expand(&path);
+        let resolved = doc.expand(&path).unwrap();
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].identity.is_empty());
         assert_eq!(resolved[0].path, path);
@@ -841,7 +897,7 @@ enabled = false
             .unwrap(),
         };
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
-        let mut resolved = doc.expand(&pattern);
+        let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].identity, vec!["github".to_string()]);
@@ -856,7 +912,7 @@ enabled = false
     fn expand_returns_empty_when_array_missing() {
         let doc = TomlDocument::empty();
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
-        let resolved = doc.expand(&pattern);
+        let resolved = doc.expand(&pattern).unwrap();
         assert!(resolved.is_empty());
     }
 
@@ -887,7 +943,7 @@ enabled = true
         };
         // pinned then wildcard: only openai's models, but every model.
         let pattern = FieldPath::parse("providers[name=\"openai\"].models[id].enabled").unwrap();
-        let mut resolved = doc.expand(&pattern);
+        let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].identity, vec!["gpt-4".to_string()]);
@@ -933,6 +989,52 @@ enabled = false
     }
 
     #[test]
+    fn expand_errors_on_pinned_multi_match() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#
+            .parse()
+            .unwrap(),
+        };
+        let pattern = FieldPath::parse("mcp_servers[name=\"github\"].enabled").unwrap();
+        let err = doc.expand(&pattern).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous pinned"), "msg: {msg}");
+        assert!(msg.contains("name=\"github\""), "msg: {msg}");
+        assert!(msg.contains("2 items"), "msg: {msg}");
+    }
+
+    #[test]
+    fn expand_errors_on_wildcard_duplicate_identifier() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#
+            .parse()
+            .unwrap(),
+        };
+        let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        let err = doc.expand(&pattern).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous wildcard"), "msg: {msg}");
+        assert!(msg.contains("\"github\""), "msg: {msg}");
+        assert!(msg.contains("×2"), "msg: {msg}");
+    }
+
+    #[test]
     fn expand_skips_items_lacking_the_identifier_key() {
         let doc = TomlDocument {
             doc: r#"
@@ -947,7 +1049,7 @@ enabled = true
             .unwrap(),
         };
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
-        let resolved = doc.expand(&pattern);
+        let resolved = doc.expand(&pattern).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].identity, vec!["github".to_string()]);
     }

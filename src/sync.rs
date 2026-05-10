@@ -120,7 +120,7 @@ fn target_conflicts<D: Document>(target: &TargetConfig) -> Result<Vec<Conflict>>
     let source = D::load(&target.source, true)?;
     let target_doc = D::load(&target.target, true)?;
     let sync_paths = parse_paths(target)?;
-    Ok(collect_conflicts::<D>(&source, &target_doc, &sync_paths))
+    collect_conflicts::<D>(&source, &target_doc, &sync_paths)
 }
 
 /// Resolve the target's declared format string into the typed `Format` enum
@@ -288,7 +288,7 @@ fn load_document_for_target<D: Document>(
 fn pull<D: Document>(source: &mut D, target: &D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for parsed in paths {
-        for resolved in expanded_paths::<D>(source, target, parsed) {
+        for resolved in expanded_paths::<D>(source, target, parsed)? {
             if let Some(change) =
                 apply_one_way::<D>(source, target, &resolved, Destination::Source)?
             {
@@ -302,7 +302,7 @@ fn pull<D: Document>(source: &mut D, target: &D, paths: &[ParsedPath]) -> Result
 fn push<D: Document>(source: &D, target: &mut D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for parsed in paths {
-        for resolved in expanded_paths::<D>(source, target, parsed) {
+        for resolved in expanded_paths::<D>(source, target, parsed)? {
             if let Some(change) =
                 apply_one_way::<D>(target, source, &resolved, Destination::Target)?
             {
@@ -320,7 +320,7 @@ fn sync<D: Document>(
     mode: ConflictMode,
 ) -> Result<Vec<Change>> {
     if matches!(mode, ConflictMode::FailOnConflict) {
-        let conflicts = collect_conflicts::<D>(source, target, paths);
+        let conflicts = collect_conflicts::<D>(source, target, paths)?;
         if !conflicts.is_empty() {
             print_conflicts(&conflicts);
             bail!("fail-on-conflict: {} conflicting field(s)", conflicts.len());
@@ -329,7 +329,7 @@ fn sync<D: Document>(
 
     let mut changes = Vec::new();
     for parsed in paths {
-        for resolved in expanded_paths::<D>(source, target, parsed) {
+        for resolved in expanded_paths::<D>(source, target, parsed)? {
             let source_item = source.get(&resolved.path);
             let target_item = target.get(&resolved.path);
             match (source_item, target_item) {
@@ -366,37 +366,54 @@ fn sync<D: Document>(
 }
 
 /// Resolve `parsed.path` against both documents and merge by identity. For a
-/// pattern with no wildcards this returns one entry whose `path` equals the
-/// input. For wildcards, it fans out across the union of items present on
+/// pattern with no selectors this returns one entry whose `path` equals the
+/// input. For selectors, it fans out across the union of items present on
 /// either side, giving each resolved entry a `raw` string of its concrete
-/// form (e.g. `mcp_servers[name="github"].enabled`) for use in change reports.
-fn expanded_paths<D: Document>(source: &D, target: &D, parsed: &ParsedPath) -> Vec<ParsedPath> {
-    if !parsed.path.has_wildcard() {
-        return vec![ParsedPath {
+/// form (e.g. `mcp_servers[name="github"].enabled`) for use in change
+/// reports. Bubbles up multi-match errors from `Document::expand` with
+/// per-side context so the resulting chain pinpoints which document holds
+/// the duplicate.
+fn expanded_paths<D: Document>(
+    source: &D,
+    target: &D,
+    parsed: &ParsedPath,
+) -> Result<Vec<ParsedPath>> {
+    if parsed.path.segments().iter().all(|s| s.select.is_none()) {
+        return Ok(vec![ParsedPath {
             raw: parsed.raw.clone(),
             path: parsed.path.clone(),
-        }];
+        }]);
     }
     let mut by_id: BTreeMap<Vec<String>, FieldPath> = BTreeMap::new();
-    for resolved in source.expand(&parsed.path) {
+    let source_resolved = source
+        .expand(&parsed.path)
+        .with_context(|| format!("source pattern '{}'", parsed.raw))?;
+    for resolved in source_resolved {
         by_id.insert(resolved.identity, resolved.path);
     }
-    for resolved in target.expand(&parsed.path) {
+    let target_resolved = target
+        .expand(&parsed.path)
+        .with_context(|| format!("target pattern '{}'", parsed.raw))?;
+    for resolved in target_resolved {
         by_id.entry(resolved.identity).or_insert(resolved.path);
     }
-    by_id
+    Ok(by_id
         .into_values()
         .map(|path| ParsedPath {
             raw: path.to_string(),
             path,
         })
-        .collect()
+        .collect())
 }
 
-fn collect_conflicts<D: Document>(source: &D, target: &D, paths: &[ParsedPath]) -> Vec<Conflict> {
+fn collect_conflicts<D: Document>(
+    source: &D,
+    target: &D,
+    paths: &[ParsedPath],
+) -> Result<Vec<Conflict>> {
     let mut conflicts = Vec::new();
     for parsed in paths {
-        for resolved in expanded_paths::<D>(source, target, parsed) {
+        for resolved in expanded_paths::<D>(source, target, parsed)? {
             let (Some(s), Some(t)) = (source.get(&resolved.path), target.get(&resolved.path))
             else {
                 continue;
@@ -411,7 +428,7 @@ fn collect_conflicts<D: Document>(source: &D, target: &D, paths: &[ParsedPath]) 
             });
         }
     }
-    conflicts
+    Ok(conflicts)
 }
 
 fn print_conflicts(conflicts: &[Conflict]) {

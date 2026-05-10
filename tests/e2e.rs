@@ -829,6 +829,83 @@ fn push_wildcard_array_selector_pairs_items_by_identifier() {
 }
 
 #[test]
+fn pinned_selector_multi_match_errors_with_target_context() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - mcp_servers[name="github"].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.toml"),
+        r#"[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#,
+    );
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to process target codex"))
+        .stderr(predicate::str::contains(
+            "source pattern 'mcp_servers[name=\"github\"].enabled'",
+        ))
+        .stderr(predicate::str::contains("ambiguous pinned"))
+        .stderr(predicate::str::contains("2 items where name=\"github\""));
+
+    // No write happened on either side.
+    assert_eq!(read_file(&dir.path().join("target.toml")), "");
+}
+
+#[test]
+fn wildcard_selector_duplicate_identifier_errors() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - mcp_servers[name].enabled
+"#,
+    );
+    write_file(
+        &dir.path().join("source.toml"),
+        r#"[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "github"
+enabled = false
+"#,
+    );
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous wildcard"))
+        .stderr(predicate::str::contains("\"github\"×2"));
+}
+
+#[test]
 fn config_rejects_unknown_keys() {
     let dir = TempDir::new().unwrap();
     write_file(
