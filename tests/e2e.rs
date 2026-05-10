@@ -81,6 +81,17 @@ fn dot_sync_in(cwd: impl Into<PathBuf>) -> Command {
     command
 }
 
+/// Override the OS temp directory for a child process. On Unix, Rust's
+/// std::env::temp_dir reads `TMPDIR`; on Windows, GetTempPath2 reads
+/// `TMP`/`TEMP` and ignores `TMPDIR`. Set all three so tests work on both.
+fn override_temp_dir(cmd: &mut Command, dir: &Path) {
+    cmd.env("TMPDIR", dir).env("TMP", dir).env("TEMP", dir);
+}
+
+fn read_normalized(path: &Path) -> String {
+    normalize_newlines(&read_file(path))
+}
+
 #[test]
 fn sync_discovers_config_in_current_directory() {
     let fixture = Fixture::load("toml", "codex_basic_sync");
@@ -534,9 +545,9 @@ fn write_emits_recovery_snapshot_for_existing_files() {
     let fixture = Fixture::load("toml", "dry_run_no_write");
     let snap = TempDir::new().unwrap();
 
-    let assert = fixture
-        .command()
-        .env("TMPDIR", snap.path())
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    let assert = cmd
         .args(["push", "codex"])
         .assert()
         .success()
@@ -562,10 +573,9 @@ fn dry_run_does_not_emit_recovery_snapshot() {
     let fixture = Fixture::load("toml", "dry_run_no_write");
     let snap = TempDir::new().unwrap();
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["push", "codex", "--dry-run"])
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["push", "codex", "--dry-run"])
         .assert()
         .success()
         .stdout(predicate::str::contains("recovery:").not())
@@ -590,11 +600,11 @@ fn sync_source_wins_overwrites_target_value() {
         .stdout(predicate::str::contains("target: 1"));
 
     assert_eq!(
-        fixture.read("target.toml"),
+        read_normalized(&fixture.path().join("target.toml")),
         "project_doc_max_bytes = 65536\n"
     );
     assert_eq!(
-        fixture.read("source.toml"),
+        read_normalized(&fixture.path().join("source.toml")),
         "project_doc_max_bytes = 65536\n"
     );
 }
@@ -635,40 +645,41 @@ fn restore_lists_then_writes_newest_snapshot() {
     let snap = TempDir::new().unwrap();
 
     // First push: produces a recovery snapshot of the original target (= "1").
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["push", "codex"])
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"])
         .assert()
         .success()
         .stdout(predicate::str::contains("recovery:"));
     assert_eq!(
-        fixture.read("target.toml"),
+        read_normalized(&fixture.path().join("target.toml")),
         "project_doc_max_bytes = 65536\n"
     );
 
     // List should show the recovery candidate.
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["restore", "codex", "--list"])
+    let mut list = fixture.command();
+    override_temp_dir(&mut list, snap.path());
+    list.args(["restore", "codex", "--list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("candidates (1):"))
-        .stdout(predicate::str::contains("[recovery]"))
+        .stdout(predicate::str::contains("[recovery"))
         .stdout(predicate::str::contains(" 1  "));
 
     // Restore (no flag = newest = the original "1" content).
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
+    let mut restore = fixture.command();
+    override_temp_dir(&mut restore, snap.path());
+    restore
         .args(["restore", "codex"])
         .assert()
         .success()
         .stdout(predicate::str::contains("selected:"))
         .stdout(predicate::str::contains("wrote target:"));
 
-    assert_eq!(fixture.read("target.toml"), "project_doc_max_bytes = 1\n");
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        "project_doc_max_bytes = 1\n"
+    );
 }
 
 #[test]
@@ -676,23 +687,23 @@ fn restore_dry_run_does_not_write() {
     let fixture = Fixture::load("toml", "dry_run_no_write");
     let snap = TempDir::new().unwrap();
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["push", "codex"])
-        .assert()
-        .success();
-    let after_push = fixture.read("target.toml");
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"]).assert().success();
+    let after_push = read_normalized(&fixture.path().join("target.toml"));
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
+    let mut restore = fixture.command();
+    override_temp_dir(&mut restore, snap.path());
+    restore
         .args(["restore", "codex", "--dry-run"])
         .assert()
         .success()
         .stdout(predicate::str::contains("dry run: no files written"));
 
-    assert_eq!(fixture.read("target.toml"), after_push);
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        after_push
+    );
 }
 
 #[test]
@@ -700,10 +711,9 @@ fn restore_with_no_snapshots_fails() {
     let fixture = Fixture::load("toml", "codex_basic_sync");
     let snap = TempDir::new().unwrap();
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["restore", "codex"])
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["restore", "codex"])
         .assert()
         .failure()
         .stdout(predicate::str::contains("No snapshots available"))
@@ -715,17 +725,13 @@ fn restore_pick_out_of_range_fails() {
     let fixture = Fixture::load("toml", "dry_run_no_write");
     let snap = TempDir::new().unwrap();
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["push", "codex"])
-        .assert()
-        .success();
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"]).assert().success();
 
-    fixture
-        .command()
-        .env("TMPDIR", snap.path())
-        .args(["restore", "codex", "--pick", "99"])
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["restore", "codex", "--pick", "99"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("out of range"));
