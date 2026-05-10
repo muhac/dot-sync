@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{Document, TomlDocument, validate_format};
+use crate::document::{Document, Format, TomlDocument, parse_format};
 use crate::path::FieldPath;
 
 #[derive(Debug, Clone, Copy)]
@@ -94,10 +94,9 @@ pub fn run(
 fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
     let mut violators: Vec<(String, Vec<Conflict>)> = Vec::new();
     for target in targets {
-        let conflicts = dispatch_format(target, |t| match t.format.as_str() {
-            "toml" => target_conflicts::<TomlDocument>(t),
-            _ => unreachable!("dispatch_format guards format"),
-        })?;
+        let conflicts = match target_format(target)? {
+            Format::Toml => target_conflicts::<TomlDocument>(target)?,
+        };
         if !conflicts.is_empty() {
             violators.push((target.name.clone(), conflicts));
         }
@@ -123,20 +122,18 @@ fn target_conflicts<D: Document>(target: &TargetConfig) -> Result<Vec<Conflict>>
     Ok(collect_conflicts::<D>(&source, &target_doc, &sync_paths))
 }
 
-/// Validate the target's format and dispatch to a typed pipeline. Centralizes
-/// the format match so each engine entry point doesn't repeat it.
-fn dispatch_format<T>(
-    target: &TargetConfig,
-    typed: impl FnOnce(&TargetConfig) -> Result<T>,
-) -> Result<T> {
-    validate_format(&target.format).map_err(|error| {
+/// Resolve the target's declared format string into the typed `Format` enum
+/// with the standard "target '<name>' uses format '<value>': ..." error
+/// context. Inline `match` at each call site so adding a new format makes
+/// every dispatch site non-exhaustive at compile time.
+fn target_format(target: &TargetConfig) -> Result<Format> {
+    parse_format(&target.format).map_err(|error| {
         anyhow!(
             "target '{}' uses format '{}': {error}",
             target.name,
             target.format
         )
-    })?;
-    typed(target)
+    })
 }
 
 fn select_targets<'a>(
@@ -155,10 +152,9 @@ fn select_targets<'a>(
 }
 
 fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions) -> Result<()> {
-    dispatch_format(target, |t| match t.format.as_str() {
-        "toml" => run_target_typed::<TomlDocument>(t, direction, options),
-        _ => unreachable!("dispatch_format guards format"),
-    })
+    match target_format(target)? {
+        Format::Toml => run_target_typed::<TomlDocument>(target, direction, options),
+    }
 }
 
 fn run_target_typed<D: Document>(

@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{DotSyncConfig, TargetConfig};
-use crate::document::{Document, TomlDocument, validate_format};
+use crate::document::{Document, Format, TomlDocument, parse_format};
 use crate::path::FieldPath;
 
 pub fn run(config: &DotSyncConfig, name: Option<&str>) -> Result<()> {
@@ -103,17 +103,19 @@ fn inspect_target(target: &TargetConfig) -> TargetStatus {
         errors: Vec::new(),
     };
 
-    if let Err(error) = validate_format(&target.format) {
-        status.errors.push(format!(
-            "target '{}' uses format '{}': {error}",
-            target.name, target.format
-        ));
-        return status;
-    }
+    let format = match parse_format(&target.format) {
+        Ok(format) => format,
+        Err(error) => {
+            status.errors.push(format!(
+                "target '{}' uses format '{}': {error}",
+                target.name, target.format
+            ));
+            return status;
+        }
+    };
 
-    match target.format.as_str() {
-        "toml" => inspect_target_typed::<TomlDocument>(target, &mut status),
-        _ => unreachable!("validate_format guards format"),
+    match format {
+        Format::Toml => inspect_target_typed::<TomlDocument>(target, &mut status),
     }
 
     status

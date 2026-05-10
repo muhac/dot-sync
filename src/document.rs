@@ -35,11 +35,19 @@ pub trait Document: Sized {
     fn summarize(item: Option<&Self::Item>) -> String;
 }
 
-/// Validate the format string up front so callers can fail fast before any
-/// file I/O. Returns a list of supported format names in the error message.
-pub fn validate_format(format: &str) -> Result<()> {
+/// Supported document formats. Adding a variant prompts the compiler to
+/// flag every dispatch site as non-exhaustive — that is the whole point.
+/// Do not paper over with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Toml,
+}
+
+/// Parse the format string from `.sync.yaml` into the typed `Format` enum,
+/// failing fast (before any file I/O) with a list of supported format names.
+pub fn parse_format(format: &str) -> Result<Format> {
     match format {
-        "toml" => Ok(()),
+        "toml" => Ok(Format::Toml),
         "json" => bail!("format json is recognized but not implemented yet"),
         other => bail!("unsupported format: {other}; supported formats: toml"),
     }
