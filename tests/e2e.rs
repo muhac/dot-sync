@@ -3041,3 +3041,428 @@ targets:
     assert!(!after.contains("co = co-old"), "got:\n{after}");
     assert!(!after.contains("editor = vim\n"), "got:\n{after}");
 }
+
+// =====================================================================
+// env backend
+// =====================================================================
+
+#[test]
+fn env_push_updates_synced_keys_and_preserves_unmanaged_content() {
+    // The fixture mixes managed (NODE_VERSION, DATABASE_URL, DEBUG) and
+    // unmanaged (OPENAI_API_KEY, GITHUB_TOKEN) entries plus comments
+    // and blank lines. Push must update the three managed keys while
+    // leaving all other bytes intact — that's the whole "surgical
+    // sync for env files" promise.
+    let fixture = Fixture::load("env", "push_basic");
+
+    fixture
+        .command()
+        .args(["push", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: NODE_VERSION"))
+        .stdout(predicate::str::contains("changed target: DATABASE_URL"))
+        .stdout(predicate::str::contains("added target: DEBUG"));
+
+    fixture.assert_file_eq("target.env", "target.expected.env");
+}
+
+#[test]
+fn env_pull_updates_source_and_leaves_target_alone() {
+    let fixture = Fixture::load("env", "pull_basic");
+    let target_before = fixture.read("target.env");
+
+    fixture
+        .command()
+        .args(["pull", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: NODE_VERSION"))
+        .stdout(predicate::str::contains("changed source: DATABASE_URL"));
+
+    fixture.assert_file_eq("source.env", "source.expected.env");
+    assert_eq!(fixture.read("target.env"), target_before);
+}
+
+#[test]
+fn env_sync_target_wins_writes_both_sides() {
+    let fixture = Fixture::load("env", "sync_target_wins");
+
+    fixture
+        .command()
+        .args(["sync", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: NODE_VERSION"))
+        .stdout(predicate::str::contains("changed source: PORT"))
+        .stdout(predicate::str::contains("added target: DEBUG"));
+
+    fixture.assert_file_eq("source.env", "source.expected.env");
+    fixture.assert_file_eq("target.env", "target.expected.env");
+}
+
+#[test]
+fn env_sync_source_wins_overwrites_target() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+",
+    );
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+    write_file(&dir.path().join("target.env"), "NODE_VERSION=20\n");
+
+    dot_sync_in(dir.path())
+        .args(["sync", "envsync", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: NODE_VERSION"));
+
+    let target = read_file(&dir.path().join("target.env"));
+    assert!(target.contains("NODE_VERSION=22"), "got: {target}");
+}
+
+#[test]
+fn env_sync_fail_on_conflict_aborts_writes() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - PORT
+",
+    );
+    let source = "PORT=3000\n";
+    let target = "PORT=8080\n";
+    write_file(&dir.path().join("source.env"), source);
+    write_file(&dir.path().join("target.env"), target);
+
+    dot_sync_in(dir.path())
+        .args(["sync", "envsync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: PORT"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    assert_eq!(read_file(&dir.path().join("source.env")), source);
+    assert_eq!(read_file(&dir.path().join("target.env")), target);
+}
+
+#[test]
+fn env_status_lists_target_with_format_label() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+      - PORT
+",
+    );
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+    write_file(&dir.path().join("target.env"), "NODE_VERSION=22\n");
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("envsync"))
+        .stdout(predicate::str::contains("env"))
+        .stdout(predicate::str::contains("fields=2"));
+}
+
+#[test]
+fn env_push_dry_run_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+",
+    );
+    let source = "NODE_VERSION=22\n";
+    let target = "NODE_VERSION=20\n";
+    write_file(&dir.path().join("source.env"), source);
+    write_file(&dir.path().join("target.env"), target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "envsync", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains(
+            "would change target: NODE_VERSION",
+        ))
+        .stdout(predicate::str::contains("recovery:").not());
+
+    assert_eq!(read_file(&dir.path().join("source.env")), source);
+    assert_eq!(read_file(&dir.path().join("target.env")), target);
+}
+
+#[test]
+fn env_push_backup_creates_timestamped_copy() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+",
+    );
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+    let original_target = "NODE_VERSION=20\n";
+    write_file(&dir.path().join("target.env"), original_target);
+
+    dot_sync_in(dir.path())
+        .args(["push", "envsync", "--backup"])
+        .assert()
+        .success();
+
+    let backups = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".bak."))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(read_file(&backups[0].path()), original_target);
+}
+
+#[test]
+fn env_restore_rolls_back_to_pre_push_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let snap = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+",
+    );
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+    let original_target = "NODE_VERSION=20\n";
+    write_file(&dir.path().join("target.env"), original_target);
+
+    let mut push = dot_sync_in(dir.path());
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:"));
+
+    let mut restore = dot_sync_in(dir.path());
+    override_temp_dir(&mut restore, snap.path());
+    restore
+        .args(["restore", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"));
+
+    assert_eq!(read_file(&dir.path().join("target.env")), original_target);
+}
+
+#[test]
+fn env_add_infers_format_from_extension() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "envsync",
+            "--source",
+            "source.env",
+            "--target",
+            "target.env",
+            "--field",
+            "NODE_VERSION",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: env"), "yaml: {yaml}");
+    assert!(yaml.contains("NODE_VERSION"), "yaml: {yaml}");
+}
+
+#[test]
+fn env_add_infers_format_from_bare_dotfile_name() {
+    // `.env` (with the leading dot) has no Path::extension because
+    // the dot is part of the basename. Inference must catch this
+    // via the file_name fallback.
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source"), "NODE_VERSION=22\n");
+    // Wait — we need the source path to be `.env`. Place a real
+    // dotfile in a subdir so the path is `./sub/.env`.
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    write_file(&sub.join(".env"), "NODE_VERSION=22\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "envsync",
+            "--source",
+            "sub/.env",
+            "--target",
+            "other/.envrc",
+            "--field",
+            "NODE_VERSION",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: env"), "yaml: {yaml}");
+}
+
+#[test]
+fn env_add_multiple_field_flags() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.env"),
+        "NODE_VERSION=22\nDATABASE_URL=postgres://localhost/db\nPORT=8080\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "envsync",
+            "--source",
+            "source.env",
+            "--target",
+            "target.env",
+            "--field",
+            "NODE_VERSION",
+            "--field",
+            "DATABASE_URL",
+            "--field",
+            "PORT",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    for field in ["NODE_VERSION", "DATABASE_URL", "PORT"] {
+        assert!(yaml.contains(field), "missing {field}: {yaml}");
+    }
+}
+
+#[test]
+fn env_add_dry_run_does_not_persist_target() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "envsync",
+            "--source",
+            "source.env",
+            "--target",
+            "target.env",
+            "--field",
+            "NODE_VERSION",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("format: env"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(!yaml.contains("envsync"), "leaked into yaml: {yaml}");
+}
+
+#[test]
+fn env_add_then_push_uses_inferred_format() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.env"), "NODE_VERSION=22\n");
+    write_file(&dir.path().join("target.env"), "NODE_VERSION=20\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "envsync",
+            "--source",
+            "source.env",
+            "--target",
+            "target.env",
+            "--field",
+            "NODE_VERSION",
+        ])
+        .assert()
+        .success();
+
+    dot_sync_in(dir.path())
+        .args(["push", "envsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: NODE_VERSION"));
+
+    let target = read_file(&dir.path().join("target.env"));
+    assert!(target.contains("NODE_VERSION=22"), "got: {target}");
+}
+
+#[test]
+fn env_push_bails_when_source_file_is_unsupported_subset() {
+    // A `.env` with shell-script content (`if ... then`) fails to
+    // load with a clear error rather than silently producing a
+    // garbage sync.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+",
+    );
+    write_file(
+        &dir.path().join("source.env"),
+        "if [ -d ~/x ]; then\nNODE_VERSION=22\nfi\n",
+    );
+    write_file(&dir.path().join("target.env"), "NODE_VERSION=20\n");
+
+    dot_sync_in(dir.path())
+        .args(["push", "envsync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse env file"));
+}
