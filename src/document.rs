@@ -2102,6 +2102,46 @@ enabled = true
     }
 
     #[test]
+    fn json_get_returns_float_value_as_number() {
+        // Float source values must round-trip without truncation.
+        // `Number::from_f64` rejects NaN/Inf — those remain rare in
+        // dotfiles and aren't tested here, but plain finite floats
+        // (1.5, -2.25, 0.0) must come back as Number, not int or string.
+        let doc = json_doc(r#"{"a": 1.5, "b": -2.25, "c": 0.0}"#);
+        let a = doc.get(&FieldPath::parse("a").unwrap()).unwrap();
+        let b = doc.get(&FieldPath::parse("b").unwrap()).unwrap();
+        let c = doc.get(&FieldPath::parse("c").unwrap()).unwrap();
+        assert!(a.is_number(), "a should be number: {a:?}");
+        assert_eq!(a.as_f64(), Some(1.5));
+        assert!(b.is_number(), "b should be number: {b:?}");
+        assert_eq!(b.as_f64(), Some(-2.25));
+        // 0.0 may parse as i64 first (we try i64 before f64 in the
+        // safe walker) — accept either, the value just needs to be 0.
+        assert!(c.is_number(), "c should be number: {c:?}");
+        assert_eq!(c.as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn json_set_then_render_preserves_float_value() {
+        // Setting a float value through the trait — round-trip through
+        // `value_to_cst_input` (which uses Number(n.to_string())) must
+        // keep the float literal intact in the rendered output.
+        let mut doc = JsonDocument::empty();
+        doc.set(&FieldPath::parse("temperature").unwrap(), json!(0.7))
+            .unwrap();
+        let rendered = doc.render();
+        assert!(
+            rendered.contains("0.7"),
+            "rendered should contain 0.7 literally: {rendered}"
+        );
+        // Get back returns the same float.
+        assert_eq!(
+            doc.get(&FieldPath::parse("temperature").unwrap()),
+            Some(json!(0.7))
+        );
+    }
+
+    #[test]
     fn json_render_preserves_key_order() {
         let doc = json_doc(r#"{"z": 1, "a": 2, "m": 3}"#);
         let rendered = doc.render();

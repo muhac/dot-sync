@@ -1517,9 +1517,7 @@ fn jsonc_push_preserves_multi_line_comment_run_above_key() {
         .args(["push", "agent"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "changed target: feature.enabled",
-        ));
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
     fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
 }
 
@@ -1573,9 +1571,7 @@ fn jsonc_cross_dialect_does_not_leak_comments_across_sides() {
         .args(["push", "agent"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "changed target: feature.enabled",
-        ));
+        .stdout(predicate::str::contains("changed target: feature.enabled"));
 
     // Target gets the new value, no comments leaked.
     fixture.assert_file_eq("target.json", "target.expected.json");
@@ -1591,6 +1587,26 @@ fn jsonc_cross_dialect_does_not_leak_comments_across_sides() {
 
     // Source untouched (push direction doesn't write source).
     fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
+}
+
+#[test]
+fn json_push_propagates_float_values_without_truncation() {
+    // Source has a float value; push must write the same float to the
+    // target, not truncate to int. End-to-end check that
+    // `value_to_cst_input` and the safe walker both preserve the float.
+    let fixture = Fixture::load("json", "float_source_value");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: llm.temperature"));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let after = fixture.read("target.json");
+    assert!(
+        after.contains("0.7"),
+        "target should hold the float literal 0.7: {after}"
+    );
 }
 
 #[test]
