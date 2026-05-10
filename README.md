@@ -100,6 +100,10 @@ Pinned and wildcard selectors:
 
 - The identifier value (`"github"`) is matched as a string. Numeric / boolean
   identifiers are not yet supported.
+- **Multi-match is an error.** Two array items sharing the same identifier
+  value (e.g. two `mcp_servers` both named `github`) is treated as data
+  corruption and the sync bails before any write — surgical sync requires
+  unambiguous identity.
 - When the identifier matches an item that exists on one side but not the other,
   the missing side gets a new array entry seeded with the identifier — the
   "fill missing" rule from `pull`/`sync` extended to array members.
