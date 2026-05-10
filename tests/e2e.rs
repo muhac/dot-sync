@@ -1562,6 +1562,38 @@ fn jsonc_push_preserves_indent_when_creating_nested_objects() {
 }
 
 #[test]
+fn jsonc_cross_dialect_does_not_leak_comments_across_sides() {
+    // Source is JSONC with both line and block comments. Target is
+    // strict JSON (no comments). Push moves the value — but the source's
+    // comments must NOT leak into the target file, and the source's
+    // own comments must stay untouched (push doesn't write source).
+    let fixture = Fixture::load("json", "jsonc_cross_dialect");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: feature.enabled",
+        ));
+
+    // Target gets the new value, no comments leaked.
+    fixture.assert_file_eq("target.json", "target.expected.json");
+    let target_after = fixture.read("target.json");
+    assert!(
+        !target_after.contains("//"),
+        "target must not gain a // comment from source: {target_after}"
+    );
+    assert!(
+        !target_after.contains("/*"),
+        "target must not gain a /* comment from source: {target_after}"
+    );
+
+    // Source untouched (push direction doesn't write source).
+    fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
