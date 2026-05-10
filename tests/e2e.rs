@@ -1086,9 +1086,7 @@ fn jsonc_pull_preserves_source_side_comments() {
         .args(["pull", "agent"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "changed source: feature.enabled",
-        ));
+        .stdout(predicate::str::contains("changed source: feature.enabled"));
     fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
 }
 
@@ -1133,9 +1131,7 @@ fn jsonc_vscode_settings_round_trips_real_world_shape() {
         .args(["push", "vscode"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "changed target: editor.tabSize",
-        ));
+        .stdout(predicate::str::contains("changed target: editor.tabSize"));
     fixture.assert_file_eq("settings.jsonc", "settings.expected.jsonc");
 }
 
