@@ -243,6 +243,30 @@ dot-sync sync codex --fail-on-conflict   # exit non-zero, write nothing, list co
 
 `pull` is always target-wins by definition; `push` is always source-wins.
 
+### Shell completions and man page
+
+The fastest path is the installer flag — it detects your shell and
+writes completion files to the standard user-owned directories:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --with-completions
+```
+
+That installs `dot-sync` plus completions for `bash` / `zsh` / `fish`
+and a man page at `~/.local/share/man/man1/dot-sync.1`. The installer
+prints any rc-file edits you still need to make (mostly just `zsh`).
+
+If you'd rather wire it up by hand, both come from hidden
+subcommands:
+
+```sh
+dot-sync completions bash       > ~/.local/share/bash-completion/completions/dot-sync
+dot-sync completions zsh        > ~/.zfunc/_dot-sync
+dot-sync completions fish       > ~/.config/fish/completions/dot-sync.fish
+dot-sync completions powershell > $PROFILE.dot-sync.ps1
+dot-sync man                    > ~/.local/share/man/man1/dot-sync.1
+```
+
 ## Recovering from a bad write
 
 Every real write captures the previous contents into
