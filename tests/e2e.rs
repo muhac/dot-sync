@@ -1076,6 +1076,23 @@ fn jsonc_push_preserves_block_and_inline_comments() {
 }
 
 #[test]
+fn jsonc_pull_preserves_source_side_comments() {
+    // Pull writes the *source* file (target → source). Source-side
+    // comments and block-comment trivia must survive the write — same
+    // CST round-trip guarantee as push, just on the other side.
+    let fixture = Fixture::load("json", "jsonc_pull_preserves_source_comments");
+    fixture
+        .command()
+        .args(["pull", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed source: feature.enabled",
+        ));
+    fixture.assert_file_eq("source.jsonc", "source.expected.jsonc");
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
