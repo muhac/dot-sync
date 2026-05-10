@@ -186,12 +186,24 @@ fn resolve_format(args: &AddArgs, existing: Option<&RawTargetConfig>) -> Result<
 }
 
 fn infer_format_from_path(p: &str) -> Option<&'static str> {
-    let ext = Path::new(p).extension()?.to_str()?;
-    match ext {
-        "toml" => Some("toml"),
-        "json" => Some("json"),
-        "jsonc" => Some("jsonc"),
-        "gitconfig" => Some("gitconfig"),
+    let path = Path::new(p);
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext {
+            "toml" => return Some("toml"),
+            "json" => return Some("json"),
+            "jsonc" => return Some("jsonc"),
+            "gitconfig" => return Some("gitconfig"),
+            "env" => return Some("env"),
+            "envrc" => return Some("env"),
+            _ => {}
+        }
+    }
+    // Extension-less env conventions: `.env` (dotfile, no real
+    // extension) and `.envrc` (direnv). `Path::extension` returns
+    // None for both because the leading `.` is the basename, not a
+    // separator. Match on the basename instead.
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(".env") | Some(".envrc") => Some("env"),
         _ => None,
     }
 }
@@ -310,6 +322,13 @@ mod tests {
         assert_eq!(infer_format_from_path("a.json"), Some("json"));
         assert_eq!(infer_format_from_path("a.jsonc"), Some("jsonc"));
         assert_eq!(infer_format_from_path("a.gitconfig"), Some("gitconfig"));
+        // Both `foo.env` (`.env` extension) and `.env` (no extension,
+        // bare dotfile name) infer as env. Same for `.envrc`.
+        assert_eq!(infer_format_from_path("a.env"), Some("env"));
+        assert_eq!(infer_format_from_path("a.envrc"), Some("env"));
+        assert_eq!(infer_format_from_path(".env"), Some("env"));
+        assert_eq!(infer_format_from_path(".envrc"), Some("env"));
+        assert_eq!(infer_format_from_path("path/to/.env"), Some("env"));
         assert_eq!(infer_format_from_path("a.yaml"), None);
         assert_eq!(infer_format_from_path("noext"), None);
     }
