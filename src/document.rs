@@ -1728,6 +1728,48 @@ impl GitConfigDocument {
     }
 }
 
+/// Resolved gitconfig key parts from a `FieldPath`.
+///
+/// `section` and `key` are mandatory, `subsection` is optional. We pass
+/// these to gix-config's `_by`-suffixed APIs to avoid having gix-config
+/// re-parse a dotted form — that re-parse would mis-handle subsections
+/// containing dots (e.g. `[includeIf "gitdir:~/work/"]`).
+struct GitConfigKey {
+    section: String,
+    subsection: Option<String>,
+    key: String,
+}
+
+fn path_to_gitconfig_key(path: &FieldPath) -> Result<GitConfigKey> {
+    if path.segments().iter().any(|s| s.select.is_some()) {
+        bail!(
+            "array selectors are not supported in gitconfig paths: {path} \
+             — gitconfig has no arrays of objects"
+        );
+    }
+    let names: Vec<&str> = path.segments().iter().map(|s| s.name.as_str()).collect();
+    match names.as_slice() {
+        [] => bail!("empty gitconfig path"),
+        [_section] => bail!(
+            "gitconfig path needs at least 2 segments (section.key): \
+             '{path}' is missing a key"
+        ),
+        [section, key] => Ok(GitConfigKey {
+            section: (*section).to_string(),
+            subsection: None,
+            key: (*key).to_string(),
+        }),
+        [section, subsection, key] => Ok(GitConfigKey {
+            section: (*section).to_string(),
+            subsection: Some((*subsection).to_string()),
+            key: (*key).to_string(),
+        }),
+        _ => bail!(
+            "gitconfig path has too many segments (max 3 — section.subsection.key): {path}"
+        ),
+    }
+}
+
 impl Document for GitConfigDocument {
     type Item = String;
 
@@ -1744,8 +1786,14 @@ impl Document for GitConfigDocument {
         Ok(Self { file })
     }
 
-    fn get(&self, _path: &FieldPath) -> Option<String> {
-        unimplemented!("GitConfigDocument::get — wired in next commit")
+    fn get(&self, path: &FieldPath) -> Option<String> {
+        // Invalid paths (selector segments, wrong arity) can never resolve
+        // to a value, so swallow the error here. `set` surfaces the same
+        // error properly when the caller actually tries to write.
+        let key = path_to_gitconfig_key(path).ok()?;
+        let sub = key.subsection.as_deref().map(bstr::BStr::new);
+        let value = self.file.string_by(&key.section, sub, &key.key)?;
+        Some(value.to_string())
     }
 
     fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
@@ -3351,5 +3399,68 @@ mod gitconfig_tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    fn doc_from(content: &str) -> (tempfile::TempDir, GitConfigDocument) {
+        let dir = write_fixture(content);
+        let doc = GitConfigDocument::load(&dir.path().join("config"), false).unwrap();
+        (dir, doc)
+    }
+
+    use crate::path::FieldPath;
+
+    #[test]
+    fn get_reads_section_key() {
+        let (_dir, doc) = doc_from("[user]\n\temail = alice@example.com\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn get_reads_section_subsection_key() {
+        let (_dir, doc) = doc_from(
+            "[remote \"origin\"]\n\turl = https://example.com/foo\n",
+        );
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        assert_eq!(doc.get(&path), Some("https://example.com/foo".to_string()));
+    }
+
+    #[test]
+    fn get_reads_quoted_subsection_with_special_chars() {
+        // Subsections may contain almost anything; dot-sync expresses
+        // them via the existing quoted-segment syntax. The key under
+        // [includeIf "gitdir:~/work/"] is reachable as
+        // includeIf."gitdir:~/work/".path.
+        let (_dir, doc) = doc_from(
+            "[includeIf \"gitdir:~/work/\"]\n\tpath = ~/.gitconfig-work\n",
+        );
+        let path = FieldPath::parse("includeIf.\"gitdir:~/work/\".path").unwrap();
+        assert_eq!(doc.get(&path), Some("~/.gitconfig-work".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_key() {
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&path), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_section() {
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("core.editor").unwrap();
+        assert_eq!(doc.get(&path), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_invalid_path_arity() {
+        // Single-segment path can't address anything in gitconfig (no
+        // top-level keys without a section). `get` swallows the error
+        // and returns None — `set` surfaces it.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let too_short = FieldPath::parse("user").unwrap();
+        let too_long = FieldPath::parse("a.b.c.d").unwrap();
+        assert_eq!(doc.get(&too_short), None);
+        assert_eq!(doc.get(&too_long), None);
     }
 }
