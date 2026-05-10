@@ -1925,3 +1925,106 @@ fn add_errors_when_new_target_missing_source() {
         .failure()
         .stderr(predicate::str::contains("--source is required"));
 }
+
+#[test]
+fn add_format_inferred_when_only_one_side_has_known_extension() {
+    // Source has a known extension; target doesn't (someone using a
+    // bare file name like `~/.codex/config`). The single recognized
+    // extension should still drive format inference.
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.toml"), "tui = { theme = \"x\" }\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--source",
+            "source.toml",
+            "--target",
+            "target", // no extension
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_dedupes_when_existing_leaf_path_overlaps_new_container_path() {
+    // Existing target syncs `tui.theme` (a single leaf). User now adds
+    // `tui` as a whole-subtree path. Both should end up in the list —
+    // they're different paths even though one covers the other at sync
+    // time. add() only dedupes by exact string match. Lock that
+    // behavior so a future "redundant path detection" feature has a
+    // baseline to compare against.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "tui"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 1 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+    assert!(yaml.contains("- tui\n"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_warns_when_existing_target_overrides_are_passed() {
+    // Existing target is `format: toml`. User passes --format json +
+    // new --source and --target trying to update them. add() ignores
+    // those overrides and warns; the user can re-run with a different
+    // target name if they actually wanted a fresh entry.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "json",
+            "--source",
+            "different.json",
+            "--field",
+            "max_bytes",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: target 'codex' already exists",
+        ))
+        .stderr(predicate::str::contains("--format"))
+        .stderr(predicate::str::contains("--source"));
+
+    // The existing format stays unchanged.
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+    assert!(!yaml.contains("format: json"), "yaml: {yaml}");
+    assert!(yaml.contains("source: source.toml"), "yaml: {yaml}");
+}
