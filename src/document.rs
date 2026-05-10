@@ -459,21 +459,24 @@ fn table_conflict_like(
     segments: &[Segment],
     prefix: &mut Vec<String>,
 ) -> Option<TableConflict> {
-    if segments.len() <= 1 {
-        return None;
-    }
     let (first, rest) = segments.split_first()?;
     prefix.push(first.to_string());
     let item = table.get(&first.name)?;
     match &first.select {
-        None => match item.as_table_like() {
-            Some(next) => table_conflict_like(next, rest, prefix),
-            None => Some(TableConflict {
-                path: prefix.join("."),
-                kind: item.type_name().to_string(),
-                value: summarize_toml_item(item),
-            }),
-        },
+        None => {
+            if rest.is_empty() {
+                // Leaf with no selector can be any value type.
+                return None;
+            }
+            match item.as_table_like() {
+                Some(next) => table_conflict_like(next, rest, prefix),
+                None => Some(TableConflict {
+                    path: prefix.join("."),
+                    kind: item.type_name().to_string(),
+                    value: summarize_toml_item(item),
+                }),
+            }
+        }
         Some(ItemSelector::Pinned { key, value }) => {
             // Container at first.name must be an array (of any flavor).
             // If not, that itself is a conflict the user should know about.
@@ -991,6 +994,31 @@ enabled = false
         let conflict = doc.table_conflict(&path).expect("expected conflict");
         assert_eq!(conflict.path, "mcp_servers[name]");
         assert!(conflict.value.contains("not an array"));
+    }
+
+    #[test]
+    fn table_conflict_warns_for_single_segment_selector_against_scalar() {
+        // Whole-item sync `arr[name]` (selector at the only segment) needs the
+        // same array-shape warning as `arr[name].field`. Previously the early
+        // return on `segments.len() <= 1` swallowed the check.
+        let doc = TomlDocument {
+            doc: r#"arr = "scalar""#.parse().unwrap(),
+        };
+        let pinned = FieldPath::parse(r#"arr[name="github"]"#).unwrap();
+        let wildcard = FieldPath::parse("arr[name]").unwrap();
+        assert!(doc.table_conflict(&pinned).is_some());
+        assert!(doc.table_conflict(&wildcard).is_some());
+    }
+
+    #[test]
+    fn table_conflict_does_not_warn_for_single_plain_key_segment() {
+        // Plain leaf access — `tui` against `tui = "x"` is fine, leaf can be
+        // any value type.
+        let doc = TomlDocument {
+            doc: r#"tui = "monokai""#.parse().unwrap(),
+        };
+        let path = FieldPath::parse("tui").unwrap();
+        assert!(doc.table_conflict(&path).is_none());
     }
 
     #[test]
