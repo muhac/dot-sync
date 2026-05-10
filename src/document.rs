@@ -832,16 +832,10 @@ fn json_type_name(v: &JsonValue) -> &'static str {
 }
 
 fn summarize_json_item(item: &JsonValue) -> String {
-    let mut rendered = match item {
-        JsonValue::Null => "null".to_string(),
-        JsonValue::Bool(b) => b.to_string(),
-        JsonValue::Number(n) => n.to_string(),
-        JsonValue::String(s) => serde_json::Value::String(s.clone()).to_string(),
-        // Compact rendering for arrays/objects so reports stay one line.
-        JsonValue::Array(_) | JsonValue::Object(_) => {
-            serde_json::to_string(item).unwrap_or_default()
-        }
-    };
+    // `serde_json::to_string` is the canonical compact form for every JSON
+    // value (quotes strings, prints `null` / `true` / numbers). Reports stay
+    // one line because the compact serializer never inserts whitespace.
+    let mut rendered = serde_json::to_string(item).unwrap_or_default();
     if rendered.is_empty() {
         rendered = json_type_name(item).to_string();
     }
