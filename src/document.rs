@@ -5058,6 +5058,97 @@ EMPTY=
         );
     }
 
+    #[test]
+    fn rejects_unclosed_single_quote() {
+        let (_dir, path) = write_fixture("KEY='unterminated\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("unclosed single-quoted value"),
+            "msg: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_content_after_closing_quote() {
+        // `KEY="value" extra` — extra content after the closing quote
+        // is ambiguous (bash would treat `extra` as a separate word).
+        // Refuse rather than guess.
+        let (_dir, path) = write_fixture("KEY=\"value\" extra\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("trailing content"),
+            "msg: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_shell_statement_lines() {
+        // A real-world `.envrc` might have `if [ -d ~/work ]; then`
+        // or function definitions. dot-sync's strict KEY=value shape
+        // catches these via the "missing `=`" / "invalid env key"
+        // paths. Lock that boundary — it's where "env file we support"
+        // ends and "shell script we don't" begins.
+        for line in [
+            "if [ -d ~/work ]; then\n",
+            "function helper() { echo hi; }\n",
+            "[[ -f .env.local ]] && source .env.local\n",
+        ] {
+            let (_dir, path) = write_fixture(line);
+            assert!(
+                EnvDocument::load(&path, false).is_err(),
+                "expected reject for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_key_in_line() {
+        let (_dir, path) = write_fixture("=value\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid env key"),
+            "msg: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_posix_key_in_line() {
+        // Hyphens / dots show up in some env loader dialects but not
+        // in POSIX. dot-sync follows POSIX so syncs stay portable.
+        let (_dir, path) = write_fixture("bad-key=value\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid env key"),
+            "msg: {err:#}"
+        );
+    }
+
+    #[test]
+    fn error_message_includes_line_number_and_text() {
+        // Failure messages must point at the offending line so the
+        // user can locate it. Line 1 is fine, line 2 trips.
+        let (_dir, path) = write_fixture("GOOD=1\nbad-line-no-equals\n");
+        let err = match EnvDocument::load(&path, false) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(s.contains("line 2"), "msg: {s}");
+        assert!(s.contains("bad-line-no-equals"), "msg: {s}");
+    }
+
     // ----- get + path validation -----
 
     use crate::path::FieldPath;
