@@ -1726,6 +1726,103 @@ impl GitConfigDocument {
             file: gix_config::File::new(gix_config::file::Metadata::default()),
         }
     }
+
+    /// `true` iff some section in the file matches `key` byte-for-byte
+    /// on section name + subsection name + has at least one value name
+    /// matching `key.key` byte-for-byte. Used by `get` to refuse
+    /// resolving paths whose case doesn't match the file.
+    fn case_exact_match_exists(&self, key: &GitConfigKey) -> bool {
+        for s in self.file.sections() {
+            if !section_header_bytes_eq(s.header(), key) {
+                continue;
+            }
+            for vn in s.body().value_names() {
+                if bstr_bytes(vn) == key.key.as_bytes() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Bail if any section / subsection / key in the file matches
+    /// `key` case-insensitively but not byte-for-byte. A clean-miss
+    /// (no case-insensitive overlap) is fine — that means we're
+    /// creating a brand-new section / key with the path's own case.
+    fn check_case_sensitivity(&self, key: &GitConfigKey, path: &FieldPath) -> Result<()> {
+        for s in self.file.sections() {
+            let h = s.header();
+            let h_name_bytes = bstr_bytes_from_bstr(h.name());
+            let h_sub_bytes = h.subsection_name().map(bstr_bytes_from_bstr);
+            let key_sub_bytes = key.subsection.as_deref().map(str::as_bytes);
+
+            let name_ci = h_name_bytes.eq_ignore_ascii_case(key.section.as_bytes());
+            let name_exact = h_name_bytes == key.section.as_bytes();
+            let sub_ci = match (h_sub_bytes, key_sub_bytes) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            };
+            let sub_exact = h_sub_bytes == key_sub_bytes;
+            if !(name_ci && sub_ci) {
+                continue;
+            }
+            if !(name_exact && sub_exact) {
+                bail!(
+                    "gitconfig path '{path}' case-mismatches existing section header \
+                     [{section}{sub_disp}] (dot-sync requires byte-exact section / \
+                     subsection names; git itself is case-insensitive but dot-sync \
+                     is not)",
+                    section = h.name(),
+                    sub_disp = match h.subsection_name() {
+                        Some(b) => format!(" \"{b}\""),
+                        None => String::new(),
+                    }
+                );
+            }
+            // Section + subsection are case-exact. Now check value names
+            // in this section's body.
+            for vn in s.body().value_names() {
+                let vn_bytes = bstr_bytes(vn);
+                if vn_bytes.eq_ignore_ascii_case(key.key.as_bytes())
+                    && vn_bytes != key.key.as_bytes()
+                {
+                    bail!(
+                        "gitconfig path '{path}' case-mismatches existing key '{}' \
+                         in section [{section}{sub_disp}]",
+                        bstr::BStr::new(vn_bytes),
+                        section = h.name(),
+                        sub_disp = match h.subsection_name() {
+                            Some(b) => format!(" \"{b}\""),
+                            None => String::new(),
+                        }
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn section_header_bytes_eq(h: &gix_config::parse::section::Header<'_>, key: &GitConfigKey) -> bool {
+    if bstr_bytes_from_bstr(h.name()) != key.section.as_bytes() {
+        return false;
+    }
+    match (h.subsection_name(), key.subsection.as_deref()) {
+        (Some(a), Some(b)) => bstr_bytes_from_bstr(a) == b.as_bytes(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn bstr_bytes_from_bstr(b: &bstr::BStr) -> &[u8] {
+    b
+}
+
+fn bstr_bytes<'a>(vn: &'a gix_config::parse::section::ValueName<'_>) -> &'a [u8] {
+    // ValueName derefs to BStr which derefs to [u8].
+    let bs: &bstr::BStr = vn;
+    bs
 }
 
 /// Resolved gitconfig key parts from a `FieldPath`.
@@ -1791,6 +1888,16 @@ impl Document for GitConfigDocument {
         // to a value, so swallow the error here. `set` surfaces the same
         // error properly when the caller actually tries to write.
         let key = path_to_gitconfig_key(path).ok()?;
+        // Case-sensitive matching diverges from git's native case-
+        // insensitive behavior on purpose — dot-sync's path syntax is
+        // case-sensitive across all backends, and silently letting
+        // `User.email` resolve through `[user]` would be a footgun for
+        // users hand-writing `.sync.yaml` paths. If the path's case
+        // doesn't byte-equal an existing section / subsection / key,
+        // treat it as absent.
+        if !self.case_exact_match_exists(&key) {
+            return None;
+        }
         let sub = key.subsection.as_deref().map(bstr::BStr::new);
         let value = self.file.string_by(&key.section, sub, &key.key)?;
         Some(value.to_string())
@@ -1798,6 +1905,13 @@ impl Document for GitConfigDocument {
 
     fn set(&mut self, path: &FieldPath, item: String) -> Result<()> {
         let key = path_to_gitconfig_key(path)?;
+        // Case-sensitive guard: if the file has a section / subsection
+        // / key that case-insensitively matches but does not byte-match
+        // exactly, that's almost certainly a typo in `.sync.yaml`.
+        // Surface it loudly rather than silently writing into the
+        // existing case-different entry.
+        self.check_case_sensitivity(&key, path)?;
+
         let sub = key.subsection.as_deref().map(bstr::BStr::new);
         // Multivar guard: if the destination key already has more than
         // one value (e.g. multiple `remote.origin.fetch =` lines),
@@ -3886,6 +4000,86 @@ mod gitconfig_tests {
         assert_eq!(paths, vec!["branch.\"feature.x\".remote".to_string()]);
         let parsed = FieldPath::parse(&paths[0]).unwrap();
         assert_eq!(doc.get(&parsed), Some("origin".to_string()));
+    }
+
+    // ----- case-sensitive matching -----
+
+    #[test]
+    fn get_returns_none_when_section_case_differs() {
+        // File has lowercase [user]; path queries `User.email`. git
+        // would resolve this case-insensitively; dot-sync deliberately
+        // does not — paths are case-sensitive across all backends.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("User.email").unwrap();
+        assert_eq!(doc.get(&path), None);
+        // Case-exact still works.
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_when_subsection_case_differs() {
+        let (_dir, doc) = doc_from("[remote \"Origin\"]\n\turl = u\n");
+        // Path subsection is "origin"; file has "Origin".
+        let mismatched = FieldPath::parse("remote.origin.url").unwrap();
+        assert_eq!(doc.get(&mismatched), None);
+        let exact = FieldPath::parse("remote.Origin.url").unwrap();
+        assert_eq!(doc.get(&exact), Some("u".to_string()));
+    }
+
+    #[test]
+    fn get_returns_none_when_key_case_differs() {
+        let (_dir, doc) = doc_from("[user]\n\tEmail = a@b\n");
+        let mismatched = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&mismatched), None);
+        let exact = FieldPath::parse("user.Email").unwrap();
+        assert_eq!(doc.get(&exact), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn set_bails_when_section_case_differs() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("User.email").unwrap();
+        let err = doc.set(&path, "new@x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("case-mismatches"), "msg: {s}");
+        assert!(s.contains("[user]"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_bails_when_subsection_case_differs() {
+        let (_dir, mut doc) = doc_from("[remote \"Origin\"]\n\turl = u\n");
+        let path = FieldPath::parse("remote.origin.url").unwrap();
+        let err = doc.set(&path, "new".to_string()).unwrap_err();
+        assert!(err.to_string().contains("case-mismatches"), "msg: {err}");
+    }
+
+    #[test]
+    fn set_bails_when_key_case_differs() {
+        let (_dir, mut doc) = doc_from("[user]\n\tEmail = a@b\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        let err = doc.set(&path, "new@x".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("case-mismatches"), "msg: {s}");
+        assert!(s.contains("Email"), "msg: {s}");
+    }
+
+    #[test]
+    fn set_creates_new_section_when_no_case_overlap() {
+        // No `user` section at all → set creates a new `[user]` with
+        // path's case. No case-mismatch error.
+        let (_dir, mut doc) = doc_from("[core]\n\teditor = vim\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "a@b".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+    }
+
+    #[test]
+    fn set_succeeds_with_case_exact_match() {
+        let (_dir, mut doc) = doc_from("[user]\n\temail = old\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("new".to_string()));
     }
 
     #[test]
