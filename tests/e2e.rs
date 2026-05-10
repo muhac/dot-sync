@@ -1263,6 +1263,89 @@ fn json_write_emits_recovery_snapshot_for_existing_files() {
 }
 
 #[test]
+fn json_sync_source_wins_overwrites_target_value() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "agent", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: max_bytes"))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    let target = fixture.read("target.json");
+    assert!(
+        target.contains("65536"),
+        "target should now hold source's value: {target}"
+    );
+}
+
+#[test]
+fn json_sync_fail_on_conflict_aborts() {
+    let fixture = Fixture::load("json", "dry_run_no_write");
+    let original_target = fixture.read("target.json");
+    let original_source = fixture.read("source.json");
+
+    fixture
+        .command()
+        .args(["sync", "agent", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: max_bytes"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // Both files untouched — preflight aborts before any write.
+    assert_eq!(fixture.read("target.json"), original_target);
+    assert_eq!(fixture.read("source.json"), original_source);
+}
+
+#[test]
+fn json_sync_fail_on_conflict_preflights_all_targets_before_writing() {
+    // Two targets: alpha would write cleanly, beta has a conflict. The
+    // global preflight must abort beta and prevent alpha's write — same
+    // "write nothing" guarantee as the TOML side.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  alpha:
+    format: json
+    source: alpha-source.json
+    target: alpha-target.json
+    sync:
+      - field
+  beta:
+    format: json
+    source: beta-source.json
+    target: beta-target.json
+    sync:
+      - field
+"#,
+    );
+    write_file(&dir.path().join("alpha-source.json"), r#"{"field": "new"}"#);
+    write_file(&dir.path().join("alpha-target.json"), "{}");
+    write_file(&dir.path().join("beta-source.json"), r#"{"field": "src"}"#);
+    write_file(&dir.path().join("beta-target.json"), r#"{"field": "tgt"}"#);
+
+    dot_sync_in(dir.path())
+        .args(["sync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("beta sync preflight"))
+        .stdout(predicate::str::contains("conflict: field"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    // alpha must be untouched even though only beta had the conflict.
+    assert_eq!(read_normalized(&dir.path().join("alpha-target.json")), "{}");
+    assert_eq!(
+        read_normalized(&dir.path().join("beta-target.json")),
+        r#"{"field": "tgt"}"#
+    );
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
