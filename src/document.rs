@@ -1109,13 +1109,13 @@ fn json_walk_object_for_discovery(
         }
 
         if let Some(arr) = val_node.as_array() {
-            // Filter to object elements only — phantom guard + scalars-skip.
+            // Filter to object elements only. `as_object()` returning
+            // `Some` is sufficient post jsonc-parser 0.32.4 — the
+            // phantom-string-lit bug that previously needed a separate
+            // pre-filter is fixed upstream.
             let elements = arr.elements();
-            let item_objs: Vec<CstObject> = elements
-                .iter()
-                .filter(|el| cst_node_is_real_value(el))
-                .filter_map(|el| el.as_object())
-                .collect();
+            let item_objs: Vec<CstObject> =
+                elements.iter().filter_map(|el| el.as_object()).collect();
             if !item_objs.is_empty()
                 && item_objs.len() == elements.len()
                 && let Some(node) = json_array_of_objects_node(&key, &item_objs, &seg_ancestors)
@@ -1295,14 +1295,12 @@ fn selector_value_to_cst_input(value: &SelectorValue) -> CstInputValue {
 /// True when CST `obj[key]` matches the typed pinned-selector value.
 /// Type-strict: `Int(8080)` never matches the JSON string `"8080"`.
 ///
-/// Inspects leaves directly (avoiding `to_serde_value` on the value node)
-/// because jsonc-parser 0.32.3 has a bug where `arr.elements()` after an
-/// `append()` can expose a phantom whitespace "string lit" whose
-/// `decoded_value()` panics inside `parse_string`. See
-/// <https://github.com/dprint/jsonc-parser/issues/78>. Going through
-/// `as_string_lit().decoded_value()` is fine for *real* string lits the
-/// caller has already filtered to (e.g. via `as_object()` first), and
-/// for booleans / numbers we don't use `decoded_value` at all.
+/// Inspects leaves directly via `as_string_lit` / `as_number_lit` /
+/// `as_boolean_lit` rather than going through `to_serde_value()`. This
+/// avoids walking entire subtrees just to compare one scalar — a real
+/// performance win on large arrays — and originally also worked around
+/// a jsonc-parser 0.32.3 bug
+/// (<https://github.com/dprint/jsonc-parser/issues/78>, fixed in 0.32.4).
 fn cst_object_matches(obj: &CstObject, key: &str, value: &SelectorValue) -> bool {
     let Some(prop) = obj.get(key) else {
         return false;
@@ -1356,7 +1354,7 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
             let prop = obj.get(&first.name)?;
             let val_node = prop.value()?;
             if last {
-                return cst_node_to_serde_value_safe(&val_node);
+                return val_node.to_serde_value();
             }
             let next_obj = val_node.as_object()?;
             json_get(&next_obj, rest)
@@ -1369,7 +1367,7 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
                 };
                 if cst_object_matches(&elem_obj, key, value) {
                     if last {
-                        return cst_node_to_serde_value_safe(&elem);
+                        return elem.to_serde_value();
                     }
                     return json_get(&elem_obj, rest);
                 }
@@ -1378,97 +1376,6 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
         }
         Some(ItemSelector::Wildcard { .. }) => None,
     }
-}
-
-/// Convert a CST node to a `serde_json::Value` while filtering out
-/// jsonc-parser 0.32.3's phantom whitespace "string lit" elements that
-/// can appear in arrays after `append()`. The crate's own
-/// `CstNode::to_serde_value()` doesn't filter these and panics inside
-/// `decoded_value()` when the phantom's raw value is whitespace, so we
-/// recurse manually with the same leaf-direct pattern that
-/// `cst_object_matches` uses. Tracking upstream:
-/// <https://github.com/dprint/jsonc-parser/issues/78>.
-fn cst_node_to_serde_value_safe(node: &CstNode) -> Option<JsonValue> {
-    if let Some(obj) = node.as_object() {
-        let mut map = serde_json::Map::new();
-        for prop in obj.properties() {
-            let name_node = prop.name()?;
-            let name = if let Some(sl) = name_node.as_string_lit() {
-                sl.decoded_value().ok()?
-            } else if let Some(wl) = name_node.as_word_lit() {
-                wl.to_string()
-            } else {
-                continue;
-            };
-            let val = prop
-                .value()
-                .and_then(|v| cst_node_to_serde_value_safe(&v))?;
-            map.insert(name, val);
-        }
-        return Some(JsonValue::Object(map));
-    }
-    if let Some(arr) = node.as_array() {
-        let mut out = Vec::new();
-        for el in arr.elements() {
-            if !cst_node_is_real_value(&el) {
-                // Phantom whitespace masquerading as a value node — skip.
-                continue;
-            }
-            out.push(cst_node_to_serde_value_safe(&el)?);
-        }
-        return Some(JsonValue::Array(out));
-    }
-    if let Some(sl) = node.as_string_lit() {
-        // Defense in depth: a phantom would have leaked through if we
-        // reached here directly without going through the array filter.
-        // Skip if the raw value isn't a properly delimited string.
-        let raw = sl.raw_value();
-        if !raw.starts_with('"') && !raw.starts_with('\'') {
-            return None;
-        }
-        return sl.decoded_value().ok().map(JsonValue::String);
-    }
-    if let Some(nl) = node.as_number_lit() {
-        let raw = nl.to_string();
-        if let Ok(i) = raw.parse::<i64>() {
-            return Some(JsonValue::from(i));
-        }
-        if let Ok(f) = raw.parse::<f64>() {
-            return serde_json::Number::from_f64(f).map(JsonValue::Number);
-        }
-        // Non-finite or unparseable — fall back to the raw string so the
-        // value is at least visible to the caller, matching jsonc-parser's
-        // own AST-to-value behavior on edge-case numbers.
-        return Some(JsonValue::String(raw));
-    }
-    if let Some(bl) = node.as_boolean_lit() {
-        return Some(JsonValue::Bool(bl.value()));
-    }
-    if node.as_null_keyword().is_some() {
-        return Some(JsonValue::Null);
-    }
-    None
-}
-
-/// True when the CST node is a real value-bearing node (object, array,
-/// number / bool / null literal, or a properly quoted string literal),
-/// not a phantom trivia node leaking through `as_string_lit()` after
-/// `append()` (jsonc-parser 0.32.3 quirk;
-/// <https://github.com/dprint/jsonc-parser/issues/78>).
-fn cst_node_is_real_value(node: &CstNode) -> bool {
-    if node.as_object().is_some()
-        || node.as_array().is_some()
-        || node.as_number_lit().is_some()
-        || node.as_boolean_lit().is_some()
-        || node.as_null_keyword().is_some()
-    {
-        return true;
-    }
-    if let Some(sl) = node.as_string_lit() {
-        let raw = sl.raw_value();
-        return raw.starts_with('"') || raw.starts_with('\'');
-    }
-    false
 }
 
 fn json_table_conflict_walk(
@@ -1513,14 +1420,14 @@ fn json_table_conflict_walk(
     }
 }
 
-/// Build a `TableConflict` from a CST node directly. We deliberately do NOT
-/// call `to_serde_value` on the offending node — for container nodes that
-/// recurses into descendants and trips over jsonc-parser 0.32.3's phantom
-/// whitespace "string lit" bug after an array `append()`
-/// (<https://github.com/dprint/jsonc-parser/issues/78>). Instead, derive
-/// `kind` from CST type accessors and `value` from `Display` (which uses
-/// `raw_value` and is panic-safe).
-fn cst_conflict_report(prefix: &[String], node: &jsonc_parser::cst::CstNode) -> TableConflict {
+/// Build a `TableConflict` from a CST node directly. We derive `kind`
+/// from CST type accessors and `value` from `Display` rather than
+/// going through `to_serde_value()`, which would recurse into the
+/// entire subtree just to fill the report's two short fields.
+/// Originally also worked around jsonc-parser 0.32.3's phantom
+/// whitespace "string lit" bug after `append()`
+/// (<https://github.com/dprint/jsonc-parser/issues/78>, fixed in 0.32.4).
+fn cst_conflict_report(prefix: &[String], node: &CstNode) -> TableConflict {
     let kind = if node.as_object().is_some() {
         "object"
     } else if node.as_array().is_some() {
@@ -3006,13 +2913,12 @@ enabled = true
 
     #[test]
     fn json_get_on_container_after_array_append_does_not_panic() {
-        // Regression guard for jsonc-parser 0.32.3's phantom-string-lit
-        // bug (https://github.com/dprint/jsonc-parser/issues/78): after
-        // `append()` on an array of objects, `arr.elements()` can include
-        // a whitespace "string lit" whose `decoded_value()` panics.
-        // Calling `to_serde_value()` on the array would walk every element
-        // (including the phantom) — the safe walker filters the phantom
-        // and returns the real array contents.
+        // Regression guard for jsonc-parser's phantom-string-lit bug
+        // (https://github.com/dprint/jsonc-parser/issues/78). 0.32.3
+        // would expose a whitespace "string lit" in arr.elements() after
+        // append(), and to_serde_value() on the parent array would
+        // panic walking through it. Fixed in 0.32.4 — kept as a
+        // regression guard so a future dep regression surfaces here.
         let mut doc = json_doc(r#"{"servers": [{"name": "a"}, {"name": "b"}]}"#);
         // Append a third entry — triggers the phantom condition.
         doc.set(
