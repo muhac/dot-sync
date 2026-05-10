@@ -218,12 +218,6 @@ impl PickerState {
         }
     }
 
-    pub fn toggle_expand(&mut self, idx: usize) {
-        if !self.nodes[idx].children.is_empty() {
-            self.expanded[idx] = !self.expanded[idx];
-        }
-    }
-
     pub fn cursor_down(&mut self) {
         let visible = self.visible();
         if visible.is_empty() {

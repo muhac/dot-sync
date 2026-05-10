@@ -73,6 +73,37 @@ pub struct RestoreFlags {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Target name in .sync.yaml. New targets are created; existing
+    /// targets get fields appended.
+    pub name: String,
+
+    /// Format string written to .sync.yaml. Inferred from --source /
+    /// --target extension (.toml / .json / .jsonc) when omitted.
+    #[arg(long)]
+    pub format: Option<String>,
+
+    /// Path to the managed source fragment. Required for new targets;
+    /// optional when appending fields to an existing target.
+    #[arg(long)]
+    pub source: Option<String>,
+
+    /// Path to the real config file the application reads.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Sync path to add. Repeat to add multiple. When omitted and
+    /// stdin/stdout is a TTY, an interactive picker discovers fields
+    /// from the source or target file.
+    #[arg(long = "field")]
+    pub fields: Vec<String>,
+
+    /// Show what would be written to .sync.yaml without modifying it.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show configuration and file health without syncing.
@@ -92,4 +123,9 @@ pub enum Command {
 
     /// Restore a previous snapshot of source or target.
     Restore(#[command(flatten)] RestoreFlags),
+
+    /// Add a sync target or fields to .sync.yaml. Bootstraps the file
+    /// if it doesn't exist. With --field, runs non-interactively;
+    /// without --field on a TTY, opens an interactive tree picker.
+    Add(#[command(flatten)] AddArgs),
 }
