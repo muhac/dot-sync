@@ -3,6 +3,7 @@ mod config;
 mod discovery;
 mod document;
 mod path;
+mod picker_state;
 mod restore;
 mod status;
 mod sync;
