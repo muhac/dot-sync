@@ -187,6 +187,15 @@ Pinned and wildcard selectors:
   quoted-segment syntax: `includeIf."gitdir:~/work/".path`. Quoting
   is required when the subsection contains `.` `[` `]` `"` or
   whitespace.
+- **Case-sensitive matching (diverges from git).** git itself
+  treats section / subsection / key names case-insensitively, but
+  dot-sync's path syntax is case-sensitive across all backends, and
+  forcing gitconfig into the same model catches typos in
+  `.sync.yaml`. If the path's section / subsection / key bytes
+  don't exactly match what's in the file, `get` returns absent and
+  `set` bails with a `case-mismatches existing section` error
+  pointing at the offender. Use the case from your file (the `add`
+  picker emits canonical case automatically).
 - **No array selectors.** gitconfig has no arrays of objects, so
   `arr[name="x"]` / `arr[name]` are rejected. The closest construct
   — multivar (multiple `remote.origin.fetch =` lines under one
@@ -204,6 +213,18 @@ Pinned and wildcard selectors:
   git's grammar (alphanumeric + dash, leading alphabetic for keys);
   `gix-config` rejects e.g. `new_section` (underscore) at write
   time.
+- **Mixed indentation, end-of-line comments.** Tab-indented and
+  space-indented sections coexist and round-trip byte-identically.
+  Trailing `;` and `#` comments on a value line are preserved on
+  read (`get` returns the value alone) and on write (the comment
+  stays put after a `set`).
+- **Backslash-continued multi-line values are rejected.** git
+  allows ending a value line with `\` to continue on the next, but
+  `gix-config` 0.56 parses these incorrectly and would mangle the
+  file on the first write. dot-sync detects the marker bytes at
+  load time and refuses the file rather than silently corrupt it
+  — inline the value or remove the continuation. This guard
+  drops out once gitoxide ships a fix.
 - **Cosmetic quirk on insert.** When a new key lands inside an
   existing section, `gix-config` places the line at the very end of
   the section's body — after any trailing blank line. The data is
