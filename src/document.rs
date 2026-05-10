@@ -1874,8 +1874,98 @@ impl Document for GitConfigDocument {
     }
 
     fn discover_field_tree(&self) -> FieldTree {
-        unimplemented!("GitConfigDocument::discover_field_tree — wired in a later commit")
+        // Walk every section in the file and bucket its keys by
+        // (section name, optional subsection name). Sections / keys
+        // that appear more than once collapse — git-config allows
+        // splitting a section across multiple `[user]` headers, but
+        // for picker purposes we just want a deduped list of paths.
+        let mut by_section: BTreeMap<String, BTreeMap<Option<String>, Vec<String>>> =
+            BTreeMap::new();
+        for section in self.file.sections() {
+            let header = section.header();
+            let section_name = header.name().to_string();
+            let subsection_name = header.subsection_name().map(|b| b.to_string());
+            let body = section.body();
+            let bucket = by_section
+                .entry(section_name.clone())
+                .or_default()
+                .entry(subsection_name)
+                .or_default();
+
+            // value_names() may yield the same key multiple times for
+            // multivar lines. Dedup, then drop the multivar entries
+            // entirely — they won't round-trip through dot-sync's
+            // single-value sync model, and surfacing them in the
+            // picker would be a footgun.
+            let mut seen: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for value_name in body.value_names() {
+                let key = value_name.to_string();
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                if body.values(&key).len() > 1 {
+                    continue;
+                }
+                if !bucket.contains(&key) {
+                    bucket.push(key);
+                }
+            }
+        }
+
+        let mut roots = Vec::new();
+        for (section_name, subsections) in by_section {
+            let mut section_children: Vec<FieldNode> = Vec::new();
+            for (sub_opt, keys) in subsections {
+                match sub_opt {
+                    None => {
+                        for key in keys {
+                            let path = leaf_path(&[&section_name, &key]);
+                            section_children.push(FieldNode::leaf(key, path));
+                        }
+                    }
+                    Some(sub) => {
+                        let mut sub_children = Vec::new();
+                        for key in keys {
+                            let path = leaf_path(&[&section_name, &sub, &key]);
+                            sub_children.push(FieldNode::leaf(key, path));
+                        }
+                        // Subsection has no path of its own — gitconfig
+                        // can't address `[remote "origin"]` as a value,
+                        // only its keys. VirtualGroup matches the
+                        // "select children individually, no whole" cycle.
+                        section_children.push(FieldNode::virtual_group(
+                            format!("\"{sub}\""),
+                            sub_children,
+                        ));
+                    }
+                }
+            }
+            if !section_children.is_empty() {
+                // Section header itself has no associated value either
+                // — same reasoning as for subsections. VirtualGroup so
+                // `[x]` (whole-subtree) is correctly unavailable.
+                roots.push(FieldNode::virtual_group(section_name, section_children));
+            }
+        }
+        FieldTree { roots }
     }
+}
+
+/// Build a `FieldPath` from raw segment names, no selectors. Subsection
+/// names containing characters that would confuse the path parser
+/// (dots, brackets, quotes) round-trip through `Segment.name` directly,
+/// not through `parse` — so we use `from_segments` instead of building
+/// and reparsing a string.
+fn leaf_path(parts: &[&str]) -> FieldPath {
+    let segments = parts
+        .iter()
+        .map(|name| Segment {
+            name: (*name).to_string(),
+            select: None,
+        })
+        .collect();
+    FieldPath::from_segments(segments)
 }
 
 #[cfg(test)]
@@ -3666,5 +3756,155 @@ mod gitconfig_tests {
         let wildcard = FieldPath::parse("arr[k].field").unwrap();
         let err = doc.expand(&wildcard).unwrap_err();
         assert!(err.to_string().contains("no arrays of objects"), "msg: {err}");
+    }
+
+    // ----- discover_field_tree -----
+
+    use crate::discovery::FieldNodeKind;
+
+    fn paths_in(tree: &crate::discovery::FieldTree) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(node: &crate::discovery::FieldNode, out: &mut Vec<String>) {
+            if let Some(p) = &node.path {
+                out.push(p.to_string());
+            }
+            for c in &node.children {
+                walk(c, out);
+            }
+        }
+        for r in &tree.roots {
+            walk(r, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn discover_returns_empty_tree_for_empty_doc() {
+        let doc = GitConfigDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty());
+    }
+
+    #[test]
+    fn discover_emits_section_keys_as_leaves() {
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+\temail = a@b
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(paths.contains(&"user.name".to_string()), "{paths:?}");
+        assert!(paths.contains(&"user.email".to_string()), "{paths:?}");
+        // Section is a VirtualGroup so the picker offers [*] but not [x].
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].kind, FieldNodeKind::VirtualGroup);
+        assert!(tree.roots[0].path.is_none(), "section should have no path");
+    }
+
+    #[test]
+    fn discover_nests_subsections_as_virtual_groups() {
+        let (_dir, doc) = doc_from(
+            "\
+[remote \"origin\"]
+\turl = https://example.com/origin
+[remote \"upstream\"]
+\turl = https://example.com/up
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(paths.contains(&"remote.origin.url".to_string()), "{paths:?}");
+        assert!(paths.contains(&"remote.upstream.url".to_string()), "{paths:?}");
+        // remote → [origin (vgroup), upstream (vgroup)]
+        assert_eq!(tree.roots.len(), 1);
+        let remote = &tree.roots[0];
+        assert_eq!(remote.kind, FieldNodeKind::VirtualGroup);
+        assert!(remote.path.is_none());
+        assert_eq!(remote.children.len(), 2);
+        for sub in &remote.children {
+            assert_eq!(sub.kind, FieldNodeKind::VirtualGroup);
+            assert!(sub.path.is_none());
+        }
+    }
+
+    #[test]
+    fn discover_skips_multivar_keys() {
+        // [remote "origin"] has both a single-valued `url` and a
+        // multivar `fetch`. Only `url` should appear in the tree —
+        // multivar can't round-trip through dot-sync.
+        let (_dir, doc) = doc_from(
+            "\
+[remote \"origin\"]
+\turl = https://example.com
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert!(paths.contains(&"remote.origin.url".to_string()), "{paths:?}");
+        assert!(
+            !paths.contains(&"remote.origin.fetch".to_string()),
+            "multivar fetch should be hidden, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn discover_handles_subsection_without_special_chars() {
+        // `gitdir:~/work/` has no characters that the path parser
+        // treats specially (no . [ ] " or whitespace), so its Segment
+        // serializes unquoted. The path still round-trips.
+        let (_dir, doc) = doc_from(
+            "\
+[includeIf \"gitdir:~/work/\"]
+\tpath = ~/.gitconfig-work
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["includeIf.gitdir:~/work/.path".to_string()]);
+        let parsed = FieldPath::parse(&paths[0]).unwrap();
+        assert_eq!(doc.get(&parsed), Some("~/.gitconfig-work".to_string()));
+    }
+
+    #[test]
+    fn discover_quotes_subsections_with_dots() {
+        // Subsection contains a `.` — Segment.name carries it
+        // verbatim and the path's Display impl quotes the segment so
+        // re-parsing stays unambiguous.
+        let (_dir, doc) = doc_from(
+            "\
+[branch \"feature.x\"]
+\tremote = origin
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["branch.\"feature.x\".remote".to_string()]);
+        let parsed = FieldPath::parse(&paths[0]).unwrap();
+        assert_eq!(doc.get(&parsed), Some("origin".to_string()));
+    }
+
+    #[test]
+    fn discover_paths_round_trip_to_get() {
+        // Every leaf path the picker emits must actually fetch a value
+        // when handed back to `get`. This is the picker's foundational
+        // contract.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[remote \"origin\"]
+\turl = https://example.com/o
+",
+        );
+        let tree = doc.discover_field_tree();
+        for path_str in paths_in(&tree) {
+            let path = FieldPath::parse(&path_str).unwrap();
+            assert!(doc.get(&path).is_some(), "no value at picker path {path_str}");
+        }
     }
 }
