@@ -586,23 +586,35 @@ pub(crate) fn sanitize_for_filename(path: &Path) -> String {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let file_name = path
+    // Resolve symlinks before writing: a tmp+rename next to the symlink would
+    // replace the link with a regular file, silently breaking dotfile setups
+    // where the destination is a link into a managed directory.
+    let resolved = resolve_symlink_target(path)?;
+    let file_name = resolved
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid write target: {}", path.display()))?;
-    let tmp = path.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
+        .ok_or_else(|| anyhow!("invalid write target: {}", resolved.display()))?;
+    let tmp = resolved.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
 
     fs::write(&tmp, content)
         .with_context(|| format!("failed to stage write at {}", tmp.display()))?;
 
     // POSIX rename is atomic only on the same filesystem; tmp lives next to
-    // the destination, so this is safe.
-    if let Err(error) = fs::rename(&tmp, path) {
+    // the (resolved) destination, so this is safe.
+    if let Err(error) = fs::rename(&tmp, &resolved) {
         let _ = fs::remove_file(&tmp);
         return Err(error)
-            .with_context(|| format!("failed to publish write to {}", path.display()));
+            .with_context(|| format!("failed to publish write to {}", resolved.display()));
     }
     Ok(())
+}
+
+fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve symlink {}", path.display())),
+        _ => Ok(path.to_path_buf()),
+    }
 }
 
 fn backup_file(path: &Path) -> Result<PathBuf> {
@@ -1128,6 +1140,29 @@ project_doc_fallback_filenames = ["AGENTS.md"]
         let snapshot_path = outcome.snapshot.expect("expected snapshot path");
         assert_eq!(fs::read_to_string(&snapshot_path).unwrap(), "old = true\n");
         assert!(snapshot_path.starts_with(snap.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_writes_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let real_dir = tempdir().unwrap();
+        let link_dir = tempdir().unwrap();
+        let real_path = real_dir.path().join("real.toml");
+        let link_path = link_dir.path().join("link.toml");
+        fs::write(&real_path, "old\n").unwrap();
+        symlink(&real_path, &link_path).unwrap();
+
+        atomic_write(&link_path, "new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&real_path).unwrap(), "new\n");
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink at link_path was replaced by a regular file"
+        );
     }
 
     #[test]
