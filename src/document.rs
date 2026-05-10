@@ -2257,4 +2257,238 @@ enabled = true
         assert!(msg.contains("ambiguous wildcard"), "msg: {msg}");
         assert!(msg.contains("\"github\""), "msg: {msg}");
     }
+
+    // ----- JSON parity tests with the TOML side -----
+    //
+    // The engine is generic over `Document`, but get/set/expand/table_conflict
+    // dispatch through backend-specific helpers. Each TOML test below has a
+    // corresponding JSON test exercising the same edge case so a regression in
+    // either backend's helper code surfaces with the same expected behavior.
+
+    #[test]
+    fn json_pinned_set_creates_array_when_missing() {
+        // Pinned write into a doc that has no array key at all — the
+        // helper must seed the array, not fail.
+        let mut doc = JsonDocument::empty();
+        let path = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        doc.set(&path, json!(true)).unwrap();
+        assert_eq!(doc.get(&path), Some(json!(true)));
+    }
+
+    #[test]
+    fn json_pinned_get_returns_none_when_no_match() {
+        // Array exists but no element satisfies the selector — get must
+        // return None, not panic or pick a wrong element.
+        let doc = json_doc(r#"{"mcpServers": [{"name": "linear"}]}"#);
+        let path = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        assert!(doc.get(&path).is_none());
+    }
+
+    #[test]
+    fn json_expand_returns_pattern_unchanged_for_no_wildcard() {
+        // No wildcard segment means the pattern is its own resolution —
+        // single ResolvedPath with empty identity, equal to the input.
+        let doc = JsonDocument::empty();
+        let path = FieldPath::parse("tui.theme").unwrap();
+        let resolved = doc.expand(&path).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].identity.is_empty());
+        assert_eq!(resolved[0].path, path);
+    }
+
+    #[test]
+    fn json_expand_returns_empty_when_array_missing() {
+        // Wildcard against a missing array — empty resolution, no error.
+        let doc = JsonDocument::empty();
+        let pattern = FieldPath::parse("mcpServers[name].enabled").unwrap();
+        let resolved = doc.expand(&pattern).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn json_expand_errors_on_pinned_multi_match() {
+        // Two array items share the same selector value — surgical sync
+        // requires unambiguous identity, so this is an error.
+        let doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "github", "enabled": false}]}"#,
+        );
+        let pattern = FieldPath::parse("mcpServers[name=\"github\"].enabled").unwrap();
+        let err = doc.expand(&pattern).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous pinned"), "msg: {msg}");
+        assert!(msg.contains("name=\"github\""), "msg: {msg}");
+        assert!(msg.contains("2 items"), "msg: {msg}");
+    }
+
+    #[test]
+    fn json_expand_combines_pinned_and_wildcard_segments() {
+        let doc = json_doc(
+            r#"{
+              "providers": [
+                {"name": "openai", "models": [{"id": "gpt-4", "enabled": true}, {"id": "gpt-5", "enabled": false}]},
+                {"name": "anthropic", "models": [{"id": "opus", "enabled": true}]}
+              ]
+            }"#,
+        );
+        // Pinned then Wildcard: only openai's models, but every model.
+        let pattern = FieldPath::parse("providers[name=\"openai\"].models[id].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec![s("gpt-4")]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"openai\"].models[id=\"gpt-4\"].enabled"
+        );
+        assert_eq!(resolved[1].identity, vec![s("gpt-5")]);
+    }
+
+    #[test]
+    fn json_expand_combines_wildcard_then_pinned_segments() {
+        let doc = json_doc(
+            r#"{
+              "providers": [
+                {"name": "openai", "models": [{"id": "gpt-4", "enabled": true}, {"id": "gpt-5", "enabled": false}]},
+                {"name": "anthropic", "models": [{"id": "gpt-4", "enabled": true}]}
+              ]
+            }"#,
+        );
+        // Wildcard then Pinned: every provider, but only its `gpt-4` model.
+        let pattern = FieldPath::parse("providers[name].models[id=\"gpt-4\"].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec![s("anthropic")]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"anthropic\"].models[id=\"gpt-4\"].enabled"
+        );
+        assert_eq!(resolved[1].identity, vec![s("openai")]);
+    }
+
+    #[test]
+    fn json_expand_combines_wildcard_then_wildcard_segments() {
+        let doc = json_doc(
+            r#"{
+              "providers": [
+                {"name": "openai", "models": [{"id": "gpt-4", "enabled": true}, {"id": "gpt-5", "enabled": false}]},
+                {"name": "anthropic", "models": [{"id": "opus", "enabled": true}]}
+              ]
+            }"#,
+        );
+        // Wildcard then Wildcard: identity is a 2-tuple (provider, model).
+        let pattern = FieldPath::parse("providers[name].models[id].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].identity, vec![s("anthropic"), s("opus")]);
+        assert_eq!(resolved[1].identity, vec![s("openai"), s("gpt-4")]);
+        assert_eq!(resolved[2].identity, vec![s("openai"), s("gpt-5")]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "providers[name=\"anthropic\"].models[id=\"opus\"].enabled"
+        );
+    }
+
+    #[test]
+    fn json_expand_wildcard_at_last_segment_yields_whole_items() {
+        // Pattern ends in a wildcard with no further descent — each
+        // resolved path returns the whole matched object via `get`.
+        let doc = json_doc(
+            r#"{"mcpServers": [{"name": "github", "enabled": true}, {"name": "linear", "enabled": false}]}"#,
+        );
+        let pattern = FieldPath::parse("mcpServers[name]").unwrap();
+        let mut resolved = doc.expand(&pattern).unwrap();
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
+        assert_eq!(resolved[0].path.to_string(), "mcpServers[name=\"github\"]");
+
+        // The resolved path returns the whole item when used with `get`.
+        let item = doc.get(&resolved[0].path).expect("item present");
+        let obj = item.as_object().expect("object");
+        assert_eq!(obj.get("enabled"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn json_expand_skips_items_lacking_the_identifier_key() {
+        // An item without the wildcard's identifier key drops out of the
+        // expansion silently (no error) — same policy as the TOML side.
+        let doc =
+            json_doc(r#"{"mcpServers": [{"name": "github", "enabled": true}, {"enabled": true}]}"#);
+        let pattern = FieldPath::parse("mcpServers[name].enabled").unwrap();
+        let resolved = doc.expand(&pattern).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
+    }
+
+    #[test]
+    fn json_table_conflict_warns_when_wildcard_target_is_not_an_array() {
+        // Wildcard against a non-array value reports the conflict at
+        // `<key>[<id>]` so the user can see the offending position
+        // including the selector marker.
+        let doc = json_doc(r#"{"mcpServers": "not an array"}"#);
+        let path = FieldPath::parse("mcpServers[name].enabled").unwrap();
+        let conflict = doc.table_conflict(&path).expect("expected conflict");
+        assert_eq!(conflict.path, "mcpServers[name]");
+        assert!(
+            conflict.value.contains("not an array"),
+            "value should include the offender's text: {conflict:?}"
+        );
+    }
+
+    #[test]
+    fn json_table_conflict_warns_for_single_segment_selector_against_scalar() {
+        // Whole-item sync `arr[name="x"]` and `arr[name]` (selector at the
+        // only segment) need the same array-shape warning as
+        // `arr[name].field`. Mirrors the TOML regression test.
+        let doc = json_doc(r#"{"arr": "scalar"}"#);
+        let pinned = FieldPath::parse(r#"arr[name="github"]"#).unwrap();
+        let wildcard = FieldPath::parse("arr[name]").unwrap();
+        assert!(doc.table_conflict(&pinned).is_some());
+        assert!(doc.table_conflict(&wildcard).is_some());
+    }
+
+    #[test]
+    fn json_table_conflict_does_not_warn_for_single_plain_key_segment() {
+        // Plain leaf access — `tui` against `"tui": "monokai"` is fine,
+        // leaf can be any value type.
+        let doc = json_doc(r#"{"tui": "monokai"}"#);
+        let path = FieldPath::parse("tui").unwrap();
+        assert!(doc.table_conflict(&path).is_none());
+    }
+
+    #[test]
+    fn json_conflict_prefix_escapes_pinned_value_quotes() {
+        // The container at `arr` is a scalar, so the conflict prefix
+        // includes the selector verbatim. The selector value contains a
+        // literal `"` which must be backslash-escaped so the prefix
+        // round-trips back through the parser.
+        let doc = json_doc(r#"{"arr": "scalar"}"#);
+        let path = FieldPath::parse(r#"arr[name="he said \"hi\""].field"#).unwrap();
+        let conflict = doc.table_conflict(&path).expect("expected conflict");
+        assert_eq!(conflict.path, r#"arr[name="he said \"hi\""]"#);
+        assert!(
+            FieldPath::parse(&conflict.path).is_ok(),
+            "prefix {:?} must reparse",
+            conflict.path
+        );
+    }
+
+    #[test]
+    fn json_pinned_set_then_get_works_through_nested_arrays() {
+        // Set deep through pinned + pinned, then get back. Locks the
+        // descend_set / descend_get pairing on a multi-level path.
+        let mut doc = json_doc(
+            r#"{
+              "providers": [
+                {"name": "openai", "models": [{"id": "gpt-4", "enabled": false}]}
+              ]
+            }"#,
+        );
+        let path =
+            FieldPath::parse("providers[name=\"openai\"].models[id=\"gpt-4\"].enabled").unwrap();
+        doc.set(&path, json!(true)).unwrap();
+        assert_eq!(doc.get(&path), Some(json!(true)));
+    }
 }
