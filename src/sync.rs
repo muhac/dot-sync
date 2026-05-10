@@ -434,7 +434,26 @@ fn write_document(path: &Path, content: String, backup: bool) -> Result<()> {
         backup_file(path)?;
     }
 
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    atomic_write(path, &content)
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid write target: {}", path.display()))?;
+    let tmp = path.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
+
+    fs::write(&tmp, content)
+        .with_context(|| format!("failed to stage write at {}", tmp.display()))?;
+
+    // POSIX rename is atomic only on the same filesystem; tmp lives next to
+    // the destination, so this is safe.
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error)
+            .with_context(|| format!("failed to publish write to {}", path.display()));
+    }
     Ok(())
 }
 
@@ -798,6 +817,23 @@ tui_theme = "monokai"
             .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
             .count();
         assert_eq!(backups, 0);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_remnant_after_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old = true\n").unwrap();
+
+        write_document(&path, "new = true\n".to_string(), false).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
+        let tmp_files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(tmp_files.is_empty(), "leftover tmp files: {tmp_files:?}");
     }
 
     #[test]
