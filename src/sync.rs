@@ -31,6 +31,14 @@ impl fmt::Display for Direction {
 pub struct SyncOptions {
     pub dry_run: bool,
     pub backup: bool,
+    pub conflict: ConflictMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictMode {
+    TargetWins,
+    SourceWins,
+    FailOnConflict,
 }
 
 #[derive(Debug)]
@@ -66,11 +74,57 @@ pub fn run(
     options: SyncOptions,
 ) -> Result<()> {
     let targets = select_targets(config, name)?;
+
+    // For fail-on-conflict, every selected target must be checked before
+    // any write happens. Otherwise an earlier target could be modified
+    // while a later one bails, violating the "write nothing" promise.
+    if matches!(direction, Direction::Sync)
+        && matches!(options.conflict, ConflictMode::FailOnConflict)
+    {
+        preflight_fail_on_conflict(&targets)?;
+    }
+
     for target in targets {
         run_target(target, direction, options)
             .with_context(|| format!("failed to process target {}", target.name))?;
     }
     Ok(())
+}
+
+fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
+    let mut violators: Vec<(String, Vec<Conflict>)> = Vec::new();
+    for target in targets {
+        let conflicts = target_conflicts(target)?;
+        if !conflicts.is_empty() {
+            violators.push((target.name.clone(), conflicts));
+        }
+    }
+    if violators.is_empty() {
+        return Ok(());
+    }
+    for (name, conflicts) in &violators {
+        println!("{name} sync preflight");
+        print_conflicts(conflicts);
+    }
+    let total: usize = violators.iter().map(|(_, c)| c.len()).sum();
+    bail!(
+        "fail-on-conflict: {total} conflicting field(s) across {} target(s)",
+        violators.len()
+    );
+}
+
+fn target_conflicts(target: &TargetConfig) -> Result<Vec<Conflict>> {
+    AnyDocument::validate_format(&target.format).map_err(|error| {
+        anyhow!(
+            "target '{}' uses format '{}': {error}",
+            target.name,
+            target.format
+        )
+    })?;
+    let source = AnyDocument::load(&target.format, &target.source, true)?;
+    let target_doc = AnyDocument::load(&target.format, &target.target, true)?;
+    let sync_paths = parse_paths(target)?;
+    Ok(collect_conflicts(&source, &target_doc, &sync_paths))
 }
 
 fn select_targets<'a>(
@@ -116,7 +170,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     let changes = match direction {
         Direction::Pull => pull(&mut source, &target_doc, &sync_paths)?,
         Direction::Push => push(&source, &mut target_doc, &sync_paths)?,
-        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths)?,
+        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths, options.conflict)?,
     };
 
     report_changes(target, direction, options, &changes, &warnings);
@@ -131,14 +185,35 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
         .iter()
         .any(|change| matches!(change.destination, Destination::Target));
 
+    let snapshot_dir = std::env::temp_dir().join("dot-sync");
+
     if writes_source {
-        write_document(&target.source, source.render(), options.backup)?;
+        let outcome = write_document(
+            &target.source,
+            source.render(),
+            options.backup,
+            &snapshot_dir,
+        )?;
+        report_write(DocumentRole::Source, &target.source, &outcome);
     }
     if writes_target {
-        write_document(&target.target, target_doc.render(), options.backup)?;
+        let outcome = write_document(
+            &target.target,
+            target_doc.render(),
+            options.backup,
+            &snapshot_dir,
+        )?;
+        report_write(DocumentRole::Target, &target.target, &outcome);
     }
 
     Ok(())
+}
+
+fn report_write(role: DocumentRole, path: &Path, outcome: &WriteOutcome) {
+    println!("  wrote {}: {}", role.label(), path.display());
+    if let Some(snapshot) = &outcome.snapshot {
+        println!("    recovery: {}", snapshot.display());
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,7 +305,16 @@ fn sync(
     source: &mut dyn Document,
     target: &mut dyn Document,
     paths: &[ParsedPath],
+    mode: ConflictMode,
 ) -> Result<Vec<Change>> {
+    if matches!(mode, ConflictMode::FailOnConflict) {
+        let conflicts = collect_conflicts(source, target, paths);
+        if !conflicts.is_empty() {
+            print_conflicts(&conflicts);
+            bail!("fail-on-conflict: {} conflicting field(s)", conflicts.len());
+        }
+    }
+
     let mut changes = Vec::new();
     for path in paths {
         let source_item = source.get(&path.path);
@@ -238,12 +322,33 @@ fn sync(
         match (source_item, target_item) {
             (None, None) => continue,
             (Some(s), Some(t)) if same_item(&s, &t) => continue,
-            (_, Some(_)) => {
+            (Some(_), Some(_)) => {
+                // Both sides have a value and they differ — conflict mode picks the winner.
+                let (into, from, dest) = match mode {
+                    ConflictMode::TargetWins => (
+                        source as &mut dyn Document,
+                        target as &dyn Document,
+                        Destination::Source,
+                    ),
+                    ConflictMode::SourceWins => (
+                        target as &mut dyn Document,
+                        source as &dyn Document,
+                        Destination::Target,
+                    ),
+                    ConflictMode::FailOnConflict => unreachable!("checked above"),
+                };
+                if let Some(change) = apply_one_way(into, from, path, dest)? {
+                    changes.push(change);
+                }
+            }
+            (None, Some(_)) => {
+                // Only target has the value; fill source regardless of mode.
                 if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
                     changes.push(change);
                 }
             }
             (Some(_), None) => {
+                // Only source has the value; fill target regardless of mode.
                 if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
                     changes.push(change);
                 }
@@ -251,6 +356,43 @@ fn sync(
         }
     }
     Ok(changes)
+}
+
+fn collect_conflicts(
+    source: &dyn Document,
+    target: &dyn Document,
+    paths: &[ParsedPath],
+) -> Vec<Conflict> {
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let (Some(s), Some(t)) = (source.get(&path.path), target.get(&path.path)) else {
+            continue;
+        };
+        if same_item(&s, &t) {
+            continue;
+        }
+        conflicts.push(Conflict {
+            path: path.raw.clone(),
+            source_value: summarize_item(Some(&s)),
+            target_value: summarize_item(Some(&t)),
+        });
+    }
+    conflicts
+}
+
+fn print_conflicts(conflicts: &[Conflict]) {
+    for conflict in conflicts {
+        println!("  conflict: {}", conflict.path);
+        println!("    source: {}", conflict.source_value);
+        println!("    target: {}", conflict.target_value);
+    }
+}
+
+#[derive(Debug)]
+struct Conflict {
+    path: String,
+    source_value: String,
+    target_value: String,
 }
 
 fn apply_one_way(
@@ -424,7 +566,17 @@ fn report_changes(
     }
 }
 
-fn write_document(path: &Path, content: String, backup: bool) -> Result<()> {
+#[derive(Debug, Default)]
+struct WriteOutcome {
+    snapshot: Option<PathBuf>,
+}
+
+fn write_document(
+    path: &Path,
+    content: String,
+    backup: bool,
+    snapshot_dir: &Path,
+) -> Result<WriteOutcome> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -434,8 +586,81 @@ fn write_document(path: &Path, content: String, backup: bool) -> Result<()> {
         backup_file(path)?;
     }
 
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    let snapshot = snapshot_existing(path, snapshot_dir)?;
+    atomic_write(path, &content)?;
+    Ok(WriteOutcome { snapshot })
+}
+
+pub(crate) fn snapshot_existing(path: &Path, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::create_dir_all(snapshot_dir).with_context(|| {
+        format!(
+            "failed to create snapshot directory {}",
+            snapshot_dir.display()
+        )
+    })?;
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let stem = sanitize_for_filename(path);
+    let mut snapshot = snapshot_dir.join(format!("{stem}.{timestamp}"));
+    let mut index = 0;
+    while snapshot.exists() {
+        index += 1;
+        snapshot = snapshot_dir.join(format!("{stem}.{timestamp}.{index}"));
+    }
+    fs::copy(path, &snapshot).with_context(|| {
+        format!(
+            "failed to snapshot {} to {}",
+            path.display(),
+            snapshot.display()
+        )
+    })?;
+    Ok(Some(snapshot))
+}
+
+pub(crate) fn sanitize_for_filename(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let trimmed = raw.trim_start_matches(['/', '\\']);
+    trimmed
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    // Resolve symlinks before writing: a tmp+rename next to the symlink would
+    // replace the link with a regular file, silently breaking dotfile setups
+    // where the destination is a link into a managed directory.
+    let resolved = resolve_symlink_target(path)?;
+    let file_name = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid write target: {}", resolved.display()))?;
+    let tmp = resolved.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
+
+    fs::write(&tmp, content)
+        .with_context(|| format!("failed to stage write at {}", tmp.display()))?;
+
+    // POSIX rename is atomic only on the same filesystem; tmp lives next to
+    // the (resolved) destination, so this is safe.
+    if let Err(error) = fs::rename(&tmp, &resolved) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error)
+            .with_context(|| format!("failed to publish write to {}", resolved.display()));
+    }
     Ok(())
+}
+
+fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve symlink {}", path.display())),
+        _ => Ok(path.to_path_buf()),
+    }
 }
 
 fn backup_file(path: &Path) -> Result<PathBuf> {
@@ -622,6 +847,7 @@ project_doc_fallback_filenames = ["CLAUDE.md"]
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -658,6 +884,7 @@ theme = "target"
             &mut source,
             &mut target,
             &parsed(&["tui.theme", "plugins.\"github@openai-curated\".enabled"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -694,6 +921,7 @@ tui_theme = "monokai"
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
 
@@ -725,9 +953,115 @@ tui_theme = "monokai"
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::TargetWins,
         )
         .unwrap();
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn sync_source_wins_overwrites_target_on_conflict() {
+        let mut source = toml_from("project_doc_max_bytes = 1\n");
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+
+        let changes = sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::SourceWins,
+        )
+        .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].destination, Destination::Target));
+        let new_target = target
+            .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+            .unwrap();
+        assert_eq!(new_target.as_value().unwrap().as_integer(), Some(1));
+        let preserved_source = source
+            .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+            .unwrap();
+        assert_eq!(
+            preserved_source.as_value().unwrap().as_integer(),
+            Some(1),
+            "source value should be untouched under source-wins"
+        );
+    }
+
+    #[test]
+    fn sync_source_wins_still_fills_missing_source() {
+        let mut source = toml_from("");
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+
+        sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes"]),
+            ConflictMode::SourceWins,
+        )
+        .unwrap();
+
+        assert_eq!(
+            source
+                .get(&FieldPath::parse("project_doc_max_bytes").unwrap())
+                .unwrap()
+                .as_value()
+                .unwrap()
+                .as_integer(),
+            Some(65536),
+            "missing-on-source case fills regardless of mode"
+        );
+    }
+
+    #[test]
+    fn sync_fail_on_conflict_bails_without_writing() {
+        let mut source = toml_from(
+            r#"
+project_doc_max_bytes = 1
+project_doc_fallback_filenames = ["AGENTS.md"]
+"#,
+        );
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+        let original_source = source.render();
+        let original_target = target.render();
+
+        let err = sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::FailOnConflict,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("fail-on-conflict"));
+        assert_eq!(source.render(), original_source);
+        assert_eq!(target.render(), original_target);
+    }
+
+    #[test]
+    fn sync_fail_on_conflict_succeeds_when_no_conflict() {
+        let mut source = toml_from("project_doc_max_bytes = 65536\n");
+        let mut target = toml_from(
+            r#"
+project_doc_max_bytes = 65536
+project_doc_fallback_filenames = ["AGENTS.md"]
+"#,
+        );
+
+        sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
+            ConflictMode::FailOnConflict,
+        )
+        .unwrap();
+
+        assert!(
+            source
+                .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
+                .is_some(),
+            "missing-on-source case still fills under fail-on-conflict"
+        );
     }
 
     #[test]
@@ -750,6 +1084,7 @@ tui_theme = "monokai"
             SyncOptions {
                 dry_run: false,
                 backup: true,
+                conflict: ConflictMode::TargetWins,
             },
         )
         .unwrap();
@@ -777,6 +1112,7 @@ tui_theme = "monokai"
             SyncOptions {
                 dry_run: true,
                 backup: true,
+                conflict: ConflictMode::TargetWins,
             },
         )
         .unwrap_err();
@@ -786,10 +1122,11 @@ tui_theme = "monokai"
     #[test]
     fn write_document_skips_backup_by_default() {
         let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "old = true\n").unwrap();
 
-        write_document(&path, "new = true\n".to_string(), false).unwrap();
+        write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
         let backups = fs::read_dir(dir.path())
@@ -801,12 +1138,31 @@ tui_theme = "monokai"
     }
 
     #[test]
-    fn write_document_creates_backup_when_requested() {
+    fn atomic_write_leaves_no_tmp_remnant_after_success() {
         let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "old = true\n").unwrap();
 
-        write_document(&path, "new = true\n".to_string(), true).unwrap();
+        write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
+        let tmp_files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(tmp_files.is_empty(), "leftover tmp files: {tmp_files:?}");
+    }
+
+    #[test]
+    fn write_document_creates_backup_when_requested() {
+        let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old = true\n").unwrap();
+
+        write_document(&path, "new = true\n".to_string(), true, snap.path()).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
         let backups = fs::read_dir(dir.path())
@@ -815,5 +1171,56 @@ tui_theme = "monokai"
             .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn write_document_creates_recovery_snapshot_for_existing_file() {
+        let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old = true\n").unwrap();
+
+        let outcome =
+            write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
+
+        let snapshot_path = outcome.snapshot.expect("expected snapshot path");
+        assert_eq!(fs::read_to_string(&snapshot_path).unwrap(), "old = true\n");
+        assert!(snapshot_path.starts_with(snap.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_writes_through_symlink() {
+        use std::os::unix::fs::symlink;
+        let real_dir = tempdir().unwrap();
+        let link_dir = tempdir().unwrap();
+        let real_path = real_dir.path().join("real.toml");
+        let link_path = link_dir.path().join("link.toml");
+        fs::write(&real_path, "old\n").unwrap();
+        symlink(&real_path, &link_path).unwrap();
+
+        atomic_write(&link_path, "new\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&real_path).unwrap(), "new\n");
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink at link_path was replaced by a regular file"
+        );
+    }
+
+    #[test]
+    fn write_document_skips_snapshot_for_new_file() {
+        let dir = tempdir().unwrap();
+        let snap = tempdir().unwrap();
+        let path = dir.path().join("brand-new.toml");
+
+        let outcome =
+            write_document(&path, "new = true\n".to_string(), false, snap.path()).unwrap();
+
+        assert!(outcome.snapshot.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new = true\n");
     }
 }

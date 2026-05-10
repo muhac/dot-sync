@@ -103,8 +103,14 @@ dot-sync sync
 ```
 
 All commands support `--dry-run` to show planned changes without writing either
-file. Real writes do not create backups by default; pass `--backup` to create a
-timestamped backup before writing.
+file. Pass `--backup` to also keep a persistent timestamped copy
+(`<file>.bak.<timestamp>`) next to the destination.
+
+Every real write is atomic (write to a hidden tmp next to the destination, then
+`rename`). Before each overwrite, the previous contents are copied to
+`$TMPDIR/dot-sync/<sanitized-path>.<timestamp>` so you can recover
+in-the-moment without cluttering the working directory. The path is printed
+under each `wrote` line; the OS reclaims the snapshots over time.
 
 ```sh
 dot-sync pull codex --dry-run
@@ -112,18 +118,55 @@ dot-sync push codex --backup
 dot-sync sync --dry-run
 ```
 
+`sync` accepts mutually exclusive conflict-mode flags (default: `--target-wins`):
+
+```sh
+dot-sync sync codex --target-wins        # (default) target value wins on conflict
+dot-sync sync codex --source-wins        # source value wins on conflict
+dot-sync sync codex --fail-on-conflict   # exit non-zero, write nothing, list conflicts
+```
+
+`pull` is always target-wins by definition; `push` is always source-wins.
+
+## Recovering from a bad write
+
+Every real write captures the previous contents into
+`$TMPDIR/dot-sync/<sanitized>.<timestamp>` and prints the path next to the
+write. Use `restore` to roll back from there or from any persistent
+`<file>.bak.<timestamp>` that `--backup` produced earlier — both pools are
+listed together, sorted newest first.
+
+```sh
+dot-sync restore codex --list           # show numbered candidates (recovery + backup)
+dot-sync restore codex                  # restore newest snapshot of target
+dot-sync restore codex --pick 3         # restore the 3rd candidate from the list
+dot-sync restore codex --at 20260510-15 # restore by timestamp prefix
+dot-sync restore codex --source         # restore source instead of target
+dot-sync restore codex --dry-run        # show what would happen
+```
+
+The restore itself is atomic and takes a fresh recovery snapshot of the
+file before overwriting, so an unwanted restore is itself recoverable.
+When timestamps tie, persistent `[backup]` entries are preferred over
+`[recovery]` (they are an explicit user signal).
+
 All three commands share a single rule: **only fields listed in `sync` are
 touched, and nothing is ever removed**. Fields outside `sync` are preserved on
 both sides. `pull` and `push` are mirror images; `sync` is exactly their union.
 
-| State of a listed field            | `pull` (target → source) | `push` (source → target) | `sync` (both ways)        |
+| State of a listed field            | `pull` (target → source) | `push` (source → target) | `sync` (both ways, default `--target-wins`) |
 | ---------------------------------- | ------------------------ | ------------------------ | ------------------------- |
 | Both sides equal                   | skip                     | skip                     | skip                      |
-| Both sides differ                  | source := target         | target := source         | source := target (target wins) |
+| Both sides differ                  | source := target         | target := source         | source := target (mode-dependent) |
 | Only target has it                 | source := target (add)   | skip                     | source := target (add)    |
 | Only source has it                 | skip                     | target := source (add)   | target := source (add)    |
 | Neither has it                     | skip                     | skip                     | skip                      |
 | Field not in `sync:` list          | untouched                | untouched                | untouched                 |
+
+Under `--source-wins`, "Both sides differ" flips to `target := source`. Under
+`--fail-on-conflict`, the same row aborts with a non-zero exit and no writes.
+Other rows are unaffected by mode — "missing on one side" always fills, never
+fails.
 
 To stop syncing a field, remove it from `sync:` in `.sync.yaml`. The tool
 will not delete it from either file — clean up by hand if you want it gone.

@@ -81,6 +81,17 @@ fn dot_sync_in(cwd: impl Into<PathBuf>) -> Command {
     command
 }
 
+/// Override the OS temp directory for a child process. On Unix, Rust's
+/// std::env::temp_dir reads `TMPDIR`; on Windows, GetTempPath2 reads
+/// `TMP`/`TEMP` and ignores `TMPDIR`. Set all three so tests work on both.
+fn override_temp_dir(cmd: &mut Command, dir: &Path) {
+    cmd.env("TMPDIR", dir).env("TMP", dir).env("TEMP", dir);
+}
+
+fn read_normalized(path: &Path) -> String {
+    normalize_newlines(&read_file(path))
+}
+
 #[test]
 fn sync_discovers_config_in_current_directory() {
     let fixture = Fixture::load("toml", "codex_basic_sync");
@@ -527,6 +538,250 @@ fn malformed_config_exits_with_parse_error() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed to parse"));
+}
+
+#[test]
+fn write_emits_recovery_snapshot_for_existing_files() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    let assert = cmd
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("wrote target:"))
+        .stdout(predicate::str::contains("recovery:"));
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let snapshot_line = output
+        .lines()
+        .find(|line| line.contains("recovery:"))
+        .unwrap();
+    let snapshot_path = PathBuf::from(snapshot_line.split_once("recovery:").unwrap().1.trim());
+    assert!(
+        snapshot_path.starts_with(snap.path().join("dot-sync")),
+        "snapshot {snapshot_path:?} not under {:?}",
+        snap.path().join("dot-sync"),
+    );
+    assert!(snapshot_path.exists(), "snapshot file missing");
+}
+
+#[test]
+fn dry_run_does_not_emit_recovery_snapshot() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["push", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:").not())
+        .stdout(predicate::str::contains("wrote ").not());
+
+    assert!(!snap.path().join("dot-sync").exists());
+}
+
+#[test]
+fn sync_source_wins_overwrites_target_value() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--source-wins"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: project_doc_max_bytes",
+        ))
+        .stdout(predicate::str::contains("source: 65536"))
+        .stdout(predicate::str::contains("target: 1"));
+
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        "project_doc_max_bytes = 65536\n"
+    );
+    assert_eq!(
+        read_normalized(&fixture.path().join("source.toml")),
+        "project_doc_max_bytes = 65536\n"
+    );
+}
+
+#[test]
+fn sync_fail_on_conflict_aborts() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let original_target = fixture.read("target.toml");
+    let original_source = fixture.read("source.toml");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("conflict: project_doc_max_bytes"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    assert_eq!(fixture.read("target.toml"), original_target);
+    assert_eq!(fixture.read("source.toml"), original_source);
+}
+
+#[test]
+fn sync_conflict_flags_are_mutually_exclusive() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+
+    fixture
+        .command()
+        .args(["sync", "codex", "--target-wins", "--source-wins"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn sync_fail_on_conflict_preflights_all_targets_before_writing() {
+    // Two targets: alpha would write cleanly, beta has a conflict. Without a
+    // global preflight, alpha's writes happen before beta bails — violating
+    // the "write nothing" promise.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  alpha:
+    format: toml
+    source: alpha-source.toml
+    target: alpha-target.toml
+    sync:
+      - field
+  beta:
+    format: toml
+    source: beta-source.toml
+    target: beta-target.toml
+    sync:
+      - field
+"#,
+    );
+    write_file(&dir.path().join("alpha-source.toml"), "field = \"new\"\n");
+    write_file(&dir.path().join("alpha-target.toml"), "");
+    write_file(&dir.path().join("beta-source.toml"), "field = \"src\"\n");
+    write_file(&dir.path().join("beta-target.toml"), "field = \"tgt\"\n");
+
+    dot_sync_in(dir.path())
+        .args(["sync", "--fail-on-conflict"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("beta sync preflight"))
+        .stdout(predicate::str::contains("conflict: field"))
+        .stderr(predicate::str::contains("fail-on-conflict"));
+
+    assert_eq!(
+        read_normalized(&dir.path().join("alpha-target.toml")),
+        "",
+        "alpha-target must be untouched when beta has a conflict"
+    );
+    assert_eq!(
+        read_normalized(&dir.path().join("beta-target.toml")),
+        "field = \"tgt\"\n"
+    );
+}
+
+#[test]
+fn restore_lists_then_writes_newest_snapshot() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    // First push: produces a recovery snapshot of the original target (= "1").
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:"));
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        "project_doc_max_bytes = 65536\n"
+    );
+
+    // List should show the recovery candidate.
+    let mut list = fixture.command();
+    override_temp_dir(&mut list, snap.path());
+    list.args(["restore", "codex", "--list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("candidates (1):"))
+        .stdout(predicate::str::contains("[recovery"))
+        .stdout(predicate::str::contains(" 1  "));
+
+    // Restore (no flag = newest = the original "1" content).
+    let mut restore = fixture.command();
+    override_temp_dir(&mut restore, snap.path());
+    restore
+        .args(["restore", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("selected:"))
+        .stdout(predicate::str::contains("wrote target:"));
+
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        "project_doc_max_bytes = 1\n"
+    );
+}
+
+#[test]
+fn restore_dry_run_does_not_write() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"]).assert().success();
+    let after_push = read_normalized(&fixture.path().join("target.toml"));
+
+    let mut restore = fixture.command();
+    override_temp_dir(&mut restore, snap.path());
+    restore
+        .args(["restore", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run: no files written"));
+
+    assert_eq!(
+        read_normalized(&fixture.path().join("target.toml")),
+        after_push
+    );
+}
+
+#[test]
+fn restore_with_no_snapshots_fails() {
+    let fixture = Fixture::load("toml", "codex_basic_sync");
+    let snap = TempDir::new().unwrap();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["restore", "codex"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("No snapshots available"))
+        .stderr(predicate::str::contains("no snapshots found"));
+}
+
+#[test]
+fn restore_pick_out_of_range_fails() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    let mut push = fixture.command();
+    override_temp_dir(&mut push, snap.path());
+    push.args(["push", "codex"]).assert().success();
+
+    let mut cmd = fixture.command();
+    override_temp_dir(&mut cmd, snap.path());
+    cmd.args(["restore", "codex", "--pick", "99"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("out of range"));
 }
 
 #[test]
