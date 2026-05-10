@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::path::{FieldPath, ItemSelector, Segment};
+use crate::path::{FieldPath, ItemSelector, Segment, SelectorValue};
 
 #[derive(Debug, Clone)]
 pub struct TableConflict {
@@ -18,9 +18,12 @@ pub struct TableConflict {
 /// `identity` carries the matched key values for each `Wildcard` segment in
 /// declaration order — engines compare identities across documents to pair
 /// items. `path` is the pattern with every `Wildcard` replaced by `Pinned`.
+///
+/// Identity uses `SelectorValue` so cross-side pairing is type-strict:
+/// a wildcard hit on `Int(8080)` never pairs with one on `String("8080")`.
 #[derive(Debug, Clone)]
 pub struct ResolvedPath {
-    pub identity: Vec<String>,
+    pub identity: Vec<SelectorValue>,
     pub path: FieldPath,
 }
 
@@ -231,14 +234,47 @@ fn summarize_toml_item(item: &Item) -> String {
     }
 }
 
-/// True when `table[key]` is a string equal to `value`. Used to identify a
-/// matching array item for a `[key="value"]` pinned selector.
-fn matches_pinned(table: &dyn TableLike, key: &str, value: &str) -> bool {
-    table
-        .get(key)
-        .and_then(|item| item.as_value())
-        .and_then(|v| v.as_str())
-        == Some(value)
+/// True when `table[key]` matches the typed pinned-selector value. Type-strict:
+/// `String` only matches `Value::String`, `Int` only `Value::Integer`, `Bool`
+/// only `Value::Boolean`. A path of `[k=8080]` never matches `k = "8080"`.
+fn matches_pinned(table: &dyn TableLike, key: &str, value: &SelectorValue) -> bool {
+    let Some(v) = table.get(key).and_then(|item| item.as_value()) else {
+        return false;
+    };
+    match value {
+        SelectorValue::String(s) => v.as_str() == Some(s.as_str()),
+        SelectorValue::Int(i) => v.as_integer() == Some(*i),
+        SelectorValue::Bool(b) => v.as_bool() == Some(*b),
+    }
+}
+
+/// Extract the wildcard-key value from `table[key]` as a `SelectorValue` if it
+/// is one of the supported scalar types. `None` if the field is absent or has
+/// an unsupported type (e.g. float, array, table) — those items are skipped
+/// during wildcard expansion just as untyped items used to be.
+fn item_selector_value(table: &dyn TableLike, key: &str) -> Option<SelectorValue> {
+    let v = table.get(key).and_then(|item| item.as_value())?;
+    if let Some(s) = v.as_str() {
+        Some(SelectorValue::String(s.to_string()))
+    } else if let Some(i) = v.as_integer() {
+        Some(SelectorValue::Int(i))
+    } else if let Some(b) = v.as_bool() {
+        Some(SelectorValue::Bool(b))
+    } else {
+        None
+    }
+}
+
+/// Build a `toml_edit::Item` from a `SelectorValue`, used when seeding a new
+/// array entry whose pinning key didn't exist on this side yet.
+fn selector_value_to_item(value: &SelectorValue) -> Item {
+    match value {
+        SelectorValue::String(s) => {
+            Item::Value(Value::String(toml_edit::Formatted::new(s.clone())))
+        }
+        SelectorValue::Int(i) => Item::Value(Value::Integer(toml_edit::Formatted::new(*i))),
+        SelectorValue::Bool(b) => Item::Value(Value::Boolean(toml_edit::Formatted::new(*b))),
+    }
 }
 
 /// A matched array item. Either a `[[arrays.of.tables]]` entry (`Table`) or
@@ -266,7 +302,11 @@ impl<'a> Matched<'a> {
     }
 }
 
-fn find_pinned_item<'a>(arr_item: &'a Item, key: &str, value: &str) -> Option<Matched<'a>> {
+fn find_pinned_item<'a>(
+    arr_item: &'a Item,
+    key: &str,
+    value: &SelectorValue,
+) -> Option<Matched<'a>> {
     match arr_item {
         Item::ArrayOfTables(arr) => arr
             .iter()
@@ -306,7 +346,7 @@ fn iter_array_items(arr_item: &Item) -> Vec<&dyn TableLike> {
 fn expand_walk(
     table: &dyn TableLike,
     remaining: &[Segment],
-    identity: Vec<String>,
+    identity: Vec<SelectorValue>,
     resolved: Vec<Segment>,
     out: &mut Vec<ResolvedPath>,
 ) -> Result<()> {
@@ -344,7 +384,7 @@ fn expand_walk(
             };
             let count = count_pinned_matches(arr, key, value);
             if count > 1 {
-                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value:?}");
+                bail!("ambiguous pinned selector at {seg}: {count} items where {key}={value}");
             }
             let Some(matched) = find_pinned_item(arr, key, value) else {
                 return Ok(());
@@ -358,20 +398,16 @@ fn expand_walk(
                 return Ok(());
             };
             // Pre-scan for duplicate identifier values across the array.
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            let mut counts: BTreeMap<SelectorValue, usize> = BTreeMap::new();
             for item_table in iter_array_items(arr) {
-                if let Some(v) = item_table
-                    .get(key)
-                    .and_then(|i| i.as_value())
-                    .and_then(|v| v.as_str())
-                {
-                    *counts.entry(v.to_string()).or_default() += 1;
+                if let Some(v) = item_selector_value(item_table, key) {
+                    *counts.entry(v).or_default() += 1;
                 }
             }
             let dups: Vec<String> = counts
                 .iter()
                 .filter(|(_, c)| **c > 1)
-                .map(|(k, c)| format!("{k:?}×{c}"))
+                .map(|(v, c)| format!("{v}×{c}"))
                 .collect();
             if !dups.is_empty() {
                 bail!(
@@ -380,21 +416,17 @@ fn expand_walk(
                 );
             }
             for item_table in iter_array_items(arr) {
-                let Some(value) = item_table
-                    .get(key)
-                    .and_then(|i| i.as_value())
-                    .and_then(|v| v.as_str())
-                else {
+                let Some(value) = item_selector_value(item_table, key) else {
                     continue;
                 };
                 let mut branch_id = identity.clone();
-                branch_id.push(value.to_string());
+                branch_id.push(value.clone());
                 let mut branch_resolved = resolved.clone();
                 branch_resolved.push(Segment {
                     name: seg.name.clone(),
                     select: Some(ItemSelector::Pinned {
                         key: key.clone(),
-                        value: value.to_string(),
+                        value,
                     }),
                 });
                 expand_walk(item_table, rest, branch_id, branch_resolved, out)?;
@@ -404,7 +436,7 @@ fn expand_walk(
     Ok(())
 }
 
-fn count_pinned_matches(arr_item: &Item, key: &str, value: &str) -> usize {
+fn count_pinned_matches(arr_item: &Item, key: &str, value: &SelectorValue) -> usize {
     match arr_item {
         Item::ArrayOfTables(arr) => arr
             .iter()
@@ -580,7 +612,7 @@ fn ensure_array_of_tables<'a>(table: &'a mut Table, name: &str) -> Result<&'a mu
 fn descend_set_in_array(
     arr: &mut ArrayOfTables,
     key: &str,
-    pinned: &str,
+    pinned: &SelectorValue,
     rest: &[Segment],
     value: Item,
 ) -> Result<()> {
@@ -590,10 +622,7 @@ fn descend_set_in_array(
         Some(p) => p,
         None => {
             let mut new_table = Table::new();
-            new_table.insert(
-                key,
-                Item::Value(Value::String(toml_edit::Formatted::new(pinned.to_string()))),
-            );
+            new_table.insert(key, selector_value_to_item(pinned));
             arr.push(new_table);
             arr.len() - 1
         }
@@ -608,10 +637,7 @@ fn descend_set_in_array(
         // Restore the pinning key in case the replacement value didn't carry
         // it (callers transferring values across docs sometimes don't).
         if !matches_pinned(item_table, key, pinned) {
-            item_table.insert(
-                key,
-                Item::Value(Value::String(toml_edit::Formatted::new(pinned.to_string()))),
-            );
+            item_table.insert(key, selector_value_to_item(pinned));
         }
         return Ok(());
     }
@@ -674,7 +700,11 @@ mod tests {
     use toml_edit::value;
 
     use super::{Document, TomlDocument};
-    use crate::path::FieldPath;
+    use crate::path::{FieldPath, SelectorValue};
+
+    fn s(v: &str) -> SelectorValue {
+        SelectorValue::String(v.to_string())
+    }
 
     #[test]
     fn sets_and_gets_nested_values() {
@@ -752,6 +782,89 @@ enabled = false
         assert_eq!(
             doc.get(&path).unwrap().as_value().unwrap().as_integer(),
             Some(81)
+        );
+    }
+
+    #[test]
+    fn pinned_get_with_int_selector() {
+        let doc = TomlDocument {
+            doc: r#"
+[[servers]]
+port = 8080
+host = "alpha"
+
+[[servers]]
+port = 9090
+host = "beta"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let path = FieldPath::parse("servers[port=9090].host").unwrap();
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn pinned_get_with_bool_selector() {
+        let doc = TomlDocument {
+            doc: r#"
+[[entries]]
+primary = true
+host = "alpha"
+
+[[entries]]
+primary = false
+host = "beta"
+"#
+            .parse()
+            .unwrap(),
+        };
+        let path = FieldPath::parse("entries[primary=true].host").unwrap();
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn pinned_selector_is_type_strict() {
+        // [k=8080] (int) does not match k = "8080" (string).
+        let doc = TomlDocument {
+            doc: r#"
+[[servers]]
+port = "8080"
+host = "alpha"
+"#
+            .parse()
+            .unwrap(),
+        };
+        assert!(
+            doc.get(&FieldPath::parse("servers[port=8080].host").unwrap())
+                .is_none()
+        );
+        assert!(
+            doc.get(&FieldPath::parse("servers[port=\"8080\"].host").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pinned_set_seeds_int_pinning_key_for_new_item() {
+        let mut doc = TomlDocument::empty();
+        let path = FieldPath::parse("servers[port=8080].host").unwrap();
+        doc.set(&path, value("alpha")).unwrap();
+
+        assert_eq!(
+            doc.get(&path).unwrap().as_value().unwrap().as_str(),
+            Some("alpha")
+        );
+        let port_path = FieldPath::parse("servers[port=8080].port").unwrap();
+        assert_eq!(
+            doc.get(&port_path).unwrap().as_value().unwrap().as_integer(),
+            Some(8080)
         );
     }
 
@@ -889,12 +1002,12 @@ enabled = false
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "mcp_servers[name=\"github\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["linear".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("linear")]);
     }
 
     #[test]
@@ -935,12 +1048,12 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["gpt-4".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("gpt-4")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"openai\"].models[id=\"gpt-4\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["gpt-5".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("gpt-5")]);
     }
 
     #[test]
@@ -1086,7 +1199,7 @@ enabled = false
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
         assert_eq!(resolved[0].path.to_string(), "mcp_servers[name=\"github\"]");
 
         // The resolved path returns the whole item when used with `get`.
@@ -1125,12 +1238,12 @@ enabled = true
         let mut resolved = doc.expand(&pattern).unwrap();
         resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].identity, vec!["anthropic".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("anthropic")]);
         assert_eq!(
             resolved[0].path.to_string(),
             "providers[name=\"anthropic\"].models[id=\"gpt-4\"].enabled"
         );
-        assert_eq!(resolved[1].identity, vec!["openai".to_string()]);
+        assert_eq!(resolved[1].identity, vec![s("openai")]);
     }
 
     #[test]
@@ -1165,15 +1278,15 @@ enabled = true
         assert_eq!(resolved.len(), 3);
         assert_eq!(
             resolved[0].identity,
-            vec!["anthropic".to_string(), "opus".to_string()]
+            vec![s("anthropic"), s("opus")]
         );
         assert_eq!(
             resolved[1].identity,
-            vec!["openai".to_string(), "gpt-4".to_string()]
+            vec![s("openai"), s("gpt-4")]
         );
         assert_eq!(
             resolved[2].identity,
-            vec!["openai".to_string(), "gpt-5".to_string()]
+            vec![s("openai"), s("gpt-5")]
         );
         assert_eq!(
             resolved[0].path.to_string(),
@@ -1198,6 +1311,6 @@ enabled = true
         let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
         let resolved = doc.expand(&pattern).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(resolved[0].identity, vec![s("github")]);
     }
 }

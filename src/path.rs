@@ -11,6 +11,8 @@ use anyhow::{Result, bail};
 /// - `mcp_servers[name="github"].enabled` — descend into the `mcp_servers`
 ///   array, find the item where `name` equals the literal string `"github"`,
 ///   then descend into its `enabled` field. Pinned key-match.
+/// - `servers[port=8080].host` — same idea with an integer literal.
+/// - `flags[primary=true].host` — boolean literal.
 /// - `mcp_servers[name].enabled` — wildcard variant: fan out across every
 ///   item in `mcp_servers`, keying matches across source/target by `name`.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -29,11 +31,31 @@ pub struct Segment {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ItemSelector {
-    /// `[key="value"]` — pin to the array item where `key` equals `value`.
-    Pinned { key: String, value: String },
+    /// `[key=<literal>]` — pin to the array item where `key` equals `<literal>`.
+    Pinned { key: String, value: SelectorValue },
     /// `[key]` — fan out across every array item, using `key` as the
     /// identifier when matching items across source/target.
     Wildcard { key: String },
+}
+
+/// Typed literal for pinned selectors and wildcard identities. Comparison is
+/// **strict**: `String("8080")` and `Int(8080)` are never equal. Syntax mirrors
+/// the type — `[k="x"]` for strings, `[k=8080]` for ints, `[k=true]` for bools.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum SelectorValue {
+    String(String),
+    Int(i64),
+    Bool(bool),
+}
+
+impl fmt::Display for SelectorValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SelectorValue::String(s) => write!(f, "\"{}\"", escape_for_quotes(s)),
+            SelectorValue::Int(i) => write!(f, "{i}"),
+            SelectorValue::Bool(b) => write!(f, "{b}"),
+        }
+    }
 }
 
 impl FieldPath {
@@ -103,7 +125,7 @@ impl fmt::Display for Segment {
         if let Some(sel) = &self.select {
             match sel {
                 ItemSelector::Pinned { key, value } => {
-                    write!(f, "[{key}=\"{}\"]", escape_for_quotes(value))?;
+                    write!(f, "[{key}={value}]")?;
                 }
                 ItemSelector::Wildcard { key } => {
                     write!(f, "[{key}]")?;
@@ -172,10 +194,7 @@ fn parse_optional_selector(
 
     let selector = if *pos < bytes.len() && bytes[*pos] == '=' {
         *pos += 1; // consume '='
-        if *pos >= bytes.len() || bytes[*pos] != '"' {
-            bail!("selector value must be a quoted string in {input}");
-        }
-        let value = parse_quoted(bytes, pos, input, '"')?;
+        let value = parse_selector_value(bytes, pos, input)?;
         ItemSelector::Pinned { key, value }
     } else {
         ItemSelector::Wildcard { key }
@@ -186,6 +205,45 @@ fn parse_optional_selector(
     }
     *pos += 1; // consume ']'
     Ok(Some(selector))
+}
+
+/// Parse a selector value literal at `*pos`. Accepts:
+/// - `"..."` quoted string → `SelectorValue::String`
+/// - bare `true` / `false` → `SelectorValue::Bool`
+/// - bare digits (decimal, optional leading `-`) → `SelectorValue::Int`
+///
+/// The selector value's syntax determines its type — `[k=8080]` matches the
+/// integer 8080 only, `[k="8080"]` matches the string `"8080"` only. Strict by
+/// design so paths are unambiguous about identifier type.
+fn parse_selector_value(bytes: &[char], pos: &mut usize, input: &str) -> Result<SelectorValue> {
+    if *pos >= bytes.len() {
+        bail!("selector value missing in {input}");
+    }
+    if bytes[*pos] == '"' {
+        let s = parse_quoted(bytes, pos, input, '"')?;
+        return Ok(SelectorValue::String(s));
+    }
+    let start = *pos;
+    while *pos < bytes.len() && bytes[*pos] != ']' {
+        *pos += 1;
+    }
+    let raw: String = bytes[start..*pos].iter().collect();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("selector value missing in {input}");
+    }
+    if trimmed != raw {
+        bail!("selector value must not be padded with whitespace in {input}");
+    }
+    match trimmed {
+        "true" => Ok(SelectorValue::Bool(true)),
+        "false" => Ok(SelectorValue::Bool(false)),
+        _ => trimmed.parse::<i64>().map(SelectorValue::Int).map_err(|_| {
+            anyhow::anyhow!(
+                "selector value {trimmed:?} is not a quoted string, integer, or boolean in {input}"
+            )
+        }),
+    }
 }
 
 /// Parse a quoted string starting at the opening quote. Consumes through the
@@ -221,7 +279,7 @@ fn parse_quoted(bytes: &[char], pos: &mut usize, input: &str, quote: char) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{FieldPath, ItemSelector};
+    use super::{FieldPath, ItemSelector, SelectorValue};
 
     fn names(path: &FieldPath) -> Vec<&str> {
         path.segments().iter().map(|s| s.name.as_str()).collect()
@@ -250,11 +308,63 @@ mod tests {
         match &path.segments()[0].select {
             Some(ItemSelector::Pinned { key, value }) => {
                 assert_eq!(key, "name");
-                assert_eq!(value, "github");
+                assert_eq!(value, &SelectorValue::String("github".to_string()));
             }
             other => panic!("expected pinned selector, got {other:?}"),
         }
         assert!(path.segments()[1].select.is_none());
+    }
+
+    #[test]
+    fn parses_int_selector_value() {
+        let path = FieldPath::parse("servers[port=8080].host").unwrap();
+        match &path.segments()[0].select {
+            Some(ItemSelector::Pinned { key, value }) => {
+                assert_eq!(key, "port");
+                assert_eq!(value, &SelectorValue::Int(8080));
+            }
+            other => panic!("expected pinned int selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_negative_int_selector_value() {
+        let path = FieldPath::parse("a[k=-1].b").unwrap();
+        match &path.segments()[0].select {
+            Some(ItemSelector::Pinned {
+                value: SelectorValue::Int(i),
+                ..
+            }) => assert_eq!(*i, -1),
+            other => panic!("expected pinned int selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bool_selector_value() {
+        let p_true = FieldPath::parse("a[primary=true].b").unwrap();
+        let p_false = FieldPath::parse("a[primary=false].b").unwrap();
+        assert!(matches!(
+            &p_true.segments()[0].select,
+            Some(ItemSelector::Pinned {
+                value: SelectorValue::Bool(true),
+                ..
+            })
+        ));
+        assert!(matches!(
+            &p_false.segments()[0].select,
+            Some(ItemSelector::Pinned {
+                value: SelectorValue::Bool(false),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_garbage_selector_value() {
+        // bareword that is neither an int nor a bool
+        assert!(FieldPath::parse("arr[name=github]").is_err());
+        // empty
+        assert!(FieldPath::parse("arr[name=]").is_err());
     }
 
     #[test]
@@ -287,7 +397,7 @@ mod tests {
         match &path.segments()[0].select {
             Some(ItemSelector::Pinned { key, value }) => {
                 assert_eq!(key, "k");
-                assert_eq!(value, "he said \"hi\"");
+                assert_eq!(value, &SelectorValue::String("he said \"hi\"".to_string()));
             }
             other => panic!("got {other:?}"),
         }
@@ -309,11 +419,6 @@ mod tests {
     fn rejects_unterminated_selector() {
         assert!(FieldPath::parse("arr[name").is_err());
         assert!(FieldPath::parse("arr[name=\"x\"").is_err());
-    }
-
-    #[test]
-    fn rejects_unquoted_selector_value() {
-        assert!(FieldPath::parse("arr[name=github]").is_err());
     }
 
     #[test]
@@ -347,6 +452,14 @@ mod tests {
     fn display_round_trips_pinned_selector() {
         let path = FieldPath::parse("mcp_servers[name=\"github\"].enabled").unwrap();
         assert_eq!(path.to_string(), "mcp_servers[name=\"github\"].enabled");
+    }
+
+    #[test]
+    fn display_round_trips_int_and_bool_selectors() {
+        let pi = FieldPath::parse("servers[port=8080].host").unwrap();
+        assert_eq!(pi.to_string(), "servers[port=8080].host");
+        let pb = FieldPath::parse("a[primary=true].b").unwrap();
+        assert_eq!(pb.to_string(), "a[primary=true].b");
     }
 
     #[test]

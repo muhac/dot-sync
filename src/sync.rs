@@ -8,7 +8,7 @@ use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
 use crate::document::{Document, Format, TomlDocument, parse_format};
-use crate::path::FieldPath;
+use crate::path::{FieldPath, SelectorValue};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -384,7 +384,7 @@ fn expanded_paths<D: Document>(
             path: parsed.path.clone(),
         }]);
     }
-    let mut by_id: BTreeMap<Vec<String>, FieldPath> = BTreeMap::new();
+    let mut by_id: BTreeMap<Vec<SelectorValue>, FieldPath> = BTreeMap::new();
     let source_resolved = source
         .expand(&parsed.path)
         .with_context(|| format!("source pattern '{}'", parsed.raw))?;
