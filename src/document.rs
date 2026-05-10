@@ -1877,6 +1877,24 @@ impl Document for GitConfigDocument {
             }
             bail!("file does not exist: {}", path.display());
         }
+        // git allows backslash-continued multi-line values, but
+        // gix-config 0.56 parses them incorrectly: trailing fragments
+        // become spurious empty-value keys, and write-back mangles the
+        // line layout. Detect the marker bytes (`\` immediately before
+        // `\n`) at the file level and refuse to load such files rather
+        // than silently corrupt them. Drop this guard once gitoxide
+        // ships a fix.
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if content.contains("\\\n") {
+            bail!(
+                "gitconfig file {} uses backslash-continued multi-line values, \
+                 which dot-sync's gitconfig backend does not support yet \
+                 (gix-config mangles them on round-trip). Inline the value \
+                 onto a single line or remove the continuation.",
+                path.display()
+            );
+        }
         let file =
             gix_config::File::from_path_no_includes(path.to_path_buf(), gix_config::Source::Local)
                 .with_context(|| format!("failed to parse gitconfig {}", path.display()))?;
@@ -4247,6 +4265,87 @@ mod gitconfig_tests {
             err.to_string().contains("section.0bad") || err.to_string().contains("key"),
             "msg: {err}"
         );
+    }
+
+    // ----- gix-config edge behavior: multi-line / mixed indent / EOL comments -----
+
+    #[test]
+    fn load_rejects_files_with_backslash_continuation_values() {
+        // git allows multi-line values via `\<newline>`, but gix-config
+        // 0.56 parses them incorrectly. Refuse to load rather than
+        // silently corrupt on the first write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "[alias]\n\tmultiline = !echo first; \\\necho second\n",
+        )
+        .unwrap();
+        let result = GitConfigDocument::load(&path, false);
+        let err = match result {
+            Ok(_) => panic!("expected error for multi-line value"),
+            Err(e) => e,
+        };
+        let s = err.to_string();
+        assert!(s.contains("multi-line") || s.contains("continuation"), "msg: {s}");
+    }
+
+    #[test]
+    fn round_trips_mixed_tab_and_space_indentation() {
+        // First section uses tab, second uses 4 spaces. gix-config
+        // preserves each section's local style — the rendered output
+        // is byte-identical to the input.
+        let original = "\
+[user]
+\tname = tab-indented
+[core]
+    editor = space-indented
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(doc.render(), original);
+
+        // get reads through both styles transparently.
+        let user_name = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&user_name), Some("tab-indented".to_string()));
+        let core_editor = FieldPath::parse("core.editor").unwrap();
+        assert_eq!(doc.get(&core_editor), Some("space-indented".to_string()));
+    }
+
+    #[test]
+    fn end_of_line_comments_are_preserved_and_stripped_from_value() {
+        // git allows trailing `;` or `#` comments on a value line.
+        // Two contracts to lock:
+        //   1. `get` returns the value with the comment stripped — the
+        //      user's `email` is `a@b`, not `a@b ; trailing comment`.
+        //   2. `render` preserves the comment byte-exactly so the file
+        //      still shows the user's annotation after a no-op write.
+        let original = "\
+[user]
+\temail = a@b ; trailing semicolon comment
+\tname = Alice  # trailing hash comment
+";
+        let (_dir, doc) = doc_from(original);
+
+        let email = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&email), Some("a@b".to_string()));
+        let name = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&name), Some("Alice".to_string()));
+
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_after_eol_comment_keeps_comment() {
+        // After updating the value, the trailing comment must still
+        // be there. This is the case-of-record for "user annotates
+        // their gitconfig and dot-sync respects it".
+        let original = "[user]\n\temail = old ; my email\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("email = new"), "got: {rendered}");
+        assert!(rendered.contains("; my email"), "got: {rendered}");
     }
 
     #[test]
