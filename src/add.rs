@@ -52,10 +52,11 @@ pub fn run(args: AddArgs) -> Result<()> {
         let tree = build_tree(fmt, &source_abs, &target_abs)?;
         match picker::run(&args.name, tree)? {
             PickerOutcome::Confirmed(paths) => paths,
-            PickerOutcome::Cancelled => {
-                eprintln!("cancelled, no changes made");
-                std::process::exit(1);
-            }
+            // Bubble cancellation up as an error so the process exits
+            // non-zero through the normal `Result` path. Going through
+            // `std::process::exit` would skip every `Drop` higher in the
+            // stack and is inconsistent with the rest of the codebase.
+            PickerOutcome::Cancelled => bail!("cancelled, no changes made"),
         }
     } else {
         let mut out = Vec::with_capacity(args.fields.len());
