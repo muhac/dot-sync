@@ -368,6 +368,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_whitespace_padded_selector_value() {
+        // Leading or trailing whitespace inside the brackets is rejected
+        // — the literal must sit flush against `=` and `]`. Keeps parsing
+        // unambiguous and avoids `[k= 8080]` accidentally matching `8080`
+        // depending on how generously trim() is applied later.
+        assert!(FieldPath::parse("arr[k= 8080]").is_err());
+        assert!(FieldPath::parse("arr[k=8080 ]").is_err());
+        assert!(FieldPath::parse("arr[k= true]").is_err());
+    }
+
+    #[test]
     fn parses_wildcard_key_match() {
         let path = FieldPath::parse("mcp_servers[name].enabled").unwrap();
         match &path.segments()[0].select {
