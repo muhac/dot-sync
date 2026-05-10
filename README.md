@@ -128,6 +128,28 @@ dot-sync sync codex --fail-on-conflict   # exit non-zero, write nothing, list co
 
 `pull` is always target-wins by definition; `push` is always source-wins.
 
+## Recovering from a bad write
+
+Every real write captures the previous contents into
+`$TMPDIR/dot-sync/<sanitized>.<timestamp>` and prints the path next to the
+write. Use `restore` to roll back from there or from any persistent
+`<file>.bak.<timestamp>` that `--backup` produced earlier — both pools are
+listed together, sorted newest first.
+
+```sh
+dot-sync restore codex --list           # show numbered candidates (recovery + backup)
+dot-sync restore codex                  # restore newest snapshot of target
+dot-sync restore codex --pick 3         # restore the 3rd candidate from the list
+dot-sync restore codex --at 20260510-15 # restore by timestamp prefix
+dot-sync restore codex --source         # restore source instead of target
+dot-sync restore codex --dry-run        # show what would happen
+```
+
+The restore itself is atomic and takes a fresh recovery snapshot of the
+file before overwriting, so an unwanted restore is itself recoverable.
+When timestamps tie, persistent `[backup]` entries are preferred over
+`[recovery]` (they are an explicit user signal).
+
 All three commands share a single rule: **only fields listed in `sync` are
 touched, and nothing is ever removed**. Fields outside `sync` are preserved on
 both sides. `pull` and `push` are mirror images; `sync` is exactly their union.

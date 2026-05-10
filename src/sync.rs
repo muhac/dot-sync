@@ -545,7 +545,7 @@ fn write_document(
     Ok(WriteOutcome { snapshot })
 }
 
-fn snapshot_existing(path: &Path, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn snapshot_existing(path: &Path, snapshot_dir: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -573,7 +573,7 @@ fn snapshot_existing(path: &Path, snapshot_dir: &Path) -> Result<Option<PathBuf>
     Ok(Some(snapshot))
 }
 
-fn sanitize_for_filename(path: &Path) -> String {
+pub(crate) fn sanitize_for_filename(path: &Path) -> String {
     let raw = path.display().to_string();
     let trimmed = raw.trim_start_matches(['/', '\\']);
     trimmed
@@ -585,7 +585,7 @@ fn sanitize_for_filename(path: &Path) -> String {
         .collect()
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())

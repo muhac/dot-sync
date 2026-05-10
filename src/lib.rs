@@ -2,14 +2,16 @@ mod cli;
 mod config;
 mod document;
 mod path;
+mod restore;
 mod status;
 mod sync;
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::{Cli, Command, SyncCmdFlags, SyncFlags};
+use crate::cli::{Cli, Command, RestoreFlags, SyncCmdFlags, SyncFlags};
 use crate::config::DotSyncConfig;
+use crate::restore::{Pick, RestoreOptions, Side, run as run_restore};
 use crate::status::run as run_status;
 use crate::sync::{ConflictMode, Direction, SyncOptions, run as run_sync};
 
@@ -29,7 +31,35 @@ pub fn run() -> Result<()> {
             let mode = resolve_conflict_mode(&cmd);
             dispatch_sync(&loaded, Direction::Sync, cmd.common, mode)
         }
+        Command::Restore(flags) => dispatch_restore(&loaded, flags),
     }
+}
+
+fn dispatch_restore(config: &DotSyncConfig, flags: RestoreFlags) -> Result<()> {
+    let side = if flags.source {
+        Side::Source
+    } else {
+        // --target is the default; explicit --target also lands here.
+        Side::Target
+    };
+    let pick = if let Some(n) = flags.pick {
+        Pick::Index(n)
+    } else if flags.at.is_some() {
+        Pick::AtPrefix
+    } else {
+        Pick::Newest
+    };
+    run_restore(
+        config,
+        Some(&flags.name),
+        RestoreOptions {
+            side,
+            pick,
+            at: flags.at.as_deref(),
+            list_only: flags.list,
+            dry_run: flags.dry_run,
+        },
+    )
 }
 
 fn resolve_conflict_mode(cmd: &SyncCmdFlags) -> ConflictMode {

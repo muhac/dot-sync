@@ -630,6 +630,108 @@ fn sync_conflict_flags_are_mutually_exclusive() {
 }
 
 #[test]
+fn restore_lists_then_writes_newest_snapshot() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    // First push: produces a recovery snapshot of the original target (= "1").
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery:"));
+    assert_eq!(
+        fixture.read("target.toml"),
+        "project_doc_max_bytes = 65536\n"
+    );
+
+    // List should show the recovery candidate.
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["restore", "codex", "--list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("candidates (1):"))
+        .stdout(predicate::str::contains("[recovery]"))
+        .stdout(predicate::str::contains(" 1  "));
+
+    // Restore (no flag = newest = the original "1" content).
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["restore", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("selected:"))
+        .stdout(predicate::str::contains("wrote target:"));
+
+    assert_eq!(fixture.read("target.toml"), "project_doc_max_bytes = 1\n");
+}
+
+#[test]
+fn restore_dry_run_does_not_write() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["push", "codex"])
+        .assert()
+        .success();
+    let after_push = fixture.read("target.toml");
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["restore", "codex", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run: no files written"));
+
+    assert_eq!(fixture.read("target.toml"), after_push);
+}
+
+#[test]
+fn restore_with_no_snapshots_fails() {
+    let fixture = Fixture::load("toml", "codex_basic_sync");
+    let snap = TempDir::new().unwrap();
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["restore", "codex"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("No snapshots available"))
+        .stderr(predicate::str::contains("no snapshots found"));
+}
+
+#[test]
+fn restore_pick_out_of_range_fails() {
+    let fixture = Fixture::load("toml", "dry_run_no_write");
+    let snap = TempDir::new().unwrap();
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["push", "codex"])
+        .assert()
+        .success();
+
+    fixture
+        .command()
+        .env("TMPDIR", snap.path())
+        .args(["restore", "codex", "--pick", "99"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("out of range"));
+}
+
+#[test]
 fn config_rejects_unknown_keys() {
     let dir = TempDir::new().unwrap();
     write_file(
