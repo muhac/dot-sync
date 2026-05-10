@@ -1,0 +1,8 @@
+{
+    "existing": {
+        "a": 1,
+        "deep": {
+            "newer": "x"
+        }
+    }
+}

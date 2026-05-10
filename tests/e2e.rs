@@ -1524,6 +1524,44 @@ fn jsonc_push_preserves_multi_line_comment_run_above_key() {
 }
 
 #[test]
+fn jsonc_push_preserves_indent_when_creating_nested_objects() {
+    // Target uses 4-space indent and has a partial structure. Source
+    // wants to write `existing.deep.newer` where `deep` doesn't exist
+    // on the target side. The newly created intermediate object must
+    // inherit the file's 4-space indent style at every nesting level.
+    let fixture = Fixture::load("json", "jsonc_nested_indent_inheritance");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "added target: existing.deep.newer",
+        ));
+    let after = fixture.read("target.jsonc");
+    // Existing structure stays at 4-space.
+    assert!(
+        after.contains("\n    \"existing\""),
+        "outer key kept 4-space indent: {after}"
+    );
+    assert!(
+        after.contains("\n        \"a\""),
+        "nested existing.a kept 8-space indent: {after}"
+    );
+    // New `deep` key sits at the same level as `a` (8 spaces).
+    assert!(
+        after.contains("\n        \"deep\""),
+        "newly created `deep` should sit at 8-space indent: {after}"
+    );
+    // `newer` inside the new `deep` object inherits the file's step
+    // size, so it lives at 12 spaces.
+    assert!(
+        after.contains("\n            \"newer\""),
+        "newer inside new `deep` should be at 12-space indent: {after}"
+    );
+}
+
+#[test]
 fn jsonc_format_alias_dispatches_to_json_backend() {
     // `format: jsonc` is accepted as an alias for `format: json` so a
     // user with VS Code / tsconfig files can self-document the fact that
