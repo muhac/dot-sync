@@ -344,8 +344,7 @@ fn expand_walk(
             let count = count_pinned_matches(arr, key, value);
             if count > 1 {
                 bail!(
-                    "ambiguous pinned selector at {}: {count} items where {key}={value:?}",
-                    format_segment_for_prefix(seg)
+                    "ambiguous pinned selector at {seg}: {count} items where {key}={value:?}"
                 );
             }
             let Some(matched) = find_pinned_item(arr, key, value) else {
@@ -378,8 +377,7 @@ fn expand_walk(
                 .collect();
             if !dups.is_empty() {
                 bail!(
-                    "ambiguous wildcard at {}: duplicate {key} values: {}",
-                    format_segment_for_prefix(seg),
+                    "ambiguous wildcard at {seg}: duplicate {key} values: {}",
                     dups.join(", ")
                 );
             }
@@ -467,7 +465,7 @@ fn table_conflict_like(
         return None;
     }
     let (first, rest) = segments.split_first()?;
-    prefix.push(format_segment_for_prefix(first));
+    prefix.push(first.to_string());
     let item = table.get(&first.name)?;
     match &first.select {
         None => match item.as_table_like() {
@@ -505,16 +503,6 @@ fn table_conflict_like(
             }
             None
         }
-    }
-}
-
-fn format_segment_for_prefix(seg: &Segment) -> String {
-    match &seg.select {
-        None => seg.name.clone(),
-        Some(ItemSelector::Pinned { key, value }) => {
-            format!("{}[{key}=\"{value}\"]", seg.name)
-        }
-        Some(ItemSelector::Wildcard { key }) => format!("{}[{key}]", seg.name),
     }
 }
 
@@ -974,6 +962,25 @@ enabled = false
         assert_eq!(
             doc.get(&path).unwrap().as_value().unwrap().as_bool(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn conflict_prefix_escapes_pinned_value_quotes() {
+        // The container at `arr` is a scalar, so the path-conflict prefix
+        // includes the selector verbatim. The selector value contains a
+        // literal `"` which must be backslash-escaped so the prefix string
+        // round-trips back through the parser.
+        let doc = TomlDocument {
+            doc: r#"arr = "scalar""#.parse().unwrap(),
+        };
+        let path = FieldPath::parse(r#"arr[name="he said \"hi\""].field"#).unwrap();
+        let conflict = doc.table_conflict(&path).expect("expected conflict");
+        assert_eq!(conflict.path, r#"arr[name="he said \"hi\""]"#);
+        assert!(
+            FieldPath::parse(&conflict.path).is_ok(),
+            "prefix {:?} must reparse",
+            conflict.path
         );
     }
 
