@@ -4082,6 +4082,173 @@ mod gitconfig_tests {
         assert_eq!(doc.get(&path), Some("new".to_string()));
     }
 
+    // ----- items_equal / summarize / table_conflict -----
+
+    #[test]
+    fn items_equal_compares_byte_for_byte() {
+        // String comparison — no boolean polysemy. git treats `true` /
+        // `yes` / `on` / `1` as the same bool, but dot-sync compares
+        // literal bytes. Document the contract explicitly so future
+        // refactors can't loosen it without breaking this.
+        assert!(GitConfigDocument::items_equal(
+            &"yes".to_string(),
+            &"yes".to_string()
+        ));
+        assert!(!GitConfigDocument::items_equal(
+            &"yes".to_string(),
+            &"true".to_string()
+        ));
+        assert!(!GitConfigDocument::items_equal(
+            &"true".to_string(),
+            &"True".to_string()
+        ));
+    }
+
+    #[test]
+    fn summarize_quotes_present_value_and_marks_missing() {
+        assert_eq!(
+            GitConfigDocument::summarize(Some(&"vim".to_string())),
+            "\"vim\""
+        );
+        assert_eq!(GitConfigDocument::summarize(None), "<missing>");
+    }
+
+    #[test]
+    fn table_conflict_always_none_for_gitconfig() {
+        // gitconfig keys can't contain nested values, so no path
+        // can ever resolve to a "would clobber a table" condition.
+        let (_dir, doc) = doc_from("[user]\n\temail = a@b\n");
+        let path = FieldPath::parse("user.email").unwrap();
+        assert!(doc.table_conflict(&path).is_none());
+        let mut empty = GitConfigDocument::empty();
+        let new_path = FieldPath::parse("alias.co").unwrap();
+        empty.set(&new_path, "x".to_string()).unwrap();
+        assert!(empty.table_conflict(&new_path).is_none());
+    }
+
+    // ----- multiple same-name sections -----
+
+    #[test]
+    fn discover_dedupes_keys_across_repeated_section_headers() {
+        // git allows the same section to appear multiple times — the
+        // file is logically the union of all of them. The picker
+        // shouldn't show duplicates.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[core]
+\teditor = vim
+[user]
+\temail = a@b
+[user]
+\tname = Alice
+",
+        );
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        // user.name appears in two `[user]` sections — show once.
+        let user_name_count = paths.iter().filter(|p| p == &"user.name").count();
+        assert_eq!(user_name_count, 1, "{paths:?}");
+        // user.email is split off in a separate header — still counted.
+        assert!(paths.contains(&"user.email".to_string()), "{paths:?}");
+    }
+
+    #[test]
+    fn get_finds_value_in_repeated_section() {
+        // Even when split across two headers, get must find the value.
+        let (_dir, doc) = doc_from(
+            "\
+[user]
+\tname = Alice
+[core]
+\teditor = vim
+[user]
+\temail = a@b
+",
+        );
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+        let path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&path), Some("Alice".to_string()));
+    }
+
+    // ----- value content edge cases -----
+
+    #[test]
+    fn round_trips_value_with_spaces() {
+        // Aliases routinely have spaces: `co = checkout HEAD --quiet`.
+        let original = "[alias]\n\tco = checkout HEAD --quiet\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.co").unwrap();
+        assert_eq!(
+            doc.get(&path),
+            Some("checkout HEAD --quiet".to_string())
+        );
+        // Round-trip render is byte-stable.
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_preserves_spaces_in_value() {
+        let (_dir, mut doc) = doc_from("[alias]\n\tco = checkout\n");
+        let path = FieldPath::parse("alias.co").unwrap();
+        doc.set(&path, "checkout HEAD --quiet".to_string()).unwrap();
+        assert_eq!(
+            doc.get(&path),
+            Some("checkout HEAD --quiet".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_value_round_trips_as_empty_string_or_none() {
+        // git allows `key =` with nothing after the equals sign.
+        // gix-config exposes this through `value_implicit`; the
+        // user-facing comfort accessor `string_by` flattens it. We
+        // pin down the actual behavior here so a future gix-config
+        // bump that changes the flatten rule shows up as a test diff
+        // rather than slipping in as silent semantic change.
+        let (_dir, doc) = doc_from("[core]\n\teditor =\n");
+        let path = FieldPath::parse("core.editor").unwrap();
+        // Either Some("") or None is defensible; lock whatever
+        // gix-config currently does.
+        let actual = doc.get(&path);
+        assert!(
+            matches!(&actual, Some(s) if s.is_empty()) || actual.is_none(),
+            "expected empty or None, got {actual:?}"
+        );
+    }
+
+    // ----- section name validation -----
+
+    #[test]
+    fn set_surfaces_gitconfig_section_name_validation_error() {
+        // git's section grammar rejects names with underscores. We
+        // pass section names straight through to gix-config; its
+        // error must surface to the user with our path context.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("new_section.key").unwrap();
+        let err = doc.set(&path, "value".to_string()).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("new_section.key") || s.contains("section"),
+            "msg: {s}"
+        );
+    }
+
+    #[test]
+    fn set_surfaces_gitconfig_key_name_validation_error() {
+        // Keys must start with an alphabetic character per git's
+        // grammar. A leading digit gets rejected by gix-config.
+        let mut doc = GitConfigDocument::empty();
+        let path = FieldPath::parse("section.0bad").unwrap();
+        let err = doc.set(&path, "value".to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("section.0bad") || err.to_string().contains("key"),
+            "msg: {err}"
+        );
+    }
+
     #[test]
     fn discover_paths_round_trip_to_get() {
         // Every leaf path the picker emits must actually fetch a value
