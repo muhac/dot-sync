@@ -95,6 +95,11 @@ impl PickerState {
         self.expanded[idx]
     }
 
+    /// Whether the node at `idx` is in the underlying selected set.
+    /// Note: prefer [`Self::check_state`] for display purposes — that
+    /// surfaces the tri-state including `Mixed` and `Individual` modes.
+    /// Public for unit-test introspection.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_selected(&self, idx: usize) -> bool {
         self.selected[idx]
     }

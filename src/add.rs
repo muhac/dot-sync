@@ -191,10 +191,10 @@ fn resolve_path(root: &Path, value: &str) -> PathBuf {
     if value == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     let p = PathBuf::from(value);
     if p.is_absolute() { p } else { root.join(p) }

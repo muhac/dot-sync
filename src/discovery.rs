@@ -99,11 +99,6 @@ impl FieldNode {
             children,
         }
     }
-
-    /// True when this node is a leaf with a sync path and no children.
-    pub fn is_leaf(&self) -> bool {
-        matches!(self.kind, FieldNodeKind::Leaf)
-    }
 }
 
 /// Identifier-key auto-detection for arrays of objects. Priority order:

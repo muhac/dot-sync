@@ -1640,3 +1640,288 @@ fn jsonc_push_preserves_trailing_commas() {
         ));
     fixture.assert_file_eq("target.jsonc", "target.expected.jsonc");
 }
+
+// =====================================================================
+// `add` subcommand
+// =====================================================================
+
+#[test]
+fn add_bootstraps_sync_yaml_for_new_target() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.toml"),
+        "tui = { theme = \"monokai\" }\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target 'codex'"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("codex:"), "yaml: {yaml}");
+    assert!(yaml.contains("format: toml"), "yaml: {yaml}");
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_infers_format_from_source_extension() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("source.json"), "{}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "agent",
+            "--source",
+            "source.json",
+            "--target",
+            "target.json",
+            "--field",
+            "feature.enabled",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: json"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_infers_jsonc_from_extension() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join("settings.jsonc"), "{}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "vscode",
+            "--source",
+            "settings.jsonc",
+            "--target",
+            "settings.jsonc",
+            "--field",
+            "editor.tabSize",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: jsonc"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_errors_when_source_target_extensions_conflict() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add", "codex", "--source", "src.toml", "--target", "tgt.json", "--field", "x",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("conflicting format extensions"));
+}
+
+#[test]
+fn add_appends_fields_to_existing_target_without_changing_format() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "max_bytes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 1 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("- tui.theme"), "yaml: {yaml}");
+    assert!(yaml.contains("- max_bytes"), "yaml: {yaml}");
+}
+
+#[test]
+fn add_dedupes_when_field_already_exists() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    target: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+
+    dot_sync_in(dir.path())
+        .args(["add", "codex", "--field", "tui.theme"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("appended 0 field"));
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    let count = yaml.matches("- tui.theme").count();
+    assert_eq!(count, 1, "should not duplicate: {yaml}");
+}
+
+#[test]
+fn add_rejects_invalid_field_paths() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "src.toml",
+            "--target",
+            "tgt.toml",
+            "--field",
+            "tui..theme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid sync path 'tui..theme'"));
+}
+
+#[test]
+fn add_dry_run_does_not_write() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+    let original = read_file(&dir.path().join(".sync.yaml"));
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "src.toml",
+            "--target",
+            "tgt.toml",
+            "--field",
+            "tui.theme",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"))
+        .stdout(predicate::str::contains("- tui.theme"));
+
+    assert_eq!(read_file(&dir.path().join(".sync.yaml")), original);
+}
+
+#[test]
+fn add_non_tty_without_field_errors_with_actionable_message() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+    write_file(&dir.path().join("source.toml"), "tui = { theme = \"x\" }\n");
+
+    // assert_cmd runs the binary with non-TTY stdin/stdout, so the
+    // picker can't open. The command must surface a clear error.
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "interactive picker requires a TTY",
+        ));
+}
+
+#[test]
+fn add_then_push_uses_the_added_target() {
+    // End-to-end: bootstrap `.sync.yaml`, add a target, then push to
+    // verify the engine accepts what `add` wrote.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.toml"),
+        "max_bytes = 65536\n[tui]\ntheme = \"monokai\"\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--source",
+            "source.toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+            "--field",
+            "max_bytes",
+        ])
+        .assert()
+        .success();
+
+    dot_sync_in(dir.path())
+        .args(["push", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: tui.theme"))
+        .stdout(predicate::str::contains("added target: max_bytes"));
+
+    let target = read_file(&dir.path().join("target.toml"));
+    assert!(target.contains("monokai"), "{target}");
+    assert!(target.contains("65536"), "{target}");
+}
+
+#[test]
+fn add_errors_when_new_target_missing_source() {
+    let dir = TempDir::new().unwrap();
+    write_file(&dir.path().join(".sync.yaml"), "targets: {}\n");
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "codex",
+            "--format",
+            "toml",
+            "--target",
+            "target.toml",
+            "--field",
+            "tui.theme",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--source is required"));
+}

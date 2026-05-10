@@ -1116,10 +1116,11 @@ fn json_walk_object_for_discovery(
                 .filter(|el| cst_node_is_real_value(el))
                 .filter_map(|el| el.as_object())
                 .collect();
-            if !item_objs.is_empty() && item_objs.len() == elements.len() {
-                if let Some(node) = json_array_of_objects_node(&key, &item_objs, &seg_ancestors) {
-                    out.push(node);
-                }
+            if !item_objs.is_empty()
+                && item_objs.len() == elements.len()
+                && let Some(node) = json_array_of_objects_node(&key, &item_objs, &seg_ancestors)
+            {
+                out.push(node);
             }
             // Mixed / scalar / no-objects arrays: skip.
             continue;
