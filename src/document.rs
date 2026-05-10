@@ -3258,4 +3258,21 @@ name = "x"
         let tree = doc.discover_field_tree();
         assert!(tree.roots.iter().all(|n| n.display != "things"));
     }
+
+    #[test]
+    fn json_discover_returns_empty_tree_for_empty_object() {
+        // Empty document — no roots. Picker code special-cases an empty
+        // tree to "Confirmed(empty)" so the user sees a "no fields"
+        // message rather than an empty TUI.
+        let doc = JsonDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
+    }
+
+    #[test]
+    fn toml_discover_returns_empty_tree_for_empty_doc() {
+        let doc = TomlDocument::empty();
+        let tree = doc.discover_field_tree();
+        assert!(tree.roots.is_empty(), "expected empty tree from empty doc");
+    }
 }
