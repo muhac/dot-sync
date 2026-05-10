@@ -1037,9 +1037,7 @@ fn json_sync_source_wins_overrides_non_null_target_with_explicit_null() {
         .args(["sync", "agent", "--source-wins"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "changed target: feature.value",
-        ));
+        .stdout(predicate::str::contains("changed target: feature.value"));
     fixture.assert_file_eq("target.json", "target.expected.json");
 }
 
