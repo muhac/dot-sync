@@ -1,0 +1,8 @@
+# target has st (source-missing) and conflicting co + editor
+
+[alias]
+	co = co-target
+	st = status
+
+[core]
+	editor = nvim

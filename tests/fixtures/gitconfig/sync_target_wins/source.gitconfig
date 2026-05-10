@@ -1,0 +1,7 @@
+# source has alias.co, missing st; conflicting editor
+
+[alias]
+	co = co-source
+
+[core]
+	editor = vim

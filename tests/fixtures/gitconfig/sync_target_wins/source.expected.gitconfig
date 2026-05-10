@@ -1,0 +1,8 @@
+# source has alias.co, missing st; conflicting editor
+
+[alias]
+	co = co-target
+
+	st = status
+[core]
+	editor = nvim

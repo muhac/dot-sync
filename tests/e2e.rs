@@ -2146,3 +2146,181 @@ fn each_subcommand_help_shows_examples_block() {
         );
     }
 }
+
+// =====================================================================
+// gitconfig backend
+// =====================================================================
+
+#[test]
+fn gitconfig_push_updates_synced_keys_and_preserves_unmanaged_lines() {
+    // Pulls in target.gitconfig that has user.email + excludesfile +
+    // a multivar fetch line. None of those are in the sync list, so
+    // they must round-trip untouched. Synced keys (alias.co, alias.st,
+    // core.editor, remote.origin.url) all change.
+    let fixture = Fixture::load("gitconfig", "push_basic");
+
+    fixture
+        .command()
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: alias.co"))
+        .stdout(predicate::str::contains("added target: alias.st"))
+        .stdout(predicate::str::contains("changed target: core.editor"))
+        .stdout(predicate::str::contains("changed target: remote.origin.url"));
+
+    fixture.assert_file_eq("target.gitconfig", "target.expected.gitconfig");
+}
+
+#[test]
+fn gitconfig_pull_updates_source_and_leaves_target_alone() {
+    let fixture = Fixture::load("gitconfig", "pull_basic");
+    let target_before = fixture.read("target.gitconfig");
+
+    fixture
+        .command()
+        .args(["pull", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: alias.co"))
+        .stdout(predicate::str::contains("changed source: core.editor"))
+        .stdout(predicate::str::contains("changed source: remote.origin.url"));
+
+    fixture.assert_file_eq("source.gitconfig", "source.expected.gitconfig");
+    assert_eq!(fixture.read("target.gitconfig"), target_before);
+}
+
+#[test]
+fn gitconfig_sync_target_wins_writes_source_only() {
+    // target.alias.co wins over source's; source.alias.st is missing
+    // and fills from target; target.core.editor wins on conflict.
+    // Target file stays untouched (default --target-wins, source side
+    // is the only one that changes).
+    let fixture = Fixture::load("gitconfig", "sync_target_wins");
+    let target_before = fixture.read("target.gitconfig");
+
+    fixture
+        .command()
+        .args(["sync", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed source: alias.co"))
+        .stdout(predicate::str::contains("added source: alias.st"))
+        .stdout(predicate::str::contains("changed source: core.editor"));
+
+    fixture.assert_file_eq("source.gitconfig", "source.expected.gitconfig");
+    assert_eq!(fixture.read("target.gitconfig"), target_before);
+}
+
+#[test]
+fn gitconfig_push_bails_when_target_has_multivar_at_synced_path() {
+    // Target has two `remote.origin.fetch =` lines. The user puts
+    // that path in `.sync.yaml`, which dot-sync treats as data
+    // corruption — bail rather than overwrite one of the two lines.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        "\
+targets:
+  gitsync:
+    format: gitconfig
+    source: source.gitconfig
+    target: target.gitconfig
+    sync:
+      - remote.origin.fetch
+",
+    );
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[remote \"origin\"]\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "\
+[remote \"origin\"]
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+\tfetch = +refs/tags/*:refs/tags/*
+",
+    );
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multivar"))
+        .stderr(predicate::str::contains("remote.origin.fetch"));
+}
+
+#[test]
+fn gitconfig_add_infers_format_from_extension() {
+    // `dot-sync add` with --source / --target ending in `.gitconfig`
+    // and no --format flag picks `gitconfig`.
+    let dir = TempDir::new().unwrap();
+    // Source must exist for non-interactive add (format check / path
+    // resolution doesn't read it, but other checks do — keep the
+    // fixture honest).
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[user]\n\temail = a@b\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "user.email",
+        ])
+        .assert()
+        .success();
+
+    let yaml = read_file(&dir.path().join(".sync.yaml"));
+    assert!(yaml.contains("format: gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("source: source.gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("target: target.gitconfig"), "yaml: {yaml}");
+    assert!(yaml.contains("user.email"), "yaml: {yaml}");
+}
+
+#[test]
+fn gitconfig_add_then_push_uses_inferred_format() {
+    // End-to-end: bootstrap a fresh `.sync.yaml` via add (format
+    // inferred from extension), then run push and confirm it actually
+    // reaches the gitconfig backend rather than tripping over an
+    // unsupported format.
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join("source.gitconfig"),
+        "[alias]\n\tco = checkout\n",
+    );
+    write_file(
+        &dir.path().join("target.gitconfig"),
+        "[alias]\n\tco = co-old\n",
+    );
+
+    dot_sync_in(dir.path())
+        .args([
+            "add",
+            "gitsync",
+            "--source",
+            "source.gitconfig",
+            "--target",
+            "target.gitconfig",
+            "--field",
+            "alias.co",
+        ])
+        .assert()
+        .success();
+
+    dot_sync_in(dir.path())
+        .args(["push", "gitsync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed target: alias.co"));
+
+    let target = read_file(&dir.path().join("target.gitconfig"));
+    assert!(target.contains("co = checkout"), "target: {target}");
+}

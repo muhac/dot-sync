@@ -1,0 +1,10 @@
+# dot-sync managed fragment
+
+[alias]
+	co = co-old-source
+
+[core]
+	editor = vim-old
+
+[remote "origin"]
+	url = https://github.com/example/old

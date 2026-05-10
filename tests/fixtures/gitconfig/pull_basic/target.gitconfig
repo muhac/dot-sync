@@ -1,0 +1,13 @@
+# local target
+
+[user]
+	email = local@example.com
+
+[alias]
+	co = checkout
+
+[core]
+	editor = nvim
+
+[remote "origin"]
+	url = https://github.com/example/new
