@@ -1959,6 +1959,26 @@ enabled = true
     }
 
     #[test]
+    fn json_empty_renders_as_object_with_newline() {
+        // Direct constructor — covers the `expect("hardcoded {} parses
+        // cleanly")` path. Lock the basic invariant so a jsonc-parser
+        // upgrade that breaks `{}` parsing surfaces here, not in the
+        // engine's bootstrap path.
+        let doc = JsonDocument::empty();
+        assert_eq!(doc.render(), "{}\n");
+    }
+
+    #[test]
+    fn json_empty_supports_set_then_get() {
+        // empty() returns a usable document — set / get round-trips
+        // through the CST without going through file I/O.
+        let mut doc = JsonDocument::empty();
+        let path = FieldPath::parse("a.b").unwrap();
+        doc.set(&path, json!(1)).unwrap();
+        assert_eq!(doc.get(&path), Some(json!(1)));
+    }
+
+    #[test]
     fn json_load_treats_empty_file_as_empty_object() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.json");
