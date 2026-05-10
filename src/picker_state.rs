@@ -671,4 +671,112 @@ mod tests {
             vec!["servers".to_string()],
         );
     }
+
+    /// 4-level nesting: `a → b → c → d` (all containers with paths).
+    /// Cycle the top-level Whole→Individual→Empty and verify
+    /// `selected_paths()` matches the displayed state at each step.
+    #[test]
+    fn deep_nesting_cycles_cleanly_through_whole_individual_empty() {
+        fn p(s: &str) -> FieldPath {
+            FieldPath::parse(s).unwrap()
+        }
+        let leaf = FieldNode::leaf("d", p("a.b.c.d"));
+        let c = FieldNode::object("c", p("a.b.c"), vec![leaf]);
+        let b = FieldNode::object("b", p("a.b"), vec![c]);
+        let a = FieldNode::object("a", p("a"), vec![b]);
+        let mut s = PickerState::from_tree(FieldTree { roots: vec![a] });
+
+        let a_idx = 0;
+        let b_idx = 1;
+        let c_idx = 2;
+        let d_idx = 3;
+
+        // Empty → Whole at the top.
+        s.toggle(a_idx);
+        assert_eq!(s.check_state(a_idx), CheckState::Whole);
+        assert!(!s.is_selected(b_idx) && !s.is_selected(c_idx) && !s.is_selected(d_idx));
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()],
+        );
+
+        // Whole → Individual at the top: every leaf at any depth gets
+        // selected, every intermediate container stays cleared.
+        s.toggle(a_idx);
+        assert_eq!(s.check_state(a_idx), CheckState::Individual);
+        assert!(!s.is_selected(b_idx));
+        assert!(!s.is_selected(c_idx));
+        assert!(s.is_selected(d_idx));
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            vec!["a.b.c.d".to_string()],
+        );
+
+        // Individual → Empty: nothing selected anywhere.
+        s.toggle(a_idx);
+        assert_eq!(s.check_state(a_idx), CheckState::Empty);
+        assert!(!s.is_selected(d_idx));
+        assert!(s.selected_paths().is_empty());
+    }
+
+    /// A virtual group lives under a parent that's currently `[~]`
+    /// (mixed because some other leaf in the parent is checked). Toggling
+    /// the virtual group should still cycle through `[*]` → `[ ]` and
+    /// not be confused by the parent's mixed state.
+    #[test]
+    fn virtual_group_cycles_independently_of_mixed_parent() {
+        fn p(s: &str) -> FieldPath {
+            FieldPath::parse(s).unwrap()
+        }
+        // servers (object)
+        //   plain (leaf)                       — toggled on by user
+        //   [name=*] (virtual)
+        //     enabled (wildcard leaf)
+        let plain = FieldNode::leaf("plain", p("servers.plain"));
+        let wc_leaf = FieldNode::leaf("enabled", p("servers[name].enabled"));
+        let wc_group = FieldNode::virtual_group("[name=*]", vec![wc_leaf]);
+        let servers = FieldNode::object("servers", p("servers"), vec![plain, wc_group]);
+        let mut s = PickerState::from_tree(FieldTree {
+            roots: vec![servers],
+        });
+
+        let servers_idx = 0;
+        let plain_idx = 1;
+        let wc_group_idx = 2;
+        let wc_leaf_idx = 3;
+
+        // User checks the plain leaf — parent goes Mixed.
+        s.toggle(plain_idx);
+        assert_eq!(s.check_state(servers_idx), CheckState::Mixed);
+
+        // User now expands and toggles the virtual group. It should
+        // skip Whole (no own path) and go straight to Individual.
+        s.toggle(wc_group_idx);
+        assert_eq!(s.check_state(wc_group_idx), CheckState::Individual);
+        assert!(s.is_selected(wc_leaf_idx));
+
+        // Both selections survive — independent branches.
+        let mut paths: Vec<String> = s.selected_paths().iter().map(|p| p.to_string()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "servers.plain".to_string(),
+                "servers[name].enabled".to_string()
+            ],
+        );
+
+        // Cycle the virtual group again: Individual → Empty. Plain leaf
+        // stays selected; the parent goes back to Mixed.
+        s.toggle(wc_group_idx);
+        assert_eq!(s.check_state(wc_group_idx), CheckState::Empty);
+        assert!(s.is_selected(plain_idx));
+        assert_eq!(s.check_state(servers_idx), CheckState::Mixed);
+    }
 }
