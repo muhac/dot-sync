@@ -919,7 +919,8 @@ fn selector_value_to_cst_input(value: &SelectorValue) -> CstInputValue {
 /// Inspects leaves directly (avoiding `to_serde_value` on the value node)
 /// because jsonc-parser 0.32.3 has a bug where `arr.elements()` after an
 /// `append()` can expose a phantom whitespace "string lit" whose
-/// `decoded_value()` panics inside `parse_string`. Going through
+/// `decoded_value()` panics inside `parse_string`. See
+/// <https://github.com/dprint/jsonc-parser/issues/78>. Going through
 /// `as_string_lit().decoded_value()` is fine for *real* string lits the
 /// caller has already filtered to (e.g. via `as_object()` first), and
 /// for booleans / numbers we don't use `decoded_value` at all.
@@ -1006,7 +1007,8 @@ fn json_get(obj: &CstObject, segments: &[Segment]) -> Option<JsonValue> {
 /// `CstNode::to_serde_value()` doesn't filter these and panics inside
 /// `decoded_value()` when the phantom's raw value is whitespace, so we
 /// recurse manually with the same leaf-direct pattern that
-/// `cst_object_matches` uses.
+/// `cst_object_matches` uses. Tracking upstream:
+/// <https://github.com/dprint/jsonc-parser/issues/78>.
 fn cst_node_to_serde_value_safe(node: &CstNode) -> Option<JsonValue> {
     if let Some(obj) = node.as_object() {
         let mut map = serde_json::Map::new();
@@ -1072,7 +1074,8 @@ fn cst_node_to_serde_value_safe(node: &CstNode) -> Option<JsonValue> {
 /// True when the CST node is a real value-bearing node (object, array,
 /// number / bool / null literal, or a properly quoted string literal),
 /// not a phantom trivia node leaking through `as_string_lit()` after
-/// `append()` (jsonc-parser 0.32.3 quirk).
+/// `append()` (jsonc-parser 0.32.3 quirk;
+/// <https://github.com/dprint/jsonc-parser/issues/78>).
 fn cst_node_is_real_value(node: &CstNode) -> bool {
     if node.as_object().is_some()
         || node.as_array().is_some()
@@ -1134,7 +1137,8 @@ fn json_table_conflict_walk(
 /// Build a `TableConflict` from a CST node directly. We deliberately do NOT
 /// call `to_serde_value` on the offending node — for container nodes that
 /// recurses into descendants and trips over jsonc-parser 0.32.3's phantom
-/// whitespace "string lit" bug after an array `append()`. Instead, derive
+/// whitespace "string lit" bug after an array `append()`
+/// (<https://github.com/dprint/jsonc-parser/issues/78>). Instead, derive
 /// `kind` from CST type accessors and `value` from `Display` (which uses
 /// `raw_value` and is panic-safe).
 fn cst_conflict_report(prefix: &[String], node: &jsonc_parser::cst::CstNode) -> TableConflict {
@@ -2624,11 +2628,12 @@ enabled = true
     #[test]
     fn json_get_on_container_after_array_append_does_not_panic() {
         // Regression guard for jsonc-parser 0.32.3's phantom-string-lit
-        // bug: after `append()` on an array of objects, `arr.elements()`
-        // can include a whitespace "string lit" whose `decoded_value()`
-        // panics. Calling `to_serde_value()` on the array would walk
-        // every element (including the phantom) — the safe walker filters
-        // the phantom and returns the real array contents.
+        // bug (https://github.com/dprint/jsonc-parser/issues/78): after
+        // `append()` on an array of objects, `arr.elements()` can include
+        // a whitespace "string lit" whose `decoded_value()` panics.
+        // Calling `to_serde_value()` on the array would walk every element
+        // (including the phantom) — the safe walker filters the phantom
+        // and returns the real array contents.
         let mut doc = json_doc(r#"{"servers": [{"name": "a"}, {"name": "b"}]}"#);
         // Append a third entry — triggers the phantom condition.
         doc.set(
