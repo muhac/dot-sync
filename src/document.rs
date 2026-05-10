@@ -4,7 +4,20 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::path::FieldPath;
+use crate::path::{FieldPath, Segment};
+
+/// Reduce a FieldPath to a flat list of key names if every segment is a plain
+/// key (no array selector). Returns None otherwise — callers that don't yet
+/// handle selectors fall back to "no value at this path".
+fn plain_segment_names(path: &FieldPath) -> Option<Vec<String>> {
+    path.segments()
+        .iter()
+        .map(|seg: &Segment| match &seg.select {
+            None => Some(seg.name.clone()),
+            Some(_) => None,
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct TableConflict {
@@ -134,15 +147,20 @@ impl Document for TomlDocument {
     }
 
     fn get(&self, path: &FieldPath) -> Option<Item> {
-        get_from_table(self.doc.as_table(), path.segments()).cloned()
+        let names = plain_segment_names(path)?;
+        get_from_table(self.doc.as_table(), &names).cloned()
     }
 
     fn set(&mut self, path: &FieldPath, item: Item) -> Result<()> {
-        set_in_table(self.doc.as_table_mut(), path.segments(), item)
+        let Some(names) = plain_segment_names(path) else {
+            bail!("array selectors in {path:?} are not yet wired through TomlDocument");
+        };
+        set_in_table(self.doc.as_table_mut(), &names, item)
     }
 
     fn table_conflict(&self, path: &FieldPath) -> Option<TableConflict> {
-        table_conflict_in_table(self.doc.as_table(), path.segments())
+        let names = plain_segment_names(path)?;
+        table_conflict_in_table(self.doc.as_table(), &names)
     }
 
     fn render(&self) -> String {
