@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "dot-sync")]
@@ -6,6 +6,20 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncFlags {
+    /// Target name from .sync.yaml. Omit to process all targets.
+    pub name: Option<String>,
+
+    /// Show planned changes without writing files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Create a timestamped backup before writing.
+    #[arg(long)]
+    pub backup: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -17,44 +31,11 @@ pub enum Command {
     },
 
     /// Pull selected fields from target into source.
-    Pull {
-        /// Target name from .sync.yaml. Omit to process all targets.
-        name: Option<String>,
-
-        /// Show planned changes without writing files.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Create a timestamped backup before writing.
-        #[arg(long)]
-        backup: bool,
-    },
+    Pull(#[command(flatten)] SyncFlags),
 
     /// Push selected fields from source into target.
-    Push {
-        /// Target name from .sync.yaml. Omit to process all targets.
-        name: Option<String>,
+    Push(#[command(flatten)] SyncFlags),
 
-        /// Show planned changes without writing files.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Create a timestamped backup before writing.
-        #[arg(long)]
-        backup: bool,
-    },
-
-    /// Pull from target to source, then fill target from source.
-    Sync {
-        /// Target name from .sync.yaml. Omit to process all targets.
-        name: Option<String>,
-
-        /// Show planned changes without writing files.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Create a timestamped backup before writing.
-        #[arg(long)]
-        backup: bool,
-    },
+    /// Reconcile selected fields between source and target in both directions.
+    Sync(#[command(flatten)] SyncFlags),
 }

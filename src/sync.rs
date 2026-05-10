@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,17 @@ pub enum Direction {
     Pull,
     Push,
     Sync,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Pull => "pull",
+            Self::Push => "push",
+            Self::Sync => "sync",
+        };
+        f.write_str(name)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,8 +52,6 @@ enum Destination {
 enum Action {
     Add,
     Change,
-    Remove,
-    Rewrite,
 }
 
 #[derive(Debug)]
@@ -104,9 +114,9 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
     let warnings = detect_table_conflicts(&source, &target_doc, &sync_paths, direction);
 
     let changes = match direction {
-        Direction::Pull => pull(&mut source, &target_doc, &sync_paths, &target.format)?,
+        Direction::Pull => pull(&mut source, &target_doc, &sync_paths)?,
         Direction::Push => push(&source, &mut target_doc, &sync_paths)?,
-        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths, &target.format)?,
+        Direction::Sync => sync(&mut source, &mut target_doc, &sync_paths)?,
     };
 
     report_changes(target, direction, options, &changes, &warnings);
@@ -122,10 +132,10 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
         .any(|change| matches!(change.destination, Destination::Target));
 
     if writes_source {
-        write_document(&target.source, source.to_string(), options.backup)?;
+        write_document(&target.source, source.render(), options.backup)?;
     }
     if writes_target {
-        write_document(&target.target, target_doc.to_string(), options.backup)?;
+        write_document(&target.target, target_doc.render(), options.backup)?;
     }
 
     Ok(())
@@ -169,7 +179,7 @@ fn load_document_for_target(
     let path = role.path(target);
     if !path.exists() && !allow_missing {
         bail!(
-            "target '{}' cannot {:?}: {} file does not exist: {}\n  fix: {}",
+            "target '{}' cannot {}: {} file does not exist: {}\n  fix: {}",
             target.name,
             direction,
             role.label(),
@@ -192,68 +202,13 @@ fn pull(
     source: &mut dyn Document,
     target: &dyn Document,
     paths: &[ParsedPath],
-    format: &str,
 ) -> Result<Vec<Change>> {
-    let canonical_source = build_canonical_source(format, paths, |path| target.get(path))?;
-    let source_needs_canonical_rewrite = source.to_string() != canonical_source.to_string();
     let mut changes = Vec::new();
     for path in paths {
-        let Some(target_item) = canonical_source.get(&path.path) else {
-            continue;
-        };
-        let source_item = source.get(&path.path);
-        let source_conflict = source.table_conflict(&path.path);
-        if source_item
-            .as_ref()
-            .is_some_and(|source_item| same_item(source_item, &target_item))
-        {
-            continue;
-        }
-        let action = if source_item.is_some() || source_conflict.is_some() {
-            Action::Change
-        } else {
-            Action::Add
-        };
-        let source_value = source_conflict
-            .as_ref()
-            .map(|conflict| conflict.value.clone())
-            .unwrap_or_else(|| summarize_item(source_item.as_ref()));
-        let target_value = summarize_item(Some(&target_item));
-        source.set(&path.path, target_item)?;
-        changes.push(Change {
-            path: path.raw.clone(),
-            destination: Destination::Source,
-            action,
-            source_value,
-            target_value,
-        });
-    }
-    for path in paths {
-        let source_item = source.get(&path.path);
-        if canonical_source.get(&path.path).is_none() && source_item.is_some() {
-            changes.push(Change {
-                path: path.raw.clone(),
-                destination: Destination::Source,
-                action: Action::Remove,
-                source_value: summarize_item(source_item.as_ref()),
-                target_value: summarize_item(None),
-            });
+        if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
+            changes.push(change);
         }
     }
-    if source_needs_canonical_rewrite
-        && !changes
-            .iter()
-            .any(|change| matches!(change.destination, Destination::Source))
-    {
-        changes.push(Change {
-            path: "canonical source order".to_string(),
-            destination: Destination::Source,
-            action: Action::Rewrite,
-            source_value: String::new(),
-            target_value: String::new(),
-        });
-    }
-    replace_with_canonical_source(source, canonical_source, paths)?;
     Ok(changes)
 }
 
@@ -264,35 +219,9 @@ fn push(
 ) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
     for path in paths {
-        let Some(source_item) = source.get(&path.path) else {
-            continue;
-        };
-        let target_item = target.get(&path.path);
-        let target_conflict = target.table_conflict(&path.path);
-        if target_item
-            .as_ref()
-            .is_some_and(|target_item| same_item(target_item, &source_item))
-        {
-            continue;
+        if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
+            changes.push(change);
         }
-        let action = if target_item.is_some() || target_conflict.is_some() {
-            Action::Change
-        } else {
-            Action::Add
-        };
-        let source_value = summarize_item(Some(&source_item));
-        let target_value = target_conflict
-            .as_ref()
-            .map(|conflict| conflict.value.clone())
-            .unwrap_or_else(|| summarize_item(target_item.as_ref()));
-        target.set(&path.path, source_item)?;
-        changes.push(Change {
-            path: path.raw.clone(),
-            destination: Destination::Target,
-            action,
-            source_value,
-            target_value,
-        });
     }
     Ok(changes)
 }
@@ -301,109 +230,72 @@ fn sync(
     source: &mut dyn Document,
     target: &mut dyn Document,
     paths: &[ParsedPath],
-    format: &str,
 ) -> Result<Vec<Change>> {
-    let canonical_source = build_canonical_source(format, paths, |path| {
-        target.get(path).or_else(|| source.get(path))
-    })?;
-    let source_needs_canonical_rewrite = source.to_string() != canonical_source.to_string();
     let mut changes = Vec::new();
     for path in paths {
-        let target_item = target.get(&path.path);
         let source_item = source.get(&path.path);
-        let canonical_item = canonical_source.get(&path.path);
-        let source_conflict = source.table_conflict(&path.path);
-        let target_conflict = target.table_conflict(&path.path);
-
-        if canonical_item.as_ref().is_some_and(|canonical_item| {
-            source_item
-                .as_ref()
-                .is_none_or(|source_item| !same_item(source_item, canonical_item))
-        }) {
-            let action = if source_item.is_some() || source_conflict.is_some() {
-                Action::Change
-            } else {
-                Action::Add
-            };
-            changes.push(Change {
-                path: path.raw.clone(),
-                destination: Destination::Source,
-                action,
-                source_value: source_conflict
-                    .as_ref()
-                    .map(|conflict| conflict.value.clone())
-                    .unwrap_or_else(|| summarize_item(source_item.as_ref())),
-                target_value: summarize_item(canonical_item.as_ref()),
-            });
-        }
-
-        if (target_item.is_none() || target_conflict.is_some())
-            && let Some(source_item) = source_item
-        {
-            let source_value = summarize_item(Some(&source_item));
-            target.set(&path.path, source_item)?;
-            changes.push(Change {
-                path: path.raw.clone(),
-                destination: Destination::Target,
-                action: if target_conflict.is_some() {
-                    Action::Change
-                } else {
-                    Action::Add
-                },
-                source_value,
-                target_value: target_conflict
-                    .as_ref()
-                    .map(|conflict| conflict.value.clone())
-                    .unwrap_or_else(|| summarize_item(None)),
-            });
+        let target_item = target.get(&path.path);
+        match (source_item, target_item) {
+            (None, None) => continue,
+            (Some(s), Some(t)) if same_item(&s, &t) => continue,
+            (_, Some(_)) => {
+                if let Some(change) = apply_one_way(source, target, path, Destination::Source)? {
+                    changes.push(change);
+                }
+            }
+            (Some(_), None) => {
+                if let Some(change) = apply_one_way(target, source, path, Destination::Target)? {
+                    changes.push(change);
+                }
+            }
         }
     }
-    if source_needs_canonical_rewrite
-        && !changes
-            .iter()
-            .any(|change| matches!(change.destination, Destination::Source))
-    {
-        changes.push(Change {
-            path: "canonical source order".to_string(),
-            destination: Destination::Source,
-            action: Action::Rewrite,
-            source_value: String::new(),
-            target_value: String::new(),
-        });
-    }
-    replace_with_canonical_source(source, canonical_source, paths)?;
     Ok(changes)
 }
 
-fn build_canonical_source<F>(
-    format: &str,
-    paths: &[ParsedPath],
-    mut value_for: F,
-) -> Result<AnyDocument>
-where
-    F: FnMut(&FieldPath) -> Option<toml_edit::Item>,
-{
-    let mut canonical = AnyDocument::empty(format)?;
-    for path in paths {
-        if let Some(item) = value_for(&path.path) {
-            canonical.set(&path.path, item)?;
-        }
+/// Copy the value at `path` from `from` into `into`, returning a Change record
+/// describing the write. Returns `None` if `from` has no value at `path` or if
+/// the values already match.
+fn apply_one_way(
+    into: &mut dyn Document,
+    from: &dyn Document,
+    path: &ParsedPath,
+    destination: Destination,
+) -> Result<Option<Change>> {
+    let Some(from_item) = from.get(&path.path) else {
+        return Ok(None);
+    };
+    let into_item = into.get(&path.path);
+    let into_conflict = into.table_conflict(&path.path);
+    if into_item
+        .as_ref()
+        .is_some_and(|item| same_item(item, &from_item))
+    {
+        return Ok(None);
     }
-    Ok(canonical)
-}
+    let action = if into_item.is_some() || into_conflict.is_some() {
+        Action::Change
+    } else {
+        Action::Add
+    };
+    let from_value = summarize_item(Some(&from_item));
+    let into_value = into_conflict
+        .as_ref()
+        .map(|conflict| conflict.value.clone())
+        .unwrap_or_else(|| summarize_item(into_item.as_ref()));
+    into.set(&path.path, from_item)?;
 
-fn replace_with_canonical_source(
-    source: &mut dyn Document,
-    canonical_source: AnyDocument,
-    paths: &[ParsedPath],
-) -> Result<()> {
-    source.clear();
-    for path in paths {
-        if let Some(item) = canonical_source.get(&path.path) {
-            source.set(&path.path, item)?;
-        }
-    }
-    Ok(())
+    let (source_value, target_value) = match destination {
+        Destination::Source => (into_value, from_value),
+        Destination::Target => (from_value, into_value),
+    };
+    Ok(Some(Change {
+        path: path.raw.clone(),
+        destination,
+        action,
+        source_value,
+        target_value,
+    }))
 }
 
 #[derive(Debug)]
@@ -499,7 +391,7 @@ fn report_changes(
     warnings: &[Warning],
 ) {
     let mode = if options.dry_run { "dry-run" } else { "apply" };
-    println!("{} {:?} {}", target.name, direction, mode);
+    println!("{} {} {}", target.name, direction, mode);
     if options.dry_run {
         println!("  dry run: no files written");
     }
@@ -521,8 +413,6 @@ fn report_changes(
         let (present, past) = match change.action {
             Action::Add => ("add", "added"),
             Action::Change => ("change", "changed"),
-            Action::Remove => ("remove", "removed"),
-            Action::Rewrite => ("rewrite", "rewritten"),
         };
         let label = if options.dry_run {
             format!("would {present}")
@@ -530,10 +420,8 @@ fn report_changes(
             past.to_string()
         };
         println!("  {label} {destination}: {}", change.path);
-        if !matches!(change.action, Action::Rewrite) {
-            println!("    source: {}", change.source_value);
-            println!("    target: {}", change.target_value);
-        }
+        println!("    source: {}", change.source_value);
+        println!("    target: {}", change.target_value);
     }
 }
 
@@ -611,13 +499,7 @@ project_doc_max_bytes = 65536
 trust_level = "trusted"
 "#,
         );
-        let changes = pull(
-            &mut source,
-            &target,
-            &parsed(&["project_doc_max_bytes"]),
-            "toml",
-        )
-        .unwrap();
+        let changes = pull(&mut source, &target, &parsed(&["project_doc_max_bytes"])).unwrap();
         assert_eq!(changes.len(), 1);
         assert!(
             source
@@ -628,7 +510,7 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn pull_rewrites_source_in_sync_order() {
+    fn pull_preserves_unlisted_source_fields_and_layout() {
         let mut source = toml_from(
             r#"
 [local]
@@ -652,56 +534,21 @@ theme = "monokai"
             &mut source,
             &target,
             &parsed(&["tui.theme", "plugins.\"github@openai-curated\".enabled"]),
-            "toml",
         )
         .unwrap();
 
-        let rendered = source.to_string();
-        assert!(!rendered.contains("[local]"));
+        let rendered = source.render();
+        assert!(rendered.contains("[local]"));
+        assert!(rendered.contains("state = true"));
+        assert!(rendered.contains("theme = \"monokai\""));
         assert!(
-            rendered.find("[tui]").unwrap()
-                < rendered
-                    .find("[plugins.\"github@openai-curated\"]")
-                    .unwrap()
+            rendered.find("[local]").unwrap() < rendered.find("[tui]").unwrap(),
+            "unlisted [local] should keep its original position before [tui]"
         );
-        assert!(!rendered.contains("[plugins]\n"));
     }
 
     #[test]
-    fn pull_reports_order_only_source_rewrite() {
-        let mut source = toml_from(
-            r#"
-[notice]
-hide_rate_limit_model_nudge = true
-
-[tui]
-theme = "monokai"
-"#,
-        );
-        let target = toml_from(
-            r#"
-[tui]
-theme = "monokai"
-
-[notice]
-hide_rate_limit_model_nudge = true
-"#,
-        );
-
-        let changes = pull(
-            &mut source,
-            &target,
-            &parsed(&["tui.theme", "notice.hide_rate_limit_model_nudge"]),
-            "toml",
-        )
-        .unwrap();
-
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "canonical source order");
-    }
-
-    #[test]
-    fn pull_reports_removed_source_fields_missing_from_target() {
+    fn pull_does_not_remove_listed_field_when_target_lacks_it() {
         let mut source = toml_from(
             r#"
 project_doc_max_bytes = 65536
@@ -714,17 +561,14 @@ project_doc_fallback_filenames = ["AGENTS.md"]
             &mut source,
             &target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
-            "toml",
         )
         .unwrap();
 
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "project_doc_fallback_filenames");
-        assert!(matches!(changes[0].action, Action::Remove));
+        assert!(changes.is_empty(), "no changes expected: {changes:?}");
         assert!(
             source
                 .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
-                .is_none()
+                .is_some()
         );
     }
 
@@ -759,7 +603,6 @@ project_doc_fallback_filenames = ["CLAUDE.md"]
             &mut source,
             &mut target,
             &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
-            "toml",
         )
         .unwrap();
 
@@ -775,7 +618,7 @@ project_doc_fallback_filenames = ["CLAUDE.md"]
     }
 
     #[test]
-    fn sync_canonical_source_uses_target_values_first() {
+    fn sync_target_value_wins_and_source_layout_is_preserved() {
         let mut source = toml_from(
             r#"
 [plugins."github@openai-curated"]
@@ -796,19 +639,18 @@ theme = "target"
             &mut source,
             &mut target,
             &parsed(&["tui.theme", "plugins.\"github@openai-curated\".enabled"]),
-            "toml",
         )
         .unwrap();
 
-        let rendered = source.to_string();
+        let rendered = source.render();
         assert!(rendered.contains("theme = \"target\""));
         assert!(
-            rendered.find("[tui]").unwrap()
-                < rendered
-                    .find("[plugins.\"github@openai-curated\"]")
-                    .unwrap()
+            rendered
+                .find("[plugins.\"github@openai-curated\"]")
+                .unwrap()
+                < rendered.find("[tui]").unwrap(),
+            "source ordering should be untouched"
         );
-        assert!(!rendered.contains("[plugins]\n"));
         assert!(
             target
                 .get(&FieldPath::parse("plugins.\"github@openai-curated\".enabled").unwrap())
@@ -817,36 +659,56 @@ theme = "target"
     }
 
     #[test]
-    fn sync_reports_order_only_source_rewrite() {
+    fn sync_never_removes_from_either_side() {
         let mut source = toml_from(
             r#"
-[notice]
-hide_rate_limit_model_nudge = true
-
-[tui]
-theme = "monokai"
+project_doc_max_bytes = 65536
+project_doc_fallback_filenames = ["AGENTS.md"]
 "#,
         );
         let mut target = toml_from(
             r#"
-[tui]
-theme = "monokai"
-
-[notice]
-hide_rate_limit_model_nudge = true
+tui_theme = "monokai"
 "#,
         );
-
-        let changes = sync(
+        sync(
             &mut source,
             &mut target,
-            &parsed(&["tui.theme", "notice.hide_rate_limit_model_nudge"]),
-            "toml",
+            &parsed(&["project_doc_max_bytes", "project_doc_fallback_filenames"]),
         )
         .unwrap();
 
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, "canonical source order");
+        assert!(
+            source
+                .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
+                .is_some(),
+            "sync must not delete source-only listed field"
+        );
+        assert!(
+            target
+                .get(&FieldPath::parse("project_doc_fallback_filenames").unwrap())
+                .is_some(),
+            "sync should fill target with source-only listed field"
+        );
+        assert!(
+            target
+                .get(&FieldPath::parse("tui_theme").unwrap())
+                .is_some(),
+            "sync must not touch unlisted target field"
+        );
+    }
+
+    #[test]
+    fn sync_no_change_when_both_sides_match() {
+        let mut source = toml_from("project_doc_max_bytes = 65536\n");
+        let mut target = toml_from("project_doc_max_bytes = 65536\n");
+        let changes = sync(
+            &mut source,
+            &mut target,
+            &parsed(&["project_doc_max_bytes"]),
+        )
+        .unwrap();
+        assert!(changes.is_empty());
     }
 
     #[test]

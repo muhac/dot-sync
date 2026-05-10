@@ -1,7 +1,7 @@
 project_doc_max_bytes = 65536
 
-[notice]
-hide_rate_limit_model_nudge = false
+[local]
+state = true
 
 [tui]
 theme = "monokai"

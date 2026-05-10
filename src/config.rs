@@ -7,11 +7,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     targets: BTreeMap<String, RawTargetConfig>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTargetConfig {
     format: String,
     source: String,

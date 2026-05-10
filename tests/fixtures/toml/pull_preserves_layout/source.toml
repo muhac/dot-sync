@@ -1,7 +1,7 @@
-[notice]
-hide_rate_limit_model_nudge = true
-
 project_doc_max_bytes = 1
+
+[local]
+state = true
 
 [tui]
 theme = "old"

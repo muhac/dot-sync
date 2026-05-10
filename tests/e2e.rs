@@ -90,7 +90,7 @@ fn sync_discovers_config_in_current_directory() {
         .args(["sync", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("codex Sync apply"))
+        .stdout(predicate::str::contains("codex sync apply"))
         .stdout(predicate::str::contains("added target: tui.theme"))
         .stdout(predicate::str::contains(
             "added target: project_doc_max_bytes",
@@ -134,8 +134,8 @@ fn push_preserves_unmanaged_target_fields() {
 }
 
 #[test]
-fn pull_rewrites_source_in_sync_order() {
-    let fixture = Fixture::load("toml", "pull_canonical_order");
+fn pull_updates_listed_fields_and_preserves_unlisted_layout() {
+    let fixture = Fixture::load("toml", "pull_preserves_layout");
 
     fixture
         .command()
@@ -144,26 +144,26 @@ fn pull_rewrites_source_in_sync_order() {
         .success()
         .stdout(predicate::str::contains("changed source: tui.theme"))
         .stdout(predicate::str::contains(
-            "added source: project_doc_max_bytes",
+            "changed source: project_doc_max_bytes",
         ));
 
     fixture.assert_file_eq("source.toml", "source.expected.toml");
 }
 
 #[test]
-fn pull_reports_removed_source_fields_missing_from_target() {
-    let fixture = Fixture::load("toml", "pull_removes_missing_target_field");
+fn pull_keeps_listed_source_field_when_target_lacks_it() {
+    let fixture = Fixture::load("toml", "pull_keeps_source_only_field");
+    let original_source = fixture.read("source.toml");
 
     fixture
         .command()
         .args(["pull", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "removed source: project_doc_fallback_filenames",
-        ));
+        .stdout(predicate::str::contains("No changes."))
+        .stdout(predicate::str::contains("removed source").not());
 
-    fixture.assert_file_eq("source.toml", "source.expected.toml");
+    assert_eq!(fixture.read("source.toml"), original_source);
 }
 
 #[test]
@@ -265,25 +265,6 @@ fn dry_run_reports_added_fields() {
             "would add target: project_doc_max_bytes",
         ))
         .stdout(predicate::str::contains("target: <missing>"));
-}
-
-#[test]
-fn dry_run_reports_removed_fields() {
-    let fixture = Fixture::load("toml", "pull_removes_missing_target_field");
-    let original_source = fixture.read("source.toml");
-
-    fixture
-        .command()
-        .args(["pull", "codex", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "would remove source: project_doc_fallback_filenames",
-        ))
-        .stdout(predicate::str::contains("source: [\"AGENTS.md\"]"))
-        .stdout(predicate::str::contains("target: <missing>"));
-
-    assert_eq!(fixture.read("source.toml"), original_source);
 }
 
 #[test]
@@ -517,8 +498,8 @@ fn multiple_targets_process_all_when_name_is_omitted() {
         .args(["push"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("codex Push apply"))
-        .stdout(predicate::str::contains("tooling Push apply"));
+        .stdout(predicate::str::contains("codex push apply"))
+        .stdout(predicate::str::contains("tooling push apply"));
 
     fixture.assert_file_eq("codex-target.toml", "codex-target.expected.toml");
     fixture.assert_file_eq("tooling-target.toml", "tooling-target.expected.toml");
@@ -546,4 +527,28 @@ fn malformed_config_exits_with_parse_error() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed to parse"));
+}
+
+#[test]
+fn config_rejects_unknown_keys() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir.path().join(".sync.yaml"),
+        r#"targets:
+  codex:
+    format: toml
+    source: source.toml
+    taregt: target.toml
+    sync:
+      - tui.theme
+"#,
+    );
+    write_file(&dir.path().join("source.toml"), "");
+    write_file(&dir.path().join("target.toml"), "");
+
+    dot_sync_in(dir.path())
+        .args(["status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown field `taregt`"));
 }
