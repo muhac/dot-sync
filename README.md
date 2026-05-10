@@ -174,6 +174,49 @@ dot-sync push
 dot-sync sync
 ```
 
+### Adding a target
+
+`dot-sync add <name>` creates a new target in `.sync.yaml` (bootstrapping
+the file if missing) or appends fields to an existing one.
+
+Non-interactive — full flag-driven, scriptable:
+
+```sh
+dot-sync add codex \
+  --format toml \
+  --source codex.sync.toml \
+  --target ~/.codex/config.toml \
+  --field tui.theme --field max_bytes
+```
+
+Format is inferred from the source / target extension when `--format`
+is omitted (`.toml` / `.json` / `.jsonc`). Append fields to an existing
+target with just `--field`:
+
+```sh
+dot-sync add codex --field tui.notification_condition
+```
+
+Interactive — drop the `--field` flags on a TTY and an interactive
+tree picker discovers fields from the source / target document:
+
+```sh
+dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
+# Tree picker opens.
+```
+
+Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space` toggle,
+`enter` confirm, `q` / `Esc` cancel. On containers, `space` cycles
+through `[ ]` (empty) → `[x]` (sync the whole subtree as one path) →
+`[*]` (sync each leaf individually) → `[ ]`. Manually toggling some
+leaves under a container shows `[~]` (mixed); pressing space on `[~]`
+resets the container.
+
+Pass `--dry-run` to preview the YAML write without modifying
+`.sync.yaml`. Note: editing `.sync.yaml` via `add` re-serializes the
+file via `serde_yaml_ng` and does not preserve user comments inside
+the YAML itself.
+
 All commands support `--dry-run` to show planned changes without writing either
 file. Pass `--backup` to also keep a persistent timestamped copy
 (`<file>.bak.<timestamp>`) next to the destination.
