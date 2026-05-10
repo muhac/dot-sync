@@ -44,10 +44,13 @@ pub fn run(title: &str, tree: FieldTree) -> Result<PickerOutcome> {
     result
 }
 
-/// True iff both stdin and stdout are connected to a terminal.
+/// True when stdout is connected to a terminal — that's where ratatui
+/// renders. Crossterm reads keyboard events from `/dev/tty` directly
+/// rather than stdin, so a piped stdin (e.g. `echo "" | dot-sync add`)
+/// is fine as long as stdout is still a TTY.
 fn is_terminal() -> bool {
     use std::io::IsTerminal;
-    io::stdin().is_terminal() && io::stdout().is_terminal()
+    io::stdout().is_terminal()
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, title: &str, tree: FieldTree) -> Result<PickerOutcome> {
