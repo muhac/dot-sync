@@ -2314,8 +2314,18 @@ impl Document for EnvDocument {
             .with_context(|| format!("failed to parse env file {}", path.display()))
     }
 
-    fn get(&self, _path: &FieldPath) -> Option<String> {
-        unimplemented!("EnvDocument::get — wired in next commit")
+    fn get(&self, path: &FieldPath) -> Option<String> {
+        // Invalid paths (selectors, multi-segment, non-POSIX key) can
+        // never resolve in env, so swallow the error here and return
+        // None. `set` surfaces the same error properly when the
+        // caller actually tries to write.
+        let key = path_to_env_key(path).ok()?;
+        // Last-wins: a later `KEY=` shadows earlier ones, matching
+        // bash's `export` semantics.
+        self.lines.iter().rev().find_map(|line| match line {
+            EnvLine::Entry(e) if e.key == key => Some(e.value.clone()),
+            _ => None,
+        })
     }
 
     fn set(&mut self, _path: &FieldPath, _item: String) -> Result<()> {
@@ -2362,13 +2372,48 @@ impl Document for EnvDocument {
         }
     }
 
-    fn expand(&self, _pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
-        unimplemented!("EnvDocument::expand — wired in next commit")
+    fn expand(&self, pattern: &FieldPath) -> Result<Vec<ResolvedPath>> {
+        // env has no arrays — any selector segment is invalid.
+        // Validate the path shape now so wildcard / pinned paths
+        // are rejected with a clear message rather than silently
+        // resolving to nothing.
+        path_to_env_key(pattern)?;
+        Ok(vec![ResolvedPath {
+            identity: Vec::new(),
+            path: pattern.clone(),
+        }])
     }
 
     fn discover_field_tree(&self) -> FieldTree {
         unimplemented!("EnvDocument::discover_field_tree — wired in a later commit")
     }
+}
+
+/// Validate and extract the env key from a `FieldPath`. Used by both
+/// `get` and `set`; `get` swallows the error (returns None), `set`
+/// surfaces it.
+fn path_to_env_key(path: &FieldPath) -> Result<String> {
+    if path.segments().iter().any(|s| s.select.is_some()) {
+        bail!(
+            "array selectors are not supported in env paths: {path} \
+             — env is a flat key-value namespace"
+        );
+    }
+    let segs = path.segments();
+    if segs.len() != 1 {
+        bail!(
+            "env paths are flat (exactly 1 segment): '{path}' has {} segments",
+            segs.len()
+        );
+    }
+    let key = &segs[0].name;
+    if !is_valid_env_key(key) {
+        bail!(
+            "invalid env key {key:?} \
+             (POSIX requires [A-Za-z_][A-Za-z0-9_]*)"
+        );
+    }
+    Ok(key.clone())
 }
 
 fn render_entry(out: &mut String, e: &EnvEntry) {
@@ -4938,5 +4983,125 @@ EMPTY=
             format!("{err:#}").contains("backslash-continued"),
             "msg: {err:#}"
         );
+    }
+
+    // ----- get + path validation -----
+
+    use crate::path::FieldPath;
+
+    fn doc_from(content: &str) -> (tempfile::TempDir, EnvDocument) {
+        let (dir, path) = write_fixture(content);
+        let doc = EnvDocument::load(&path, false).unwrap();
+        (dir, doc)
+    }
+
+    #[test]
+    fn get_reads_bare_value() {
+        let (_dir, doc) = doc_from("NODE_VERSION=22\n");
+        let path = FieldPath::parse("NODE_VERSION").unwrap();
+        assert_eq!(doc.get(&path), Some("22".to_string()));
+    }
+
+    #[test]
+    fn get_unwraps_double_quoted_value() {
+        let (_dir, doc) = doc_from("MSG=\"hello world\"\n");
+        let path = FieldPath::parse("MSG").unwrap();
+        assert_eq!(doc.get(&path), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn get_returns_unescaped_double_quoted_value() {
+        let (_dir, doc) = doc_from("MSG=\"he said \\\"hi\\\"\"\n");
+        let path = FieldPath::parse("MSG").unwrap();
+        assert_eq!(doc.get(&path), Some(r#"he said "hi""#.to_string()));
+    }
+
+    #[test]
+    fn get_unwraps_single_quoted_value_byte_literal() {
+        // Single quotes: no escape interpretation at all (POSIX).
+        let (_dir, doc) = doc_from("LITERAL='no $expansion \\here'\n");
+        let path = FieldPath::parse("LITERAL").unwrap();
+        assert_eq!(doc.get(&path), Some(r"no $expansion \here".to_string()));
+    }
+
+    #[test]
+    fn get_returns_value_through_export_prefix() {
+        let (_dir, doc) = doc_from("export DATABASE_URL=postgres://localhost/db\n");
+        let path = FieldPath::parse("DATABASE_URL").unwrap();
+        assert_eq!(doc.get(&path), Some("postgres://localhost/db".to_string()));
+    }
+
+    #[test]
+    fn get_returns_last_winning_value_for_duplicate_key() {
+        // POSIX shell `export` overwrites the previous binding.
+        // dot-sync matches that: later definition wins.
+        let (_dir, doc) = doc_from("KEY=first\nKEY=second\nKEY=third\n");
+        let path = FieldPath::parse("KEY").unwrap();
+        assert_eq!(doc.get(&path), Some("third".to_string()));
+    }
+
+    #[test]
+    fn get_is_case_sensitive() {
+        let (_dir, doc) = doc_from("PATH=/usr/bin\n");
+        // `path` is *not* the same identifier as `PATH` in env.
+        assert_eq!(doc.get(&FieldPath::parse("path").unwrap()), None);
+        assert_eq!(
+            doc.get(&FieldPath::parse("PATH").unwrap()),
+            Some("/usr/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_key() {
+        let (_dir, doc) = doc_from("PRESENT=1\n");
+        assert_eq!(doc.get(&FieldPath::parse("MISSING").unwrap()), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_invalid_path_arity() {
+        let (_dir, doc) = doc_from("KEY=value\n");
+        // Two segments → invalid for env.
+        assert_eq!(doc.get(&FieldPath::parse("section.KEY").unwrap()), None);
+    }
+
+    #[test]
+    fn get_returns_none_for_non_posix_key() {
+        let (_dir, doc) = doc_from("KEY=value\n");
+        // Hyphen is illegal in POSIX env names.
+        assert_eq!(doc.get(&FieldPath::parse("bad-key").unwrap()), None);
+    }
+
+    #[test]
+    fn expand_passes_through_clean_paths() {
+        let doc = EnvDocument::empty();
+        let path = FieldPath::parse("NODE_VERSION").unwrap();
+        let resolved = doc.expand(&path).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, path);
+    }
+
+    #[test]
+    fn expand_rejects_paths_with_selectors() {
+        let doc = EnvDocument::empty();
+        let err = doc
+            .expand(&FieldPath::parse("arr[k=\"v\"].field").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("flat key-value"), "msg: {err}");
+    }
+
+    #[test]
+    fn expand_rejects_multi_segment_paths() {
+        let doc = EnvDocument::empty();
+        let err = doc.expand(&FieldPath::parse("a.b").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("1 segment"), "msg: {err}");
+    }
+
+    #[test]
+    fn expand_rejects_non_posix_keys() {
+        let doc = EnvDocument::empty();
+        let err = doc
+            .expand(&FieldPath::parse("bad-key").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("POSIX"), "msg: {err}");
     }
 }
