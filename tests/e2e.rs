@@ -2666,7 +2666,14 @@ targets:
     write_file(&included_path, "[alias]\n\tco = checkout-via-include\n");
     write_file(
         &dir.path().join("target.gitconfig"),
-        &format!("[include]\n\tpath = {}\n", included_path.display()),
+        &format!(
+            "[include]\n\tpath = {}\n",
+            // gitconfig values use forward slashes as path separators
+            // regardless of OS — git itself only accepts `/` here. On
+            // Windows, `Path::display()` emits `\`, which gix-config's
+            // value parser then chokes on (`\U`-style escape ambiguity).
+            included_path.display().to_string().replace('\\', "/")
+        ),
     );
     let original_sub = read_file(&included_path);
 
@@ -2710,7 +2717,14 @@ targets:
     write_file(&included_path, "[alias]\n\tco = original-included-value\n");
     write_file(
         &dir.path().join("target.gitconfig"),
-        &format!("[include]\n\tpath = {}\n", included_path.display()),
+        &format!(
+            "[include]\n\tpath = {}\n",
+            // gitconfig values use forward slashes as path separators
+            // regardless of OS — git itself only accepts `/` here. On
+            // Windows, `Path::display()` emits `\`, which gix-config's
+            // value parser then chokes on (`\U`-style escape ambiguity).
+            included_path.display().to_string().replace('\\', "/")
+        ),
     );
     let original_sub = read_file(&included_path);
 
