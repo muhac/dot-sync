@@ -1,3 +1,5 @@
+use std::fmt;
+
 use anyhow::{Result, bail};
 
 /// A `.sync.yaml` field path: a sequence of object keys, optionally with array
@@ -70,6 +72,72 @@ impl FieldPath {
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
+
+    /// Construct a FieldPath from already-validated segments. Used by
+    /// `Document::expand` to emit resolved paths after wildcards have been
+    /// substituted with `Pinned` values.
+    pub fn from_segments(segments: Vec<Segment>) -> Self {
+        Self { segments }
+    }
+
+    /// True if any segment carries a `Wildcard` selector. Used by the engine
+    /// to decide when expansion is needed.
+    pub fn has_wildcard(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|seg| matches!(seg.select, Some(ItemSelector::Wildcard { .. })))
+    }
+}
+
+impl fmt::Display for FieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, seg) in self.segments.iter().enumerate() {
+            if i > 0 {
+                f.write_str(".")?;
+            }
+            write!(f, "{seg}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if needs_quoting(&self.name) {
+            write!(f, "\"{}\"", escape_for_quotes(&self.name))?;
+        } else {
+            f.write_str(&self.name)?;
+        }
+        if let Some(sel) = &self.select {
+            match sel {
+                ItemSelector::Pinned { key, value } => {
+                    write!(f, "[{key}=\"{}\"]", escape_for_quotes(value))?;
+                }
+                ItemSelector::Wildcard { key } => {
+                    write!(f, "[{key}]")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn needs_quoting(name: &str) -> bool {
+    name.is_empty()
+        || name
+            .chars()
+            .any(|c| c == '.' || c == '[' || c == ']' || c == '"' || c.is_whitespace())
+}
+
+fn escape_for_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn parse_key_name(bytes: &[char], pos: &mut usize, input: &str) -> Result<String> {
@@ -260,5 +328,51 @@ mod tests {
     fn rejects_empty_selector_key() {
         assert!(FieldPath::parse("arr[]").is_err());
         assert!(FieldPath::parse("arr[=\"x\"]").is_err());
+    }
+
+    /// Parsing the Display output must produce the same FieldPath.
+    /// The exact string may differ (we only quote segments that need it,
+    /// while the input may quote even when not strictly required).
+    fn assert_round_trips(input: &str) {
+        let parsed = FieldPath::parse(input).unwrap();
+        let displayed = parsed.to_string();
+        let reparsed = FieldPath::parse(&displayed)
+            .unwrap_or_else(|e| panic!("display {displayed:?} failed to reparse: {e}"));
+        assert_eq!(parsed, reparsed, "{input} → {displayed}");
+    }
+
+    #[test]
+    fn display_round_trips_plain_path() {
+        assert_round_trips("tui.theme");
+    }
+
+    #[test]
+    fn display_round_trips_quoted_segment() {
+        assert_round_trips("plugins.\"github@openai-curated\".enabled");
+    }
+
+    #[test]
+    fn display_round_trips_pinned_selector() {
+        let path = FieldPath::parse("mcp_servers[name=\"github\"].enabled").unwrap();
+        assert_eq!(path.to_string(), "mcp_servers[name=\"github\"].enabled");
+    }
+
+    #[test]
+    fn display_round_trips_wildcard_selector() {
+        let path = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        assert_eq!(path.to_string(), "mcp_servers[name].enabled");
+    }
+
+    #[test]
+    fn display_quotes_segments_that_need_it() {
+        let path = FieldPath::parse("\"a.b\".c").unwrap();
+        assert_eq!(path.to_string(), "\"a.b\".c");
+    }
+
+    #[test]
+    fn has_wildcard_detects_wildcard_segments() {
+        assert!(!FieldPath::parse("a.b").unwrap().has_wildcard());
+        assert!(!FieldPath::parse("a[k=\"x\"].b").unwrap().has_wildcard());
+        assert!(FieldPath::parse("a[k].b").unwrap().has_wildcard());
     }
 }

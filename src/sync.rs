@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -286,9 +287,13 @@ fn load_document_for_target<D: Document>(
 
 fn pull<D: Document>(source: &mut D, target: &D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
-    for path in paths {
-        if let Some(change) = apply_one_way::<D>(source, target, path, Destination::Source)? {
-            changes.push(change);
+    for parsed in paths {
+        for resolved in expanded_paths::<D>(source, target, parsed) {
+            if let Some(change) =
+                apply_one_way::<D>(source, target, &resolved, Destination::Source)?
+            {
+                changes.push(change);
+            }
         }
     }
     Ok(changes)
@@ -296,9 +301,13 @@ fn pull<D: Document>(source: &mut D, target: &D, paths: &[ParsedPath]) -> Result
 
 fn push<D: Document>(source: &D, target: &mut D, paths: &[ParsedPath]) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
-    for path in paths {
-        if let Some(change) = apply_one_way::<D>(target, source, path, Destination::Target)? {
-            changes.push(change);
+    for parsed in paths {
+        for resolved in expanded_paths::<D>(source, target, parsed) {
+            if let Some(change) =
+                apply_one_way::<D>(target, source, &resolved, Destination::Target)?
+            {
+                changes.push(change);
+            }
         }
     }
     Ok(changes)
@@ -319,35 +328,36 @@ fn sync<D: Document>(
     }
 
     let mut changes = Vec::new();
-    for path in paths {
-        let source_item = source.get(&path.path);
-        let target_item = target.get(&path.path);
-        match (source_item, target_item) {
-            (None, None) => continue,
-            (Some(s), Some(t)) if D::items_equal(&s, &t) => continue,
-            (Some(_), Some(_)) => {
-                // Both sides have a value and they differ — conflict mode picks the winner.
-                let (into, from, dest): (&mut D, &D, Destination) = match mode {
-                    ConflictMode::TargetWins => (source, target, Destination::Source),
-                    ConflictMode::SourceWins => (target, source, Destination::Target),
-                    ConflictMode::FailOnConflict => unreachable!("checked above"),
-                };
-                if let Some(change) = apply_one_way::<D>(into, from, path, dest)? {
-                    changes.push(change);
+    for parsed in paths {
+        for resolved in expanded_paths::<D>(source, target, parsed) {
+            let source_item = source.get(&resolved.path);
+            let target_item = target.get(&resolved.path);
+            match (source_item, target_item) {
+                (None, None) => continue,
+                (Some(s), Some(t)) if D::items_equal(&s, &t) => continue,
+                (Some(_), Some(_)) => {
+                    let (into, from, dest): (&mut D, &D, Destination) = match mode {
+                        ConflictMode::TargetWins => (source, target, Destination::Source),
+                        ConflictMode::SourceWins => (target, source, Destination::Target),
+                        ConflictMode::FailOnConflict => unreachable!("checked above"),
+                    };
+                    if let Some(change) = apply_one_way::<D>(into, from, &resolved, dest)? {
+                        changes.push(change);
+                    }
                 }
-            }
-            (None, Some(_)) => {
-                // Only target has the value; fill source regardless of mode.
-                if let Some(change) = apply_one_way::<D>(source, target, path, Destination::Source)?
-                {
-                    changes.push(change);
+                (None, Some(_)) => {
+                    if let Some(change) =
+                        apply_one_way::<D>(source, target, &resolved, Destination::Source)?
+                    {
+                        changes.push(change);
+                    }
                 }
-            }
-            (Some(_), None) => {
-                // Only source has the value; fill target regardless of mode.
-                if let Some(change) = apply_one_way::<D>(target, source, path, Destination::Target)?
-                {
-                    changes.push(change);
+                (Some(_), None) => {
+                    if let Some(change) =
+                        apply_one_way::<D>(target, source, &resolved, Destination::Target)?
+                    {
+                        changes.push(change);
+                    }
                 }
             }
         }
@@ -355,20 +365,51 @@ fn sync<D: Document>(
     Ok(changes)
 }
 
+/// Resolve `parsed.path` against both documents and merge by identity. For a
+/// pattern with no wildcards this returns one entry whose `path` equals the
+/// input. For wildcards, it fans out across the union of items present on
+/// either side, giving each resolved entry a `raw` string of its concrete
+/// form (e.g. `mcp_servers[name="github"].enabled`) for use in change reports.
+fn expanded_paths<D: Document>(source: &D, target: &D, parsed: &ParsedPath) -> Vec<ParsedPath> {
+    if !parsed.path.has_wildcard() {
+        return vec![ParsedPath {
+            raw: parsed.raw.clone(),
+            path: parsed.path.clone(),
+        }];
+    }
+    let mut by_id: BTreeMap<Vec<String>, FieldPath> = BTreeMap::new();
+    for resolved in source.expand(&parsed.path) {
+        by_id.insert(resolved.identity, resolved.path);
+    }
+    for resolved in target.expand(&parsed.path) {
+        by_id.entry(resolved.identity).or_insert(resolved.path);
+    }
+    by_id
+        .into_values()
+        .map(|path| ParsedPath {
+            raw: path.to_string(),
+            path,
+        })
+        .collect()
+}
+
 fn collect_conflicts<D: Document>(source: &D, target: &D, paths: &[ParsedPath]) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
-    for path in paths {
-        let (Some(s), Some(t)) = (source.get(&path.path), target.get(&path.path)) else {
-            continue;
-        };
-        if D::items_equal(&s, &t) {
-            continue;
+    for parsed in paths {
+        for resolved in expanded_paths::<D>(source, target, parsed) {
+            let (Some(s), Some(t)) = (source.get(&resolved.path), target.get(&resolved.path))
+            else {
+                continue;
+            };
+            if D::items_equal(&s, &t) {
+                continue;
+            }
+            conflicts.push(Conflict {
+                path: resolved.raw,
+                source_value: D::summarize(Some(&s)),
+                target_value: D::summarize(Some(&t)),
+            });
         }
-        conflicts.push(Conflict {
-            path: path.raw.clone(),
-            source_value: D::summarize(Some(&s)),
-            target_value: D::summarize(Some(&t)),
-        });
     }
     conflicts
 }
@@ -923,6 +964,80 @@ tui_theme = "monokai"
         )
         .unwrap();
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn sync_wildcard_pairs_items_by_identifier_key() {
+        let mut source = toml_from(
+            r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "linear"
+enabled = false
+"#,
+        );
+        let mut target = toml_from(
+            r#"
+[[mcp_servers]]
+name = "linear"
+enabled = true
+
+[[mcp_servers]]
+name = "supabase"
+enabled = true
+"#,
+        );
+
+        sync(
+            &mut source,
+            &mut target,
+            &parsed(&["mcp_servers[name].enabled"]),
+            ConflictMode::TargetWins,
+        )
+        .unwrap();
+
+        // linear is shared; target's value (true) wins under TargetWins.
+        let linear = source
+            .get(&FieldPath::parse("mcp_servers[name=\"linear\"].enabled").unwrap())
+            .unwrap();
+        assert_eq!(linear.as_value().unwrap().as_bool(), Some(true));
+
+        // github is source-only; target gets a new entry.
+        let target_github = target
+            .get(&FieldPath::parse("mcp_servers[name=\"github\"].enabled").unwrap())
+            .unwrap();
+        assert_eq!(target_github.as_value().unwrap().as_bool(), Some(true));
+
+        // supabase is target-only; source gets a new entry.
+        let source_supabase = source
+            .get(&FieldPath::parse("mcp_servers[name=\"supabase\"].enabled").unwrap())
+            .unwrap();
+        assert_eq!(source_supabase.as_value().unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn pull_wildcard_only_writes_source() {
+        let mut source = toml_from("");
+        let target = toml_from(
+            r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+"#,
+        );
+        let changes = pull(
+            &mut source,
+            &target,
+            &parsed(&["mcp_servers[name].enabled"]),
+        )
+        .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "mcp_servers[name=\"github\"].enabled");
+        assert!(matches!(changes[0].destination, Destination::Source));
     }
 
     #[test]

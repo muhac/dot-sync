@@ -13,6 +13,16 @@ pub struct TableConflict {
     pub value: String,
 }
 
+/// One concrete instantiation of a pattern after wildcard expansion.
+/// `identity` carries the matched key values for each `Wildcard` segment in
+/// declaration order — engines compare identities across documents to pair
+/// items. `path` is the pattern with every `Wildcard` replaced by `Pinned`.
+#[derive(Debug, Clone)]
+pub struct ResolvedPath {
+    pub identity: Vec<String>,
+    pub path: FieldPath,
+}
+
 /// Format-agnostic view of a structured config file that the sync engine
 /// drives. Each impl owns its native value type via the associated `Item`,
 /// so JSON / YAML / TOML do not have to share a lowest-common-denominator
@@ -75,6 +85,13 @@ pub trait Document: Sized {
     /// (e.g. `toml_edit::Item` doesn't), and equality semantics can be
     /// format-specific (e.g. `1` vs `1.0`).
     fn items_equal(a: &Self::Item, b: &Self::Item) -> bool;
+
+    /// Resolve a path's wildcard selectors against this document, yielding
+    /// one `ResolvedPath` per matched item combination. For a pattern with no
+    /// wildcards, returns a single result whose path equals the input. The
+    /// engine merges resolved paths from source and target by `identity` to
+    /// pair items across documents.
+    fn expand(&self, pattern: &FieldPath) -> Vec<ResolvedPath>;
 
     /// Format-aware short rendering used in change reports. Returns
     /// `<missing>` when the item is `None` so callers do not have to
@@ -160,6 +177,24 @@ impl Document for TomlDocument {
             Some(item) => summarize_toml_item(item),
         }
     }
+
+    fn expand(&self, pattern: &FieldPath) -> Vec<ResolvedPath> {
+        if !pattern.has_wildcard() {
+            return vec![ResolvedPath {
+                identity: Vec::new(),
+                path: pattern.clone(),
+            }];
+        }
+        let mut out = Vec::new();
+        expand_walk(
+            self.doc.as_table(),
+            pattern.segments(),
+            Vec::new(),
+            Vec::new(),
+            &mut out,
+        );
+        out
+    }
 }
 
 // ----- shared helpers -----
@@ -230,6 +265,100 @@ fn find_pinned_item<'a>(arr_item: &'a Item, key: &str, value: &str) -> Option<Ma
             .find(|t| matches_pinned(*t, key, value))
             .map(Matched::Inline),
         _ => None,
+    }
+}
+
+/// Iterate every item in `arr_item` as a TableLike. Handles both
+/// `[[arrays.of.tables]]` and inline `arr = [{...}]` shapes. Items that
+/// aren't table-like are skipped.
+fn iter_array_items(arr_item: &Item) -> Vec<&dyn TableLike> {
+    match arr_item {
+        Item::ArrayOfTables(arr) => arr.iter().map(|t| t as &dyn TableLike).collect(),
+        Item::Value(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_inline_table())
+            .map(|t| t as &dyn TableLike)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Recursive expand walker. Emits a `ResolvedPath` once all wildcards have
+/// been substituted. Branches die when an intermediate container is missing
+/// while a wildcard remains downstream — there's no array to fan out from.
+fn expand_walk(
+    table: &dyn TableLike,
+    remaining: &[Segment],
+    identity: Vec<String>,
+    resolved: Vec<Segment>,
+    out: &mut Vec<ResolvedPath>,
+) {
+    let no_more_wildcards = remaining
+        .iter()
+        .all(|s| !matches!(s.select, Some(ItemSelector::Wildcard { .. })));
+
+    if no_more_wildcards {
+        let mut full = resolved;
+        full.extend(remaining.iter().cloned());
+        out.push(ResolvedPath {
+            identity,
+            path: FieldPath::from_segments(full),
+        });
+        return;
+    }
+
+    let (seg, rest) = remaining
+        .split_first()
+        .expect("non-empty: wildcards exist downstream");
+
+    match &seg.select {
+        None => {
+            let Some(item) = table.get(&seg.name) else {
+                return;
+            };
+            let Some(next) = item.as_table_like() else {
+                return;
+            };
+            let mut new_resolved = resolved;
+            new_resolved.push(seg.clone());
+            expand_walk(next, rest, identity, new_resolved, out);
+        }
+        Some(ItemSelector::Pinned { key, value }) => {
+            let Some(arr) = table.get(&seg.name) else {
+                return;
+            };
+            let Some(matched) = find_pinned_item(arr, key, value) else {
+                return;
+            };
+            let mut new_resolved = resolved;
+            new_resolved.push(seg.clone());
+            expand_walk(matched.as_table_like(), rest, identity, new_resolved, out);
+        }
+        Some(ItemSelector::Wildcard { key }) => {
+            let Some(arr) = table.get(&seg.name) else {
+                return;
+            };
+            for item_table in iter_array_items(arr) {
+                let Some(value) = item_table
+                    .get(key)
+                    .and_then(|i| i.as_value())
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let mut branch_id = identity.clone();
+                branch_id.push(value.to_string());
+                let mut branch_resolved = resolved.clone();
+                branch_resolved.push(Segment {
+                    name: seg.name.clone(),
+                    select: Some(ItemSelector::Pinned {
+                        key: key.clone(),
+                        value: value.to_string(),
+                    }),
+                });
+                expand_walk(item_table, rest, branch_id, branch_resolved, out);
+            }
+        }
     }
 }
 
@@ -667,5 +796,70 @@ name = "linear"
         let path = FieldPath::parse("servers[name=\"b\"].port").unwrap();
         let err = doc.set(&path, value(80)).unwrap_err();
         assert!(err.to_string().contains("inline array"));
+    }
+
+    #[test]
+    fn expand_returns_pattern_unchanged_for_no_wildcard() {
+        let doc = TomlDocument::empty();
+        let path = FieldPath::parse("tui.theme").unwrap();
+        let resolved = doc.expand(&path);
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].identity.is_empty());
+        assert_eq!(resolved[0].path, path);
+    }
+
+    #[test]
+    fn expand_fans_out_wildcard_across_array_of_tables() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+name = "linear"
+enabled = false
+"#
+            .parse()
+            .unwrap(),
+        };
+        let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        let mut resolved = doc.expand(&pattern);
+        resolved.sort_by(|a, b| a.identity.cmp(&b.identity));
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
+        assert_eq!(
+            resolved[0].path.to_string(),
+            "mcp_servers[name=\"github\"].enabled"
+        );
+        assert_eq!(resolved[1].identity, vec!["linear".to_string()]);
+    }
+
+    #[test]
+    fn expand_returns_empty_when_array_missing() {
+        let doc = TomlDocument::empty();
+        let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        let resolved = doc.expand(&pattern);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn expand_skips_items_lacking_the_identifier_key() {
+        let doc = TomlDocument {
+            doc: r#"
+[[mcp_servers]]
+name = "github"
+enabled = true
+
+[[mcp_servers]]
+enabled = true
+"#
+            .parse()
+            .unwrap(),
+        };
+        let pattern = FieldPath::parse("mcp_servers[name].enabled").unwrap();
+        let resolved = doc.expand(&pattern);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].identity, vec!["github".to_string()]);
     }
 }
