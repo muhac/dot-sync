@@ -4380,4 +4380,128 @@ mod gitconfig_tests {
             );
         }
     }
+
+    // ----- value content edges: UTF-8 / quoted / empty section / CRLF / `=` in value -----
+
+    #[test]
+    fn round_trips_utf8_in_value() {
+        // Real-world common: non-Latin name in user.name, accented
+        // character in email, emoji in commit-related aliases.
+        let original = "\
+[user]
+\tname = 张三
+\temail = pelé@example.com
+[alias]
+\tship = !echo 🚀
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("user.name").unwrap()),
+            Some("张三".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("user.email").unwrap()),
+            Some("pelé@example.com".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("alias.ship").unwrap()),
+            Some("!echo 🚀".to_string())
+        );
+        // Round-trip render preserves the bytes.
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_writes_utf8_value_and_round_trips() {
+        let (_dir, mut doc) = doc_from("[user]\n\tname = old\n");
+        let path = FieldPath::parse("user.name").unwrap();
+        doc.set(&path, "李四".to_string()).unwrap();
+        assert_eq!(doc.get(&path), Some("李四".to_string()));
+    }
+
+    #[test]
+    fn round_trips_double_quoted_value() {
+        // git allows wrapping a value in `"..."` to preserve leading /
+        // trailing whitespace and embedded `;` / `#`. gix-config
+        // unwraps the quotes on read; render preserves the original
+        // bytes (including the quotes) on a no-op pass.
+        let original = "[alias]\n\tquoted = \"hello world\"\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.quoted").unwrap();
+        assert_eq!(doc.get(&path), Some("hello world".to_string()));
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn round_trips_value_containing_equals_sign() {
+        // Aliases sometimes embed `=`, e.g. `log --format=%H`. Only
+        // the first `=` separates key from value; subsequent ones are
+        // part of the value.
+        let original = "[alias]\n\tlogh = log --format=%H\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("alias.logh").unwrap();
+        assert_eq!(doc.get(&path), Some("log --format=%H".to_string()));
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_preserves_equals_sign_in_value() {
+        let (_dir, mut doc) = doc_from("[alias]\n\tlogh = old\n");
+        let path = FieldPath::parse("alias.logh").unwrap();
+        doc.set(&path, "log --format=%H --abbrev=12".to_string())
+            .unwrap();
+        assert_eq!(
+            doc.get(&path),
+            Some("log --format=%H --abbrev=12".to_string())
+        );
+    }
+
+    #[test]
+    fn discover_skips_sections_without_keys() {
+        // `[empty]` with no body and `[justcomments]` with only a
+        // comment line: discovery should not emit either as a
+        // container — the picker would render selectable-but-useless
+        // sections otherwise.
+        let original = "\
+[empty]
+[justcomments]
+\t# just a comment, no keys
+[user]
+\tname = Alice
+";
+        let (_dir, doc) = doc_from(original);
+        let tree = doc.discover_field_tree();
+        let paths = paths_in(&tree);
+        assert_eq!(paths, vec!["user.name".to_string()], "{paths:?}");
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].display, "user");
+    }
+
+    #[test]
+    fn round_trips_crlf_file() {
+        // Git on Windows commonly produces CRLF gitconfig files. The
+        // parser must accept them; this test pins what gix-config
+        // currently does on render so a future change shows up as a
+        // diff.
+        let original = "[user]\r\n\temail = a@b\r\n";
+        let (_dir, doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        assert_eq!(doc.get(&path), Some("a@b".to_string()));
+        let rendered = doc.render();
+        assert!(rendered.contains("email = a@b"), "got: {rendered:?}");
+    }
+
+    #[test]
+    fn set_in_crlf_file_keeps_other_keys_intact() {
+        // After updating one line in a CRLF-only file, the rest of
+        // the keys must survive. Don't over-constrain on line-ending
+        // policy — just check the unrelated key is still readable.
+        let original = "[user]\r\n\temail = old\r\n\tname = Alice\r\n";
+        let (_dir, mut doc) = doc_from(original);
+        let path = FieldPath::parse("user.email").unwrap();
+        doc.set(&path, "new".to_string()).unwrap();
+        let name_path = FieldPath::parse("user.name").unwrap();
+        assert_eq!(doc.get(&name_path), Some("Alice".to_string()));
+        assert_eq!(doc.get(&path), Some("new".to_string()));
+    }
 }
