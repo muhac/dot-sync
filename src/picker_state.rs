@@ -157,13 +157,22 @@ impl PickerState {
     /// Toggle a node per the cycle: leaves flip, containers walk
     /// `[ ] → [x] → [*] → [ ]` (virtual groups skip `[x]`), and `[~]`
     /// resets to `[ ]`.
+    ///
+    /// Invariant maintained: at any point, for any ancestor / descendant
+    /// pair, at most one of them has `selected == true`. Toggling a
+    /// parent always clears every descendant (containers + leaves), and
+    /// toggling a leaf to `true` clears every ancestor. Without this, a
+    /// stale child-container selection would leak through `selected_paths()`
+    /// — e.g. cycling Whole → Individual on a parent could emit a child
+    /// container's whole-subtree path instead of the per-leaf paths.
     pub fn toggle(&mut self, idx: usize) {
         let node = &self.nodes[idx];
         if matches!(node.kind, FieldNodeKind::Leaf) {
             self.selected[idx] = !self.selected[idx];
             if self.selected[idx] {
-                // Clear any ancestor whole-mode — leaf and whole-mode are
-                // mutually exclusive. Other ancestor leaves stay as-is.
+                // Leaf and whole-mode are mutually exclusive — clear
+                // every ancestor's `selected` (and every other ancestor
+                // through the walk, no matter how deep).
                 let mut cur = self.nodes[idx].parent;
                 while let Some(p) = cur {
                     self.selected[p] = false;
@@ -173,40 +182,63 @@ impl PickerState {
             return;
         }
         let state = self.check_state(idx);
-        let leaves = self.descendant_leaves(idx);
         let has_path = node.path.is_some();
         match state {
             CheckState::Empty => {
                 if has_path {
-                    self.selected[idx] = true; // → Whole
+                    self.set_whole(idx);
                 } else {
                     // Virtual group: skip Whole, go straight to Individual.
-                    for leaf in leaves {
-                        self.selected[leaf] = true;
-                    }
+                    self.set_individual(idx);
                 }
             }
             CheckState::Whole => {
-                self.selected[idx] = false;
-                for leaf in leaves {
-                    self.selected[leaf] = true;
-                }
-                // → Individual
+                self.set_individual(idx);
             }
-            CheckState::Individual => {
-                for leaf in leaves {
-                    self.selected[leaf] = false;
-                }
-                // → Empty
-            }
-            CheckState::Mixed => {
-                // Reset everything under this node before the next cycle.
-                self.selected[idx] = false;
-                for leaf in leaves {
-                    self.selected[leaf] = false;
-                }
+            CheckState::Individual | CheckState::Mixed => {
+                // [*] and [~] both reset to [ ] on the next press.
+                self.clear_subtree(idx);
             }
         }
+    }
+
+    /// Set the node at `idx` to whole-subtree mode (`[x]`): own
+    /// `selected` flag on, every descendant cleared so the whole-mode
+    /// path is the only one emitted from this branch.
+    fn set_whole(&mut self, idx: usize) {
+        self.selected[idx] = true;
+        for desc in self.descendants_of(idx) {
+            self.selected[desc] = false;
+        }
+    }
+
+    /// Set the node at `idx` to individual-leaves mode (`[*]`): own
+    /// flag off, every descendant container cleared (so it doesn't
+    /// cover its leaves), every descendant leaf set.
+    fn set_individual(&mut self, idx: usize) {
+        self.selected[idx] = false;
+        for desc in self.descendants_of(idx) {
+            let is_leaf = matches!(self.nodes[desc].kind, FieldNodeKind::Leaf);
+            self.selected[desc] = is_leaf;
+        }
+    }
+
+    /// Reset the subtree rooted at `idx` to fully empty (`[ ]`).
+    fn clear_subtree(&mut self, idx: usize) {
+        self.selected[idx] = false;
+        for desc in self.descendants_of(idx) {
+            self.selected[desc] = false;
+        }
+    }
+
+    /// All descendant indices (containers + leaves) in flat order.
+    fn descendants_of(&self, idx: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for &child in &self.nodes[idx].children {
+            out.push(child);
+            out.extend(self.descendants_of(child));
+        }
+        out
     }
 
     /// Expand a container. No-op for leaves and already-expanded nodes.
@@ -554,5 +586,89 @@ mod tests {
         let mut s = fixture();
         s.cursor_up();
         assert_eq!(s.cursor, 0);
+    }
+
+    /// Regression: cycling a parent's tri-state must not leave a stale
+    /// child-container selection that hijacks `selected_paths()`.
+    ///
+    /// Bug shape (fixed): user toggled a child container (e.g. the
+    /// pinned `[name="github"]` inside `servers`) → child becomes
+    /// Whole. Then user toggled the grand-parent `servers` to Whole,
+    /// then cycled to Individual. Without descendant-container cleanup,
+    /// `[name="github"].selected` persisted and `selected_paths`
+    /// emitted `servers[name="github"]` (whole) instead of the per-leaf
+    /// paths the `[*]` display promised.
+    #[test]
+    fn cycling_parent_to_individual_clears_nested_container_selections() {
+        let mut s = fixture();
+        let github = idx_of(&s, "[name=\"github\"]");
+        let servers = idx_of(&s, "servers");
+
+        // 1. User selects child container as Whole.
+        s.toggle(github);
+        assert_eq!(s.check_state(github), CheckState::Whole);
+
+        // 2. User toggles parent → Whole (the previously-selected
+        //    nested container must get cleared).
+        s.toggle(servers);
+        assert_eq!(s.check_state(servers), CheckState::Whole);
+        assert!(
+            !s.is_selected(github),
+            "nested container selection must be cleared when parent enters Whole"
+        );
+
+        // 3. User cycles parent to Individual. selected_paths must emit
+        //    per-leaf paths, NOT a nested whole-subtree path.
+        s.toggle(servers);
+        assert_eq!(s.check_state(servers), CheckState::Individual);
+        assert!(
+            !s.is_selected(github),
+            "nested container must stay cleared in Individual mode"
+        );
+
+        let mut paths: Vec<String> = s.selected_paths().iter().map(|p| p.to_string()).collect();
+        paths.sort();
+        // Lexicographic: `[` < `\"`, so `[name="github"]` sorts before `[name]`.
+        assert_eq!(
+            paths,
+            vec![
+                "servers[name=\"github\"].enabled".to_string(),
+                "servers[name].enabled".to_string(),
+            ],
+            "Individual mode must emit per-leaf paths, not nested whole-subtree paths"
+        );
+    }
+
+    /// Direct selection of a nested container while the parent stays
+    /// empty must not leak into the parent's Whole behavior — toggling
+    /// the parent next clears the nested selection cleanly.
+    #[test]
+    fn parent_whole_clears_pre_existing_nested_container_selection() {
+        let mut s = fixture();
+        let github = idx_of(&s, "[name=\"github\"]");
+        let servers = idx_of(&s, "servers");
+
+        s.toggle(github);
+        assert!(s.is_selected(github));
+        // selected_paths from this state alone yields just the nested path.
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            vec!["servers[name=\"github\"]".to_string()],
+        );
+
+        // Now press space on parent — should override.
+        s.toggle(servers);
+        assert_eq!(s.check_state(servers), CheckState::Whole);
+        assert!(!s.is_selected(github), "nested must be cleared");
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            vec!["servers".to_string()],
+        );
     }
 }
