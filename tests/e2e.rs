@@ -928,3 +928,114 @@ fn config_rejects_unknown_keys() {
         .failure()
         .stderr(predicate::str::contains("unknown field `taregt`"));
 }
+
+// =====================================================================
+// JSON
+// =====================================================================
+
+#[test]
+fn json_basic_sync_bootstraps_missing_target() {
+    let fixture = Fixture::load("json", "basic_sync");
+    fixture
+        .command()
+        .args(["sync", "agent"])
+        .assert()
+        .success();
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_pinned_string_selector_push_updates_one_item() {
+    let fixture = Fixture::load("json", "array_pinned_string");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: mcpServers[name=\"github\"].enabled",
+        ));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_pinned_int_selector_push() {
+    let fixture = Fixture::load("json", "array_pinned_int");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: servers[port=8080].host",
+        ));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_pinned_bool_selector_push() {
+    let fixture = Fixture::load("json", "array_pinned_bool");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "changed target: entries[primary=true].host",
+        ));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_wildcard_selector_pairs_items_by_identifier() {
+    let fixture = Fixture::load("json", "array_wildcard");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        // linear: in both, push source → target.
+        .stdout(predicate::str::contains(
+            "changed target: mcpServers[name=\"linear\"].enabled",
+        ))
+        // github: source-only, push fills target.
+        .stdout(predicate::str::contains(
+            "added target: mcpServers[name=\"github\"].enabled",
+        ));
+
+    let after = fixture.read("target.json");
+    // linear flipped to source's value (false).
+    assert!(after.contains("\"linear\""));
+    // github appended.
+    assert!(after.contains("\"github\""));
+    // supabase preserved (push doesn't touch target-only items beyond the listed field).
+    assert!(after.contains("\"supabase\""));
+    assert!(after.contains("\"private\""));
+    assert!(after.contains("\"keep\""));
+}
+
+#[test]
+fn json_push_propagates_explicit_null_from_source() {
+    // Source has `feature.value = null` (explicit). Pushing must produce
+    // target with the same explicit null — Some(Value::Null) is a value
+    // that gets written, not collapsed to "missing".
+    let fixture = Fixture::load("json", "null_vs_missing");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added target: feature.value"));
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}
+
+#[test]
+fn json_push_preserves_unmanaged_target_fields() {
+    let fixture = Fixture::load("json", "preserves_unmanaged");
+    fixture
+        .command()
+        .args(["push", "agent"])
+        .assert()
+        .success();
+    fixture.assert_file_eq("target.json", "target.expected.json");
+}

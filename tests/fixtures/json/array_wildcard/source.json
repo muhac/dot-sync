@@ -1,0 +1,12 @@
+{
+  "mcpServers": [
+    {
+      "name": "github",
+      "enabled": true
+    },
+    {
+      "name": "linear",
+      "enabled": false
+    }
+  ]
+}

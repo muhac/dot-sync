@@ -1,0 +1,12 @@
+{
+  "entries": [
+    {
+      "primary": true,
+      "host": "alpha"
+    },
+    {
+      "primary": false,
+      "host": "untouched"
+    }
+  ]
+}

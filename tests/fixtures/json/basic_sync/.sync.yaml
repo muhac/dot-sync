@@ -1,0 +1,10 @@
+targets:
+  agent:
+    format: json
+    source: source.json
+    target: target.json
+    sync:
+      - tui.theme
+      - max_bytes
+      - fallback_filenames
+      - notice.hide_nudge

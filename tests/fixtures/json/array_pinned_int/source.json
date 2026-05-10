@@ -1,0 +1,12 @@
+{
+  "servers": [
+    {
+      "port": 8080,
+      "host": "alpha"
+    },
+    {
+      "port": 9090,
+      "host": "untouched"
+    }
+  ]
+}

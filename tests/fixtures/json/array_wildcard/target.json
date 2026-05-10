@@ -1,0 +1,13 @@
+{
+  "mcpServers": [
+    {
+      "name": "linear",
+      "enabled": true
+    },
+    {
+      "name": "supabase",
+      "enabled": true,
+      "private": "keep"
+    }
+  ]
+}
