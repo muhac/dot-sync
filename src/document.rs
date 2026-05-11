@@ -5556,4 +5556,205 @@ B=2
             );
         }
     }
+
+    // ----- value content edges: UTF-8 / `=` / empty / `#` / whitespace -----
+
+    #[test]
+    fn round_trips_utf8_in_values() {
+        // env files routinely carry non-ASCII content: user names in
+        // Chinese / Japanese, accented characters, emoji. Lock that
+        // they parse, round-trip, and read cleanly.
+        let original = "\
+NAME=张三
+GREETING=\"hello, café\"
+EMOJI=🚀
+URL=https://例.com/path
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("NAME").unwrap()),
+            Some("张三".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("GREETING").unwrap()),
+            Some("hello, café".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("EMOJI").unwrap()),
+            Some("🚀".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("URL").unwrap()),
+            Some("https://例.com/path".to_string())
+        );
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn set_writes_utf8_value_byte_stable() {
+        let mut doc = EnvDocument::empty();
+        doc.set(&FieldPath::parse("NAME").unwrap(), "李四".to_string())
+            .unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("NAME=李四"), "got: {rendered}");
+        // Round-trip through reload.
+        let (_dir, path) = write_fixture(&rendered);
+        let reloaded = EnvDocument::load(&path, false).unwrap();
+        assert_eq!(
+            reloaded.get(&FieldPath::parse("NAME").unwrap()),
+            Some("李四".to_string())
+        );
+    }
+
+    #[test]
+    fn round_trips_value_containing_equals_sign() {
+        // Common in real env files: base64 (AWS secret keys end with
+        // `=`), JWTs, URLs with query strings. The parser must split
+        // on the FIRST `=` only — the rest stays in the value.
+        let original = "\
+JWT=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature
+AWS_SECRET=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=
+DATABASE_URL=postgres://user:pass=encoded@host:5432/db?x=1&y=2
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("JWT").unwrap()),
+            Some("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("AWS_SECRET").unwrap()),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY=".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("DATABASE_URL").unwrap()),
+            Some("postgres://user:pass=encoded@host:5432/db?x=1&y=2".to_string())
+        );
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn empty_bare_value_returns_empty_string() {
+        // `KEY=` with nothing after the `=` is a present-but-empty
+        // value. dot-sync returns Some("") rather than None so the
+        // engine can distinguish "key is here and empty" from
+        // "key is absent". `set("KEY", "")` round-trips back to
+        // `KEY=`.
+        let (_dir, doc) = doc_from("EMPTY=\nALSO_EMPTY=\"\"\n");
+        assert_eq!(
+            doc.get(&FieldPath::parse("EMPTY").unwrap()),
+            Some(String::new())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("ALSO_EMPTY").unwrap()),
+            Some(String::new())
+        );
+
+        let mut empty_doc = EnvDocument::empty();
+        empty_doc
+            .set(&FieldPath::parse("CLEAR").unwrap(), String::new())
+            .unwrap();
+        assert!(
+            empty_doc.render().contains("CLEAR="),
+            "got: {}",
+            empty_doc.render()
+        );
+        assert_eq!(
+            empty_doc.get(&FieldPath::parse("CLEAR").unwrap()),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn hash_in_bare_value_is_treated_as_literal() {
+        // bash does NOT treat `#` as a comment marker inside an
+        // unquoted value — the whole bare value is taken literally.
+        // dot-sync mirrors that so values like `TAG=v1#beta` or
+        // `COLOR=#ff0000` round-trip unchanged. (Some env loaders
+        // strip trailing `#` comments — this test guards against
+        // anyone "fixing" us to match them.)
+        let original = "\
+TAG=v1#beta
+COLOR=#ff0000
+WITH_SPACE=value # not-a-comment
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("TAG").unwrap()),
+            Some("v1#beta".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("COLOR").unwrap()),
+            Some("#ff0000".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("WITH_SPACE").unwrap()),
+            Some("value # not-a-comment".to_string())
+        );
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn bare_value_strips_trailing_whitespace() {
+        // POSIX shell convention: `KEY=value   ` is the same as
+        // `KEY=value`. We follow it so two files written with
+        // different trailing whitespace compare equal on get.
+        let (_dir, doc) = doc_from("KEY=value   \n");
+        assert_eq!(
+            doc.get(&FieldPath::parse("KEY").unwrap()),
+            Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn quoted_value_preserves_whitespace_inside_quotes() {
+        // Inside `"..."` or `'...'`, whitespace is part of the value
+        // and must not be stripped. Users who want to preserve
+        // padding deliberately reach for quotes for exactly this.
+        let (_dir, doc) = doc_from("PADDED=\"   spaced   \"\nLITERAL='   alpha   '\n");
+        assert_eq!(
+            doc.get(&FieldPath::parse("PADDED").unwrap()),
+            Some("   spaced   ".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("LITERAL").unwrap()),
+            Some("   alpha   ".to_string())
+        );
+    }
+
+    #[test]
+    fn loads_file_with_only_comments_and_blanks() {
+        // No entries — just comment / blank trivia. Should parse to
+        // an empty-entry-set document, render byte-identically, and
+        // be safe to `set` into (becoming the first entry).
+        let original = "\
+# header comment
+#
+# another line of doc
+
+# trailing
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(doc.render(), original);
+        assert!(doc.discover_field_tree().roots.is_empty());
+
+        let mut mutable = EnvDocument::load(&write_fixture(original).1, false).unwrap();
+        mutable
+            .set(&FieldPath::parse("FIRST").unwrap(), "1".to_string())
+            .unwrap();
+        let rendered = mutable.render();
+        // Original comment block survives intact, new entry appended.
+        assert!(rendered.starts_with("# header comment"), "got: {rendered}");
+        assert!(rendered.contains("FIRST=1"), "got: {rendered}");
+    }
+
+    #[test]
+    fn set_on_single_quoted_with_safe_value_keeps_single_quotes() {
+        // `pick_quote_style` should NOT upgrade single → double when
+        // the new value contains no `'`. Locks the "preserve user's
+        // style by default" promise.
+        let (_dir, mut doc) = doc_from("KEY='old'\n");
+        doc.set(&FieldPath::parse("KEY").unwrap(), "still safe".to_string())
+            .unwrap();
+        assert_eq!(doc.render(), "KEY='still safe'\n");
+    }
 }
