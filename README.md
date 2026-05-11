@@ -76,6 +76,14 @@ directory. Paths in `source` are resolved relative to that file. Paths in
   round-trip through edits. Common case for syncing aliases, editor
   preferences, or include rules across machines while leaving
   `user.email`, signing keys, and credential helpers per-machine.
+- **env** (`format: env`) — `.env` / `.envrc`-style flat
+  `KEY=value` files. Format-preserving via a hand-rolled
+  line-based CST: comments (`# ...`), blank lines, `export`
+  prefix, and quote style (bare / `"..."` / `'...'`) all
+  round-trip through edits. Common case for syncing
+  per-project env vars like `NODE_VERSION`, `DATABASE_URL`,
+  feature flags — while keeping local secrets (`OPENAI_API_KEY`,
+  `GITHUB_TOKEN`) out of the managed source.
 
 ## Concepts
 
@@ -121,6 +129,15 @@ targets:
       - core.editor
       - merge.tool
       - includeIf."gitdir:~/work/".path        # quoted subsection
+
+  app:
+    format: env
+    source: app.sync.env
+    target: .env
+    sync:
+      - NODE_VERSION
+      - DATABASE_URL
+      - DEBUG                                  # single-segment paths only
 ```
 
 ### Path syntax
@@ -242,6 +259,56 @@ Pinned and wildcard selectors:
   Manually moving the new line up past the blank is fine; the file
   parses identically.
 
+### env specifics
+
+- **Flat namespace.** env is a single-level key-value list, so
+  paths are exactly one segment (`NODE_VERSION`, `DATABASE_URL`).
+  Multi-segment paths and array selectors (`arr[name="x"]`) are
+  rejected — there's nothing to descend into.
+- **POSIX key names only.** Keys must match
+  `[A-Za-z_][A-Za-z0-9_]*`. Hyphenated keys (`bad-key`) accepted
+  by some loader dialects are rejected so syncs stay portable.
+- **Case-sensitive.** `PATH` and `path` are different keys
+  (consistent with POSIX, and with dot-sync's other backends).
+- **Quote styles.** Bare (`KEY=value`), double-quoted
+  (`KEY="value"`), and single-quoted (`KEY='value'`) are all
+  read on load and preserved on round-trip. Updates keep the
+  user's original quote style by default — bare upgrades to
+  double only when the new value would no longer round-trip
+  unquoted (leading/trailing whitespace, trailing `\`, leading
+  `"` or `'`); single upgrades to double when the new value
+  contains a literal `'` (POSIX single quotes have no escapes).
+- **`export` prefix preserved.** A line written as
+  `export DATABASE_URL=...` keeps the `export` after sync.
+  New entries dot-sync appends never get the `export` prefix —
+  it's a style choice the tool doesn't try to guess.
+- **Last-wins on duplicate keys.** A key defined multiple times
+  resolves to its last value (matching bash `export`
+  semantics). `set` updates the last occurrence and leaves the
+  earlier shadowed entries alone so the file's history of
+  redefinitions stays readable.
+- **What's not supported (rejected at load):**
+  - Backslash-continued multi-line values (`KEY=line1\` …).
+  - Unclosed quotes.
+  - Trailing content after a closing quote.
+  - Shell expressions: `if/then`, function definitions, `[[
+    ... ]]`, command substitution `$(...)`, etc. `.envrc` files
+    that use these constructs aren't supported — only the
+    `[export ]KEY=value` subset.
+  - Trailing `# comment` on the same line as a value (the `#`
+    becomes part of the value, matching bash on unquoted
+    values). Use a separate `# ...` line above instead.
+- **No `\n` / `\t` interpolation.** Inside double quotes, only
+  `\"` and `\\` are interpreted as escapes. `\n` is two literal
+  characters. Values containing real newlines are not
+  supported in v1 (would need multi-line, which is rejected
+  above).
+- **Variable interpolation is literal.** `KEY=${OTHER}` syncs
+  the literal seven characters `${OTHER}`; dot-sync does not
+  expand it. Same for `$VAR`. If your value depends on another
+  variable, dot-sync syncs the *reference*, not the resolved
+  result.
+
 ## Commands
 
 ```sh
@@ -275,7 +342,8 @@ dot-sync add codex \
 ```
 
 Format is inferred from the source / target extension when `--format`
-is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig`). Append fields to an existing
+is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig` / `.env` /
+`.envrc`; also the bare dotfile names `.env` and `.envrc`). Append fields to an existing
 target with just `--field`:
 
 ```sh

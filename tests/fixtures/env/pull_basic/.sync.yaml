@@ -1,0 +1,8 @@
+targets:
+  envsync:
+    format: env
+    source: source.env
+    target: target.env
+    sync:
+      - NODE_VERSION
+      - DATABASE_URL

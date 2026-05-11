@@ -8,7 +8,7 @@ use chrono::Local;
 
 use crate::config::{DotSyncConfig, TargetConfig};
 use crate::document::{
-    Document, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
+    Document, EnvDocument, Format, GitConfigDocument, JsonDocument, TomlDocument, parse_format,
 };
 use crate::path::{FieldPath, SelectorValue};
 
@@ -101,6 +101,7 @@ fn preflight_fail_on_conflict(targets: &[&TargetConfig]) -> Result<()> {
             Format::Toml => target_conflicts::<TomlDocument>(target)?,
             Format::Json => target_conflicts::<JsonDocument>(target)?,
             Format::GitConfig => target_conflicts::<GitConfigDocument>(target)?,
+            Format::Env => target_conflicts::<EnvDocument>(target)?,
         };
         if !conflicts.is_empty() {
             violators.push((target.name.clone(), conflicts));
@@ -161,6 +162,7 @@ fn run_target(target: &TargetConfig, direction: Direction, options: SyncOptions)
         Format::Toml => run_target_typed::<TomlDocument>(target, direction, options),
         Format::Json => run_target_typed::<JsonDocument>(target, direction, options),
         Format::GitConfig => run_target_typed::<GitConfigDocument>(target, direction, options),
+        Format::Env => run_target_typed::<EnvDocument>(target, direction, options),
     }
 }
 
