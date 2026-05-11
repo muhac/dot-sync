@@ -98,7 +98,7 @@ targets:
       - project_doc_max_bytes
       - tui.theme
       - plugins."github@openai-curated".enabled
-      - mcp_servers[name="github"].enabled    # specific item by key
+      - mcp_servers[name="github"].enabled     # specific item by key
       - mcp_servers[name].enabled              # all items, paired by key
 
   claude:
