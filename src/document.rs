@@ -5757,4 +5757,64 @@ WITH_SPACE=value # not-a-comment
             .unwrap();
         assert_eq!(doc.render(), "KEY='still safe'\n");
     }
+
+    // ----- "no interpolation" promises from the README -----
+
+    #[test]
+    fn backslash_letter_in_double_quoted_value_is_literal() {
+        // README contract: inside `"..."`, only `\"` and `\\` are
+        // interpreted as escapes. `\n` / `\t` / `\r` are two literal
+        // characters (backslash + letter). Lock this so future
+        // "improvements" can't silently add interpolation that would
+        // break round-trip.
+        let (_dir, doc) = doc_from("KEY=\"line1\\nline2\\tafter\"\n");
+        // Value bytes: literal `\` `n` (not a newline), literal `\` `t`.
+        assert_eq!(
+            doc.get(&FieldPath::parse("KEY").unwrap()),
+            Some("line1\\nline2\\tafter".to_string())
+        );
+    }
+
+    #[test]
+    fn dollar_brace_variable_in_value_is_literal() {
+        // README contract: `${OTHER}` is synced verbatim — no
+        // expansion. Same for `$VAR` (bare-dollar).
+        let original = "\
+DB_URL=postgres://${HOST}:${PORT}/db
+WITH_FALLBACK=${MAYBE_MISSING:-default}
+SHORTHAND=$HOME/.config
+";
+        let (_dir, doc) = doc_from(original);
+        assert_eq!(
+            doc.get(&FieldPath::parse("DB_URL").unwrap()),
+            Some("postgres://${HOST}:${PORT}/db".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("WITH_FALLBACK").unwrap()),
+            Some("${MAYBE_MISSING:-default}".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("SHORTHAND").unwrap()),
+            Some("$HOME/.config".to_string())
+        );
+        assert_eq!(doc.render(), original);
+    }
+
+    #[test]
+    fn dollar_paren_command_substitution_in_value_is_literal() {
+        // README contract: shell expressions are rejected at line
+        // level (if/then, function defs, etc.) — but `$(...)` and
+        // backticks appearing *inside a value* are accepted as
+        // literal bytes. dot-sync syncs the reference, not the
+        // would-be expansion.
+        let (_dir, doc) = doc_from("BUILD_ID=$(date +%Y%m%d)\nLEGACY=`whoami`-prod\n");
+        assert_eq!(
+            doc.get(&FieldPath::parse("BUILD_ID").unwrap()),
+            Some("$(date +%Y%m%d)".to_string())
+        );
+        assert_eq!(
+            doc.get(&FieldPath::parse("LEGACY").unwrap()),
+            Some("`whoami`-prod".to_string())
+        );
+    }
 }
