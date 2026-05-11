@@ -1,13 +1,12 @@
-# .sync — surgical config sync
+# dot-sync — surgical config sync
 
-Sync a handful of fields between a managed dotfile and the app config
-that uses it — keep `alias.co`, `core.editor`, `NODE_VERSION`,
-`tui.theme` aligned across machines while leaving `user.email`,
-`OPENAI_API_KEY`, and per-machine state behind. Comments,
-formatting, and the rest of the file round-trip byte-stable.
+Sync specific fields across machines — not whole files.
 
-Supports **TOML, JSON/JSONC, gitconfig, and `.env`** as target
-formats.
+Share `alias.co`, `NODE_VERSION`, `core.editor`; keep `user.email`,
+`OPENAI_API_KEY`, and per-machine state local. Comments and
+formatting in the target file round-trip byte-stable.
+
+Supports **TOML**, **JSON / JSONC**, **gitconfig**, and **`.env`**.
 
 ## Install
 
@@ -19,64 +18,91 @@ Installs `dot-sync` (and a `ds` shortcut, if `~/.local/bin/ds` is
 unused). Other install flavors — nightly, pinned version, alternate
 directory, shell completions — are at the bottom of this file.
 
-## First sync in 60 seconds
+## Quick start
 
-Pick something simple: `~/.gitconfig` aliases.
+Pick something simple — `~/.gitconfig` aliases:
 
 ```sh
-# 1. Create a folder for your managed dotfiles
-mkdir -p ~/dotfiles && cd ~/dotfiles
-
-# 2. Write the "source" — the version you want to share across machines
+# Source: the version you want shared across machines
 cat > git.sync.gitconfig <<'EOF'
 [alias]
     co = checkout
-    st = status
 [core]
     editor = nvim
 EOF
 
-# 3. Register a sync target. `add` writes a .sync.yaml in the
-#    current directory and picks `format: gitconfig` from the
-#    file extension.
-dot-sync add gitsync \
+# Register the target — writes a .sync.yaml in the current directory
+dot-sync add git \
   --source git.sync.gitconfig \
   --target ~/.gitconfig \
-  --field alias.co --field alias.st --field core.editor
+  --field alias.co --field core.editor
 
-# 4. Preview what `push` would do (no writes yet)
-dot-sync push gitsync --dry-run
-
-# 5. Push for real — overwrites only those three fields in ~/.gitconfig.
-#    Your user.email, signing keys, credential helpers stay untouched.
-dot-sync push gitsync
+# Push: writes those two fields into ~/.gitconfig, leaves the rest untouched
+dot-sync push git
 ```
 
-After this, `dot-sync push gitsync` on any machine where `~/dotfiles`
-is checked out applies the same three fields without touching the
-rest of `~/.gitconfig`. The reverse direction — `dot-sync pull
-gitsync` — copies whatever values are currently in `~/.gitconfig`
-back into `git.sync.gitconfig`, so you can commit the new state.
+That's it. On another machine, after `dot-sync add` (or after checking
+out the same `.sync.yaml` + source), `dot-sync push git` applies the
+same two fields. The reverse direction — `dot-sync pull git` — copies
+whatever's currently in `~/.gitconfig` back into the source so you
+can commit the new state.
+
+Add `--dry-run` to any command for a no-write preview.
+
+## Adding a target
+
+`dot-sync add <name>` registers a target in `.sync.yaml` (and
+bootstraps the file if it's missing) or appends fields to an existing
+target. Three flavors:
+
+```sh
+# Non-interactive — fully flag-driven, scriptable
+dot-sync add codex \
+  --format toml \
+  --source codex.sync.toml \
+  --target ~/.codex/config.toml \
+  --field tui.theme --field max_bytes
+
+# Append fields to an existing target — only --field needed
+dot-sync add codex --field tui.notification_condition
+
+# Interactive — drop --field on a TTY; a tree picker discovers fields
+# from the source / target document
+dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
+```
+
+Format is inferred from the source / target file extension when
+`--format` is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig` /
+`.env` / `.envrc`; also the bare dotfile names `.env` and `.envrc`).
+
+Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space`
+toggle, `enter` confirm, `q` / `Esc` cancel. On containers, `space`
+cycles `[ ]` (empty) → `[x]` (sync the whole subtree as one path) →
+`[*]` (sync each leaf individually) → `[ ]`. Manually toggling some
+leaves under a container shows `[~]` (mixed); pressing space on `[~]`
+resets the container.
+
+`add --dry-run` previews the YAML write. Writing `.sync.yaml` via
+`add` does not preserve user comments inside the YAML itself.
 
 ## Sync rules
 
-Only the fields listed in `sync:` are touched on either side, and
-nothing is ever removed. Everything outside `sync:` round-trips
-unchanged.
+Only fields listed in `sync:` are touched on either side, and nothing
+is ever removed. Everything outside `sync:` round-trips unchanged.
 
-| State of a listed field    | `pull` (target → source) | `push` (source → target) | `sync` (default `--target-wins`) |
-| -------------------------- | ------------------------ | ------------------------ | --------------------------------- |
-| Both sides equal           | skip                     | skip                     | skip                              |
-| Both sides differ          | source := target         | target := source         | source := target (mode-dependent) |
-| Only target has it         | source := target (add)   | skip                     | source := target (add)            |
-| Only source has it         | skip                     | target := source (add)   | target := source (add)            |
-| Neither has it             | skip                     | skip                     | skip                              |
-| Field not in `sync:` list  | untouched                | untouched                | untouched                         |
+| State of a listed field   | `pull` (target → source) | `push` (source → target) | `sync` (default `--target-wins`) |
+| ------------------------- | ------------------------ | ------------------------ | --------------------------------- |
+| Both sides equal          | skip                     | skip                     | skip                              |
+| Both sides differ         | source := target         | target := source         | source := target (mode-dependent) |
+| Only target has it        | source := target (add)   | skip                     | source := target (add)            |
+| Only source has it        | skip                     | target := source (add)   | target := source (add)            |
+| Neither has it            | skip                     | skip                     | skip                              |
+| Field not in `sync:` list | untouched                | untouched                | untouched                         |
 
-`pull` is always target-wins by definition; `push` is always
-source-wins. `sync` accepts mutually exclusive conflict-mode flags:
-`--target-wins` (default), `--source-wins`, or `--fail-on-conflict`
-(exit non-zero, write nothing, list the conflicts).
+`pull` is always target-wins; `push` is always source-wins. `sync`
+takes mutually exclusive conflict-mode flags: `--target-wins`
+(default), `--source-wins`, or `--fail-on-conflict` (exit non-zero,
+write nothing, list the conflicts).
 
 To stop syncing a field, remove it from `sync:` in `.sync.yaml`. The
 tool will not delete it from either file — clean up by hand if you
@@ -95,35 +121,10 @@ targets:
     source: codex.sync.toml
     target: ~/.codex/config.toml
     sync:
-      - project_doc_max_bytes
-      - tui.theme
-      - plugins."github@openai-curated".enabled
-      - mcp_servers[name="github"].enabled     # specific item by key
-      - mcp_servers[name].enabled              # all items, paired by key
-
-  claude:
-    format: json
-    source: claude.sync.json
-    target: ~/.claude/settings.json
-    sync:
-      - mcpServers[name="github"].enabled
-
-  git:
-    format: gitconfig
-    source: git.sync.gitconfig
-    target: ~/.gitconfig
-    sync:
-      - alias.co
-      - core.editor
-      - includeIf."gitdir:~/work/".path        # quoted subsection
-
-  app:
-    format: env
-    source: app.sync.env
-    target: .env
-    sync:
-      - NODE_VERSION
-      - DATABASE_URL                           # single-segment paths
+      - tui.theme                                # plain key
+      - plugins."github@openai-curated".enabled  # quoted segment
+      - mcp_servers[name="github"].enabled       # array, pinned by key
+      - mcp_servers[name].enabled                # array, wildcard
 ```
 
 ### Path syntax
@@ -137,8 +138,8 @@ targets:
 | `arr[primary=true].host` | Pinned with a boolean literal. |
 | `arr[name].enabled` | Wildcard: fan out across every item in `arr`, pairing source / target items by `name`. |
 
-Selector value types: `"quoted string"`, decimal integer
-(e.g. `8080`, `-1`), or `true` / `false`. Floats are not supported.
+Selector value types: `"quoted string"`, decimal integer (e.g. `8080`,
+`-1`), or `true` / `false`. Floats are not supported.
 
 **Multi-match is an error.** Two array items sharing the same
 identifier value is treated as data corruption and the sync bails
@@ -170,11 +171,6 @@ byte-for-byte on the fields it doesn't touch.
   `KEY=value`. Hand-rolled line-based CST: comments, blank lines,
   `export` prefix, all three quote styles (bare / `"..."` /
   `'...'`) preserved.
-
-Format is inferred from the source / target extension when
-`--format` is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig`
-/ `.env` / `.envrc`; also the bare dotfile names `.env` and
-`.envrc`).
 
 <details>
 <summary><b>TOML & JSON specifics</b></summary>
@@ -283,72 +279,36 @@ Format is inferred from the source / target extension when
 ## Commands
 
 ```sh
-dot-sync pull <name>                # target → source (target-wins)
-dot-sync push <name>                # source → target (source-wins)
-dot-sync sync <name>                # both directions
-
-dot-sync status [name]              # show config + file health
-dot-sync restore <name>             # roll back from a recovery snapshot
-dot-sync add <name>                 # register a new target / append fields
+dot-sync pull <name>     # target → source
+dot-sync push <name>     # source → target
+dot-sync sync <name>     # both directions (see § Sync rules)
+dot-sync add <name>      # register a target (see § Adding a target)
+dot-sync status [name]   # config + file health
+dot-sync restore <name>  # roll back (see § Backup and recovery)
 ```
 
 `<name>` is the target name from `.sync.yaml`. Omit it on
 `pull` / `push` / `sync` / `status` to operate on all configured
 targets.
 
-### Adding a target
-
-`dot-sync add <name>` creates the target (and bootstraps `.sync.yaml`
-if missing) or appends fields to an existing one.
-
-```sh
-# Non-interactive — fully flag-driven
-dot-sync add codex \
-  --format toml \
-  --source codex.sync.toml \
-  --target ~/.codex/config.toml \
-  --field tui.theme --field max_bytes
-
-# Append fields to an existing target — only --field needed
-dot-sync add codex --field tui.notification_condition
-
-# Interactive — omit --field on a TTY; a tree picker discovers
-# fields from the source / target document
-dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
-```
-
-Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space`
-toggle, `enter` confirm, `q` / `Esc` cancel. On containers, `space`
-cycles `[ ]` (empty) → `[x]` (sync the whole subtree as one path)
-→ `[*]` (sync each leaf individually) → `[ ]`. Manually toggling
-some leaves under a container shows `[~]` (mixed); pressing space
-on `[~]` resets the container.
-
-`add --dry-run` previews the YAML write without modifying
-`.sync.yaml`. Note: writing `.sync.yaml` via `add` re-serializes the
-file and does not preserve user comments inside the YAML itself.
-
 ## Backup and recovery
 
-Every real write is atomic (write to a hidden tmp next to the
-destination, then `rename`). Before each overwrite, the previous
-contents are copied to
-`$TMPDIR/dot-sync/<sanitized-path>.<timestamp>` so you can recover
-in the moment without cluttering the working directory. The path is
-printed under each `wrote` line; the OS reclaims the snapshots over
-time.
+Writes are atomic. Before each overwrite, the previous contents are
+saved to a recovery snapshot under `$TMPDIR/dot-sync/`; the path is
+printed under each `wrote` line, and `restore` rolls back from there.
 
 ```sh
 dot-sync pull codex --dry-run       # preview, no writes
 dot-sync push codex --backup        # also keep a persistent .bak.<timestamp>
 ```
 
-`--dry-run` works on `pull` / `push` / `sync` / `add` / `restore`
-and shows the planned changes without writing either file.
+`--dry-run` works on every command and shows planned changes without
+writing.
 
 `--backup` (on `pull` / `push` / `sync`) writes a persistent
-timestamped copy `<file>.bak.<timestamp>` next to the destination,
-in addition to the auto recovery snapshot.
+timestamped copy `<file>.bak.<timestamp>` next to the destination, in
+addition to the auto recovery snapshot. Recovery snapshots are
+ephemeral (the OS reclaims them); backups are explicit and survive.
 
 ### Restoring from a snapshot
 
@@ -361,10 +321,10 @@ dot-sync restore codex --source         # restore source instead of target
 dot-sync restore codex --dry-run        # show what would happen
 ```
 
-`restore` is itself atomic and takes a fresh recovery snapshot of
-the file before overwriting, so an unwanted restore is itself
-recoverable. When timestamps tie, persistent `[backup]` entries are
-preferred over `[recovery]` (they are an explicit user signal).
+`restore` is itself atomic and snapshots before overwriting, so an
+unwanted restore is recoverable too. When timestamps tie,
+`[backup]` entries are preferred over `[recovery]` (they are an
+explicit user signal).
 
 ## Shell completions and man page
 
@@ -374,11 +334,11 @@ Easiest path — re-run the installer with `--with-completions`:
 curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --with-completions
 ```
 
-Detects `$SHELL`, writes completion files to the standard
-user-owned directory (`~/.local/share/bash-completion/completions/`,
-`~/.zfunc/`, `~/.config/fish/completions/`), and writes a man page
-to `~/.local/share/man/man1/dot-sync.1`. Prints any rc-file edits
-you still need to make (mostly just `zsh`).
+Detects `$SHELL`, writes completion files to the standard user-owned
+directory (`~/.local/share/bash-completion/completions/`, `~/.zfunc/`,
+`~/.config/fish/completions/`), and writes a man page to
+`~/.local/share/man/man1/dot-sync.1`. Prints any rc-file edits you
+still need to make (mostly just `zsh`).
 
 By hand:
 
@@ -406,9 +366,8 @@ curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh
 ```
 
 The installer always writes `dot-sync` to the install directory. It
-writes the shorter `ds` alias only when that path is empty or
-already points at an existing `dot-sync` install — it will not
-overwrite an unrelated `ds` command.
+writes the shorter `ds` alias only when that path is empty or already
+points at an existing `dot-sync` install — it will not overwrite an
+unrelated `ds` command.
 
-Use `dot-sync` in scripts and docs; `ds` is the interactive
-shortcut.
+Use `dot-sync` in scripts and docs; `ds` is the interactive shortcut.
