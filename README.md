@@ -1,97 +1,92 @@
 # .sync — surgical config sync
 
-Sync only the parts of your config that matter.
+Sync a handful of fields between a managed dotfile and the app config
+that uses it — keep `alias.co`, `core.editor`, `NODE_VERSION`,
+`tui.theme` aligned across machines while leaving `user.email`,
+`OPENAI_API_KEY`, and per-machine state behind. Comments,
+formatting, and the rest of the file round-trip byte-stable.
 
-Keep your preferences. Ignore secrets, local state, and noise.
+Supports **TOML, JSON/JSONC, gitconfig, and `.env`** as target
+formats.
 
-## Use cases
-
-### AI tool configs
-
-Sync your Codex or Claude settings across machines, without leaking API keys or local trust state.
-
-### Noisy config files
-
-Many tools write back to their own config files (timestamps, caches, counters).
-`.sync` lets you keep only the stable parts in Git.
-
-### Multi-machine setup
-
-Keep your environment consistent across machines, while preserving local paths, accounts, and secrets.
-
-## Quick start
-
-Install the latest stable release:
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh
 ```
 
-Install the nightly prerelease:
+Installs `dot-sync` (and a `ds` shortcut, if `~/.local/bin/ds` is
+unused). Other install flavors — nightly, pinned version, alternate
+directory, shell completions — are at the bottom of this file.
+
+## First sync in 60 seconds
+
+Pick something simple: `~/.gitconfig` aliases.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --nightly
+# 1. Create a folder for your managed dotfiles
+mkdir -p ~/dotfiles && cd ~/dotfiles
+
+# 2. Write the "source" — the version you want to share across machines
+cat > git.sync.gitconfig <<'EOF'
+[alias]
+    co = checkout
+    st = status
+[core]
+    editor = nvim
+EOF
+
+# 3. Register a sync target. `add` writes a .sync.yaml in the
+#    current directory and picks `format: gitconfig` from the
+#    file extension.
+dot-sync add gitsync \
+  --source git.sync.gitconfig \
+  --target ~/.gitconfig \
+  --field alias.co --field alias.st --field core.editor
+
+# 4. Preview what `push` would do (no writes yet)
+dot-sync push gitsync --dry-run
+
+# 5. Push for real — overwrites only those three fields in ~/.gitconfig.
+#    Your user.email, signing keys, credential helpers stay untouched.
+dot-sync push gitsync
 ```
 
-Install a specific version or directory:
+After this, `dot-sync push gitsync` on any machine where `~/dotfiles`
+is checked out applies the same three fields without touching the
+rest of `~/.gitconfig`. The reverse direction — `dot-sync pull
+gitsync` — copies whatever values are currently in `~/.gitconfig`
+back into `git.sync.gitconfig`, so you can commit the new state.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --version v0.1.0
-curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --dir ~/.local/bin
-```
+## Sync rules
 
-The installer always installs `dot-sync`. It installs the shorter `ds` alias
-only when that path is empty or already points to an existing `dot-sync`
-installation, so it will not overwrite an unrelated `ds` command.
+Only the fields listed in `sync:` are touched on either side, and
+nothing is ever removed. Everything outside `sync:` round-trips
+unchanged.
 
-```sh
-dot-sync sync  # or: ds sync
-```
+| State of a listed field    | `pull` (target → source) | `push` (source → target) | `sync` (default `--target-wins`) |
+| -------------------------- | ------------------------ | ------------------------ | --------------------------------- |
+| Both sides equal           | skip                     | skip                     | skip                              |
+| Both sides differ          | source := target         | target := source         | source := target (mode-dependent) |
+| Only target has it         | source := target (add)   | skip                     | source := target (add)            |
+| Only source has it         | skip                     | target := source (add)   | target := source (add)            |
+| Neither has it             | skip                     | skip                     | skip                              |
+| Field not in `sync:` list  | untouched                | untouched                | untouched                         |
 
-`.sync` keeps selected fields in structured config files aligned without taking
-ownership of the whole file. Use `dot-sync` in scripts and docs, or `ds` as the
-short interactive command.
+`pull` is always target-wins by definition; `push` is always
+source-wins. `sync` accepts mutually exclusive conflict-mode flags:
+`--target-wins` (default), `--source-wins`, or `--fail-on-conflict`
+(exit non-zero, write nothing, list the conflicts).
+
+To stop syncing a field, remove it from `sync:` in `.sync.yaml`. The
+tool will not delete it from either file — clean up by hand if you
+want it gone.
 
 ## Configuration
 
-`dot-sync` reads `.sync.yaml` from the current directory or the nearest parent
-directory. Paths in `source` are resolved relative to that file. Paths in
-`target` may use `~` for the current user's home directory.
-
-**Supporting formats:**
-- **TOML** (`format: toml`) — format-preserving via `toml_edit`
-  (whitespace, key order, comments).
-- **JSON / JSONC** (`format: json` or `format: jsonc` — same backend,
-  use whichever name better describes the target file) — format-preserving
-  via `jsonc-parser`. Object key order, comments (`//` and `/* */`),
-  trailing commas, blank lines, and original indentation all round-trip
-  through `pull` / `push` / `sync`. Strict JSON, JSONC (the dialect VS
-  Code / `tsconfig.json` use), and files with trailing commas are all
-  accepted. JSON5 (single-quoted strings, unquoted keys, hex / Infinity
-  / NaN literals) is not supported.
-- **gitconfig** (`format: gitconfig`) — git's INI dialect, used by
-  `~/.gitconfig` and per-repo `.git/config`. Format-preserving via
-  `gix-config` (gitoxide): comments (`#` / `;`), blank lines, tab /
-  space indentation, and `[section "subsection"]` quoting all
-  round-trip through edits. Common case for syncing aliases, editor
-  preferences, or include rules across machines while leaving
-  `user.email`, signing keys, and credential helpers per-machine.
-- **env** (`format: env`) — `.env` / `.envrc`-style flat
-  `KEY=value` files. Format-preserving via a hand-rolled
-  line-based CST: comments (`# ...`), blank lines, `export`
-  prefix, and quote style (bare / `"..."` / `'...'`) all
-  round-trip through edits. Common case for syncing
-  per-project env vars like `NODE_VERSION`, `DATABASE_URL`,
-  feature flags — while keeping local secrets (`OPENAI_API_KEY`,
-  `GITHUB_TOKEN`) out of the managed source.
-
-## Concepts
-
-- `source`: managed sync fragment.
-- `target`: real app config used by the application.
-- `sync`: fields that move both ways.
-
-Example:
+`dot-sync` reads `.sync.yaml` from the current directory or the
+nearest parent directory. Paths in `source` are relative to that
+file; paths in `target` may use `~`.
 
 ```yaml
 targets:
@@ -100,11 +95,7 @@ targets:
     source: codex.sync.toml
     target: ~/.codex/config.toml
     sync:
-      - project_doc_fallback_filenames
       - project_doc_max_bytes
-      - developer_instructions
-      - tui.notification_condition
-      - tui.status_line
       - tui.theme
       - plugins."github@openai-curated".enabled
       - mcp_servers[name="github"].enabled    # specific item by key
@@ -115,9 +106,7 @@ targets:
     source: claude.sync.json
     target: ~/.claude/settings.json
     sync:
-      - mcpServers[name="github"].enabled      # string identifier
-      - servers[port=8080].host                # integer identifier
-      - features[primary=true].host            # boolean identifier
+      - mcpServers[name="github"].enabled
 
   git:
     format: gitconfig
@@ -125,9 +114,7 @@ targets:
     target: ~/.gitconfig
     sync:
       - alias.co
-      - alias.st
       - core.editor
-      - merge.tool
       - includeIf."gitdir:~/work/".path        # quoted subsection
 
   app:
@@ -136,8 +123,7 @@ targets:
     target: .env
     sync:
       - NODE_VERSION
-      - DATABASE_URL
-      - DEBUG                                  # single-segment paths only
+      - DATABASE_URL                           # single-segment paths
 ```
 
 ### Path syntax
@@ -146,287 +132,225 @@ targets:
 | --- | --- |
 | `tui.theme` | Plain object navigation. |
 | `plugins."github@openai-curated".enabled` | Quoted segment, for keys with `.` `[` or whitespace. |
-| `arr[name="github"].enabled` | Pin to the array item where `name == "github"`; sync just its `enabled` field. Stable across reorderings. |
-| `arr[port=8080].host` | Pinned with an integer literal; matches `port = 8080` only, never the string `"8080"`. |
+| `arr[name="github"].enabled` | Pin to the array item where `name == "github"`. Stable across reorderings. |
+| `arr[port=8080].host` | Pinned with an integer literal — strict; matches `port = 8080`, not `"8080"`. |
 | `arr[primary=true].host` | Pinned with a boolean literal. |
 | `arr[name].enabled` | Wildcard: fan out across every item in `arr`, pairing source / target items by `name`. |
 
-Pinned and wildcard selectors:
+Selector value types: `"quoted string"`, decimal integer
+(e.g. `8080`, `-1`), or `true` / `false`. Floats are not supported.
 
-- Selector value types: `"quoted string"`, decimal integer (e.g. `8080`,
-  `-1`), or `true` / `false`. Floats are not supported. The literal's
-  syntax determines its type — comparison is **strict**, so `[k=8080]`
-  matches `k = 8080` only, and `[k="8080"]` matches `k = "8080"` only.
-- **Multi-match is an error.** Two array items sharing the same identifier
-  value (e.g. two `mcp_servers` both named `github`) is treated as data
-  corruption and the sync bails before any write — surgical sync requires
-  unambiguous identity.
-- When the identifier matches an item that exists on one side but not the other,
-  the missing side gets a new array entry seeded with the identifier — the
-  "fill missing" rule from `pull`/`sync` extended to array members.
-- TOML writes go into `[[arrays]]` form; inline `arr = [{...}]` arrays are
-  read-only for now. JSON writes go into the single native array form.
-- Plain index syntax (`arr[0]`) is intentionally not supported — array
-  positions shift when data changes, so index-based sync is destructive in
-  the cases that matter most.
+**Multi-match is an error.** Two array items sharing the same
+identifier value is treated as data corruption and the sync bails
+before any write — surgical sync requires unambiguous identity.
 
-### JSON specifics
+When the identifier matches an item that exists on one side but not
+the other, the missing side gets a new array entry seeded with the
+identifier — the "fill missing" rule extended to array members.
 
-- **Null vs missing.** `{"key": null}` is a present field with the value
-  `null`; an absent key is "missing". `pull` / `push` / `sync` treat them
-  as different values, so an explicit `null` propagates instead of being
-  dropped. Use this to deliberately overwrite a target's value with `null`.
-- **Int vs float in selectors.** `[k=8080]` matches `"k": 8080` only —
-  not `"k": 8080.0`. Integer and float representations are distinct, and
-  selector matching follows that distinction. Floats are not supported
+Plain index syntax (`arr[0]`) is intentionally not supported — array
+positions shift when data changes, so index-based sync is destructive
+in the cases that matter most.
+
+## Format support
+
+Four backends. Each preserves the original file's formatting
+byte-for-byte on the fields it doesn't touch.
+
+- **TOML** (`format: toml`) — via `toml_edit`. Whitespace, key
+  order, comments preserved.
+- **JSON / JSONC** (`format: json` or `format: jsonc`, same backend)
+  — via `jsonc-parser`. Object key order, line/block comments,
+  trailing commas, blank lines, indentation all round-trip.
+- **gitconfig** (`format: gitconfig`) — via `gix-config` (gitoxide).
+  `~/.gitconfig` / per-repo `.git/config`. Subsection quoting
+  (`[remote "origin"]`), tab/space indentation, `#` / `;` comments
+  all survive.
+- **env** (`format: env`) — `.env` / `.envrc`-style flat
+  `KEY=value`. Hand-rolled line-based CST: comments, blank lines,
+  `export` prefix, all three quote styles (bare / `"..."` /
+  `'...'`) preserved.
+
+Format is inferred from the source / target extension when
+`--format` is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig`
+/ `.env` / `.envrc`; also the bare dotfile names `.env` and
+`.envrc`).
+
+<details>
+<summary><b>TOML & JSON specifics</b></summary>
+
+- **Null vs missing (JSON).** `{"key": null}` is a present field
+  with the value `null`; an absent key is "missing". `pull` /
+  `push` / `sync` treat them as different values — an explicit
+  `null` propagates instead of being dropped.
+- **Int vs float in selectors (JSON).** `[k=8080]` matches
+  `"k": 8080` only — not `"k": 8080.0`. Floats are not supported
   as selector values at all.
-- **JSONC support.** Line (`// …`) and block (`/* … */`) comments,
-  trailing commas inside arrays and objects, and blank lines round-trip
-  through sync. Comments stay attached to the source / target side they
-  originally lived on — sync moves *values*, not the surrounding trivia.
-- **Indent and trailing-comma style** are inferred from existing
-  structure when new entries are added — a 4-space / tab-indented file
-  keeps its style, a file using trailing commas keeps using them.
-- **What's not preserved.** String escape sequences in *replaced* string
-  values are re-emitted in canonical form (e.g. `"A"` becomes `"A"`).
-  JSON5-only syntax (single-quoted strings, unquoted keys, hex / Infinity
-  / NaN literals) is rejected by the parser.
+- **JSONC trivia.** Line (`// …`) and block (`/* … */`)
+  comments, trailing commas inside arrays / objects, and blank
+  lines round-trip through sync. Comments stay attached to the
+  side they originally lived on — sync moves *values*, not the
+  surrounding trivia.
+- **JSON indent style** is inferred from existing structure when
+  new entries are added — a 4-space / tab-indented file keeps
+  its style; a file using trailing commas keeps using them.
+- **JSON string escapes** in *replaced* values are re-emitted in
+  canonical form. JSON5-only syntax (single-quoted strings,
+  unquoted keys, hex / Infinity / NaN literals) is rejected by
+  the parser.
+- **TOML inline tables** are read-only for arrays-of-objects
+  selectors (`inline = [{...}]`); writes go into `[[arrays]]`
+  form.
 
-### gitconfig specifics
+</details>
+
+<details>
+<summary><b>gitconfig specifics</b></summary>
 
 - **Path arity.** Two segments address `section.key`
-  (`user.email`, `core.editor`); three address
-  `section.subsection.key` (`remote.origin.url`,
-  `branch."feature.x".remote`). Single-segment and 4+ segment paths
-  are rejected — gitconfig has no top-level keys outside a section
-  and no nested values under a key.
-- **Subsections with special characters.** Use the existing
-  quoted-segment syntax: `includeIf."gitdir:~/work/".path`. Quoting
-  is required when the subsection contains `.` `[` `]` `"` or
-  whitespace.
+  (`user.email`); three address `section.subsection.key`
+  (`remote.origin.url`, `branch."feature.x".remote`).
+  Single-segment and 4+ segment paths are rejected.
+- **Subsections with special characters** use the existing
+  quoted-segment syntax: `includeIf."gitdir:~/work/".path`.
 - **Case-sensitive matching (diverges from git).** git itself
   treats section / subsection / key names case-insensitively, but
-  dot-sync's path syntax is case-sensitive across all backends, and
-  forcing gitconfig into the same model catches typos in
-  `.sync.yaml`. If the path's section / subsection / key bytes
-  don't exactly match what's in the file, `get` returns absent and
-  `set` bails with a `case-mismatches existing section` error
-  pointing at the offender. Use the case from your file (the `add`
-  picker emits canonical case automatically).
-- **No array selectors.** gitconfig has no arrays of objects, so
-  `arr[name="x"]` / `arr[name]` are rejected. The closest construct
-  — multivar (multiple `remote.origin.fetch =` lines under one
-  section) — is treated as data corruption for surgical sync. Any
-  attempt to sync a path that resolves to a multivar key bails with
-  a clear error; the interactive `add` picker hides multivar keys
-  outright.
-- **Boolean polysemy.** git accepts `true` / `yes` / `on` / `1` as
-  the same logical value, but dot-sync compares string contents
-  byte-for-byte. Whatever literal is in the source file is what
-  gets written to the target. If the two sides write the same
-  boolean differently (`true` vs `yes`), they won't compare equal
-  and dot-sync will treat them as a conflict.
-- **Section name validation.** Section / key names must match
-  git's grammar (alphanumeric + dash, leading alphabetic for keys);
-  `gix-config` rejects e.g. `new_section` (underscore) at write
-  time.
-- **Mixed indentation, end-of-line comments.** Tab-indented and
-  space-indented sections coexist and round-trip byte-identically.
-  Trailing `;` and `#` comments on a value line are preserved on
-  read (`get` returns the value alone) and on write (the comment
-  stays put after a `set`).
-- **Backslash-continued multi-line values are rejected.** git
-  allows ending a value line with `\` to continue on the next, but
-  `gix-config` 0.56 parses these incorrectly and would mangle the
-  file on the first write. dot-sync detects the marker bytes at
-  load time and refuses the file rather than silently corrupt it
-  — inline the value or remove the continuation. This guard
-  drops out once gitoxide ships a fix.
-- **Cosmetic quirk on insert.** When a new key lands inside an
-  existing section, `gix-config` places the line at the very end of
-  the section's body — after any trailing blank line. The data is
-  semantically correct (the key still belongs to that section), but
-  the resulting file looks slightly strange:
+  dot-sync's path syntax is case-sensitive across all backends.
+  If the path's bytes don't exactly match what's in the file,
+  `get` returns absent and `set` bails with a clear error. Use
+  the case from your file — the `add` picker emits canonical
+  case automatically.
+- **No array selectors.** gitconfig has no arrays of objects.
+  The closest construct, multivar (multiple `remote.origin.fetch
+  =` lines), is treated as data corruption for surgical sync and
+  bails. The picker hides multivar keys.
+- **Boolean polysemy.** git accepts `true` / `yes` / `on` / `1`
+  as the same value; dot-sync compares bytes literally. If two
+  sides write the same boolean differently, dot-sync treats it as
+  a conflict.
+- **Section / key name validation.** Names must match git's
+  grammar (alphanumeric + dash, leading alphabetic for keys);
+  `gix-config` rejects underscores etc. at write time.
+- **Mixed indentation + end-of-line comments.** Tab-indented and
+  space-indented sections round-trip byte-identically. Trailing
+  `;` / `#` comments are preserved.
+- **Backslash-continued multi-line values are rejected at load**
+  (`gix-config` 0.56 mangles them). Inline the value or remove
+  the continuation. Drops out once gitoxide ships a fix.
+- **Cosmetic insert quirk.** When a new key lands inside an
+  existing section, `gix-config` places it after any trailing
+  blank line. Data is correct, layout looks slightly off — move
+  the line up by hand if it bothers you.
 
-  ```
-  [alias]
-  \tco = checkout
+</details>
 
-  \tst = status        # new line — note the blank above
-  [remote "origin"]
-  ```
+<details>
+<summary><b>env specifics</b></summary>
 
-  Manually moving the new line up past the blank is fine; the file
-  parses identically.
-
-### env specifics
-
-- **Flat namespace.** env is a single-level key-value list, so
-  paths are exactly one segment (`NODE_VERSION`, `DATABASE_URL`).
-  Multi-segment paths and array selectors (`arr[name="x"]`) are
-  rejected — there's nothing to descend into.
+- **Flat namespace.** Paths are exactly one segment
+  (`NODE_VERSION`). Multi-segment and array selectors are
+  rejected.
 - **POSIX key names only.** Keys must match
-  `[A-Za-z_][A-Za-z0-9_]*`. Hyphenated keys (`bad-key`) accepted
-  by some loader dialects are rejected so syncs stay portable.
-- **Case-sensitive.** `PATH` and `path` are different keys
-  (consistent with POSIX, and with dot-sync's other backends).
-- **Quote styles.** Bare (`KEY=value`), double-quoted
-  (`KEY="value"`), and single-quoted (`KEY='value'`) are all
+  `[A-Za-z_][A-Za-z0-9_]*`. Hyphens accepted by some dotenv
+  dialects are rejected so syncs stay portable.
+- **Case-sensitive.** `PATH` and `path` are different keys.
+- **Quote styles.** Bare, double, and single quoting are all
   read on load and preserved on round-trip. Updates keep the
-  user's original quote style by default — bare upgrades to
-  double only when the new value would no longer round-trip
-  unquoted (leading/trailing whitespace, trailing `\`, leading
-  `"` or `'`); single upgrades to double when the new value
-  contains a literal `'` (POSIX single quotes have no escapes).
-- **`export` prefix preserved.** A line written as
-  `export DATABASE_URL=...` keeps the `export` after sync.
-  New entries dot-sync appends never get the `export` prefix —
-  it's a style choice the tool doesn't try to guess.
-- **Last-wins on duplicate keys.** A key defined multiple times
-  resolves to its last value (matching bash `export`
-  semantics). `set` updates the last occurrence and leaves the
-  earlier shadowed entries alone so the file's history of
-  redefinitions stays readable.
-- **What's not supported (rejected at load):**
-  - Backslash-continued multi-line values (`KEY=line1\` …).
-  - Unclosed quotes.
-  - Trailing content after a closing quote.
-  - Shell expressions: `if/then`, function definitions, `[[
-    ... ]]`, command substitution `$(...)`, etc. `.envrc` files
-    that use these constructs aren't supported — only the
-    `[export ]KEY=value` subset.
-  - Trailing `# comment` on the same line as a value (the `#`
-    becomes part of the value, matching bash on unquoted
-    values). Use a separate `# ...` line above instead.
-- **No `\n` / `\t` interpolation.** Inside double quotes, only
-  `\"` and `\\` are interpreted as escapes. `\n` is two literal
-  characters. Values containing real newlines are not
-  supported in v1 (would need multi-line, which is rejected
-  above).
-- **Variable interpolation is literal.** `KEY=${OTHER}` syncs
-  the literal seven characters `${OTHER}`; dot-sync does not
-  expand it. Same for `$VAR`. If your value depends on another
-  variable, dot-sync syncs the *reference*, not the resolved
-  result.
+  user's original style by default — bare upgrades to double
+  when the new value won't round-trip unquoted (leading /
+  trailing whitespace, trailing `\`, leading `"` / `'`); single
+  upgrades to double when the new value contains a literal `'`.
+- **`export` prefix preserved** on update; new entries
+  dot-sync appends never get `export` (style choice the tool
+  doesn't try to guess).
+- **Last-wins on duplicate keys** (matches bash `export`).
+  `set` updates the last occurrence; earlier shadowed entries
+  are left alone.
+- **Rejected at load:** backslash continuation, unclosed
+  quotes, trailing content after a closing quote, shell
+  expressions at line level (`if/then`, function defs,
+  `[[...]]`), and trailing `# comment` after a value (the `#`
+  is taken as part of the value, matching bash on unquoted
+  values).
+- **No `\n` / `\t` interpolation.** Inside `"..."`, only `\"`
+  and `\\` are interpreted as escapes. Real newlines in values
+  aren't supported in v1.
+- **`${VAR}` / `$(cmd)` are literal.** dot-sync syncs the
+  reference, not the resolved result.
+
+</details>
 
 ## Commands
 
 ```sh
-dot-sync pull codex
-dot-sync push codex
-dot-sync sync codex
+dot-sync pull <name>                # target → source (target-wins)
+dot-sync push <name>                # source → target (source-wins)
+dot-sync sync <name>                # both directions
+
+dot-sync status [name]              # show config + file health
+dot-sync restore <name>             # roll back from a recovery snapshot
+dot-sync add <name>                 # register a new target / append fields
 ```
 
-The target name is optional. If omitted, `dot-sync` operates on all configured
+`<name>` is the target name from `.sync.yaml`. Omit it on
+`pull` / `push` / `sync` / `status` to operate on all configured
 targets.
-
-```sh
-dot-sync pull
-dot-sync push
-dot-sync sync
-```
 
 ### Adding a target
 
-`dot-sync add <name>` creates a new target in `.sync.yaml` (bootstrapping
-the file if missing) or appends fields to an existing one.
-
-Non-interactive — full flag-driven, scriptable:
+`dot-sync add <name>` creates the target (and bootstraps `.sync.yaml`
+if missing) or appends fields to an existing one.
 
 ```sh
+# Non-interactive — fully flag-driven
 dot-sync add codex \
   --format toml \
   --source codex.sync.toml \
   --target ~/.codex/config.toml \
   --field tui.theme --field max_bytes
-```
 
-Format is inferred from the source / target extension when `--format`
-is omitted (`.toml` / `.json` / `.jsonc` / `.gitconfig` / `.env` /
-`.envrc`; also the bare dotfile names `.env` and `.envrc`). Append fields to an existing
-target with just `--field`:
-
-```sh
+# Append fields to an existing target — only --field needed
 dot-sync add codex --field tui.notification_condition
-```
 
-Interactive — drop the `--field` flags on a TTY and an interactive
-tree picker discovers fields from the source / target document:
-
-```sh
+# Interactive — omit --field on a TTY; a tree picker discovers
+# fields from the source / target document
 dot-sync add claude --source claude.sync.json --target ~/.claude/settings.json
-# Tree picker opens.
 ```
 
-Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space` toggle,
-`enter` confirm, `q` / `Esc` cancel. On containers, `space` cycles
-through `[ ]` (empty) → `[x]` (sync the whole subtree as one path) →
-`[*]` (sync each leaf individually) → `[ ]`. Manually toggling some
-leaves under a container shows `[~]` (mixed); pressing space on `[~]`
-resets the container.
+Picker controls: `↑`/`↓` move, `←`/`→` collapse / expand, `space`
+toggle, `enter` confirm, `q` / `Esc` cancel. On containers, `space`
+cycles `[ ]` (empty) → `[x]` (sync the whole subtree as one path)
+→ `[*]` (sync each leaf individually) → `[ ]`. Manually toggling
+some leaves under a container shows `[~]` (mixed); pressing space
+on `[~]` resets the container.
 
-Pass `--dry-run` to preview the YAML write without modifying
-`.sync.yaml`. Note: editing `.sync.yaml` via `add` re-serializes the
-file via `serde_yaml_ng` and does not preserve user comments inside
-the YAML itself.
+`add --dry-run` previews the YAML write without modifying
+`.sync.yaml`. Note: writing `.sync.yaml` via `add` re-serializes the
+file and does not preserve user comments inside the YAML itself.
 
-All commands support `--dry-run` to show planned changes without writing either
-file. Pass `--backup` to also keep a persistent timestamped copy
-(`<file>.bak.<timestamp>`) next to the destination.
+## Backup and recovery
 
-Every real write is atomic (write to a hidden tmp next to the destination, then
-`rename`). Before each overwrite, the previous contents are copied to
+Every real write is atomic (write to a hidden tmp next to the
+destination, then `rename`). Before each overwrite, the previous
+contents are copied to
 `$TMPDIR/dot-sync/<sanitized-path>.<timestamp>` so you can recover
-in-the-moment without cluttering the working directory. The path is printed
-under each `wrote` line; the OS reclaims the snapshots over time.
+in the moment without cluttering the working directory. The path is
+printed under each `wrote` line; the OS reclaims the snapshots over
+time.
 
 ```sh
-dot-sync pull codex --dry-run
-dot-sync push codex --backup
-dot-sync sync --dry-run
+dot-sync pull codex --dry-run       # preview, no writes
+dot-sync push codex --backup        # also keep a persistent .bak.<timestamp>
 ```
 
-`sync` accepts mutually exclusive conflict-mode flags (default: `--target-wins`):
+`--dry-run` works on `pull` / `push` / `sync` / `add` / `restore`
+and shows the planned changes without writing either file.
 
-```sh
-dot-sync sync codex --target-wins        # (default) target value wins on conflict
-dot-sync sync codex --source-wins        # source value wins on conflict
-dot-sync sync codex --fail-on-conflict   # exit non-zero, write nothing, list conflicts
-```
+`--backup` (on `pull` / `push` / `sync`) writes a persistent
+timestamped copy `<file>.bak.<timestamp>` next to the destination,
+in addition to the auto recovery snapshot.
 
-`pull` is always target-wins by definition; `push` is always source-wins.
-
-### Shell completions and man page
-
-The fastest path is the installer flag — it detects your shell and
-writes completion files to the standard user-owned directories:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --with-completions
-```
-
-That installs `dot-sync` plus completions for `bash` / `zsh` / `fish`
-and a man page at `~/.local/share/man/man1/dot-sync.1`. The installer
-prints any rc-file edits you still need to make (mostly just `zsh`).
-
-If you'd rather wire it up by hand, both come from hidden
-subcommands:
-
-```sh
-dot-sync completions bash       > ~/.local/share/bash-completion/completions/dot-sync
-dot-sync completions zsh        > ~/.zfunc/_dot-sync
-dot-sync completions fish       > ~/.config/fish/completions/dot-sync.fish
-dot-sync completions powershell > $PROFILE.dot-sync.ps1
-dot-sync man                    > ~/.local/share/man/man1/dot-sync.1
-```
-
-## Recovering from a bad write
-
-Every real write captures the previous contents into
-`$TMPDIR/dot-sync/<sanitized>.<timestamp>` and prints the path next to the
-write. Use `restore` to roll back from there or from any persistent
-`<file>.bak.<timestamp>` that `--backup` produced earlier — both pools are
-listed together, sorted newest first.
+### Restoring from a snapshot
 
 ```sh
 dot-sync restore codex --list           # show numbered candidates (recovery + backup)
@@ -437,34 +361,54 @@ dot-sync restore codex --source         # restore source instead of target
 dot-sync restore codex --dry-run        # show what would happen
 ```
 
-The restore itself is atomic and takes a fresh recovery snapshot of the
-file before overwriting, so an unwanted restore is itself recoverable.
-When timestamps tie, persistent `[backup]` entries are preferred over
-`[recovery]` (they are an explicit user signal).
+`restore` is itself atomic and takes a fresh recovery snapshot of
+the file before overwriting, so an unwanted restore is itself
+recoverable. When timestamps tie, persistent `[backup]` entries are
+preferred over `[recovery]` (they are an explicit user signal).
 
-All three commands share a single rule: **only fields listed in `sync` are
-touched, and nothing is ever removed**. Fields outside `sync` are preserved on
-both sides. `pull` and `push` are mirror images; `sync` is exactly their union.
+## Shell completions and man page
 
-| State of a listed field            | `pull` (target → source) | `push` (source → target) | `sync` (both ways, default `--target-wins`) |
-| ---------------------------------- | ------------------------ | ------------------------ | ------------------------- |
-| Both sides equal                   | skip                     | skip                     | skip                      |
-| Both sides differ                  | source := target         | target := source         | source := target (mode-dependent) |
-| Only target has it                 | source := target (add)   | skip                     | source := target (add)    |
-| Only source has it                 | skip                     | target := source (add)   | target := source (add)    |
-| Neither has it                     | skip                     | skip                     | skip                      |
-| Field not in `sync:` list          | untouched                | untouched                | untouched                 |
+Easiest path — re-run the installer with `--with-completions`:
 
-Under `--source-wins`, "Both sides differ" flips to `target := source`. Under
-`--fail-on-conflict`, the same row aborts with a non-zero exit and no writes.
-Other rows are unaffected by mode — "missing on one side" always fills, never
-fails.
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --with-completions
+```
 
-To stop syncing a field, remove it from `sync:` in `.sync.yaml`. The tool
-will not delete it from either file — clean up by hand if you want it gone.
+Detects `$SHELL`, writes completion files to the standard
+user-owned directory (`~/.local/share/bash-completion/completions/`,
+`~/.zfunc/`, `~/.config/fish/completions/`), and writes a man page
+to `~/.local/share/man/man1/dot-sync.1`. Prints any rc-file edits
+you still need to make (mostly just `zsh`).
 
-The direction names mirror deployment-style workflows: `pull` brings the
-current target state back into the managed source, and `push` applies the
-managed source to the target environment. `sync` is convenient when you do
-not care which side is more up to date and just want both files to agree on
-the listed fields.
+By hand:
+
+```sh
+dot-sync completions bash       > ~/.local/share/bash-completion/completions/dot-sync
+dot-sync completions zsh        > ~/.zfunc/_dot-sync
+dot-sync completions fish       > ~/.config/fish/completions/dot-sync.fish
+dot-sync completions powershell > $PROFILE.dot-sync.ps1
+dot-sync man                    > ~/.local/share/man/man1/dot-sync.1
+```
+
+## Install options
+
+Nightly prerelease:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --nightly
+```
+
+Pinned version or alternate install directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/muhac/dot-sync/main/install.sh | sh -s -- --dir ~/.local/bin
+```
+
+The installer always writes `dot-sync` to the install directory. It
+writes the shorter `ds` alias only when that path is empty or
+already points at an existing `dot-sync` install — it will not
+overwrite an unrelated `ds` command.
+
+Use `dot-sync` in scripts and docs; `ds` is the interactive
+shortcut.
