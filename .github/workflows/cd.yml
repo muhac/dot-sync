@@ -124,13 +124,15 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
             release_title="${GITHUB_REF_NAME}"
-            release_notes="Release ${GITHUB_REF_NAME}"
             if gh release view "${release_tag}" >/dev/null 2>&1; then
               gh release upload "${release_tag}" dist/* --clobber
             else
+              # --generate-notes auto-builds the body from PRs / commits
+              # since the previous release tag (or from repo creation
+              # for the first stable release).
               gh release create "${release_tag}" dist/* \
                 --title "${release_title}" \
-                --notes "${release_notes}"
+                --generate-notes
             fi
             exit 0
           fi
