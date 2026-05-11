@@ -124,13 +124,43 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
             release_title="${GITHUB_REF_NAME}"
-            release_notes="Release ${GITHUB_REF_NAME}"
+            notes_file=".github/release-notes/${release_tag}.md"
+
             if gh release view "${release_tag}" >/dev/null 2>&1; then
               gh release upload "${release_tag}" dist/* --clobber
-            else
+              exit 0
+            fi
+
+            # A curated notes file under .github/release-notes/<tag>.md
+            # takes precedence — used for the first stable release and
+            # any time the auto-generated changelog isn't quite right.
+            if [[ -f "${notes_file}" ]]; then
               gh release create "${release_tag}" dist/* \
                 --title "${release_title}" \
-                --notes "${release_notes}"
+                --notes-file "${notes_file}"
+              exit 0
+            fi
+
+            # Otherwise auto-generate from the diff against the previous
+            # stable tag. We must pass --notes-start-tag explicitly
+            # because the `nightly` prerelease tag rolls forward to
+            # every main commit; without a pin, gh's auto-detection
+            # would diff against nightly (typically the same commit as
+            # this stable tag) and produce empty notes.
+            previous_stable=$(git tag --list 'v*' --sort=-version:refname \
+              | grep -v "^${release_tag}\$" \
+              | head -n 1)
+            if [[ -n "${previous_stable}" ]]; then
+              gh release create "${release_tag}" dist/* \
+                --title "${release_title}" \
+                --generate-notes --notes-start-tag "${previous_stable}"
+            else
+              # No previous stable tag at all — would diff against
+              # nightly. Fall back to a stub body; commit a curated
+              # `.github/release-notes/<tag>.md` to override.
+              gh release create "${release_tag}" dist/* \
+                --title "${release_title}" \
+                --notes "Release ${release_tag}. See the project README for usage."
             fi
             exit 0
           fi
