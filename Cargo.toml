@@ -17,7 +17,7 @@ bstr = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 dirs = "6"
 gix-config = "0.56"
 # Direct dep on gix-hash with `sha1` so the empty-`Kind` enum in
