@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
 dirs = "6"
-gix-config = "0.56"
+gix-config = "0.57"
 # Direct dep on gix-hash with `sha1` so the empty-`Kind` enum in
 # gix-hash 0.25.0 (gated behind sha1/sha256 features) gets a variant
 # under rustc ≥ 1.94's stricter exhaustivity check. gix-config does
