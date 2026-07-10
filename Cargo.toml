@@ -25,7 +25,7 @@ gix-config = "0.58"
 # under rustc ≥ 1.94's stricter exhaustivity check. gix-config does
 # not enable these features through its own feature graph.
 gix-hash = { version = "0.25", features = ["sha1"] }
-jsonc-parser = { version = "0.32.4", features = ["cst", "serde_json", "preserve_order"] }
+jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json", "preserve_order"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
