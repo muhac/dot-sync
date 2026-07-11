@@ -1217,10 +1217,8 @@ fn json_shared_scalar_leaf_keys(items: &[CstObject], id_key: &str) -> Vec<String
                 let name_node = prop.name()?;
                 let k = if let Some(sl) = name_node.as_string_lit() {
                     sl.decoded_value().ok()?
-                } else if let Some(wl) = name_node.as_word_lit() {
-                    wl.to_string()
                 } else {
-                    return None;
+                    name_node.as_word_lit()?.to_string()
                 };
                 if k == id_key {
                     return None;
