@@ -191,9 +191,18 @@ byte-for-byte on the fields it doesn't touch.
   new entries are added — a 4-space / tab-indented file keeps
   its style; a file using trailing commas keeps using them.
 - **JSON string escapes** in *replaced* values are re-emitted in
-  canonical form. JSON5-only syntax (single-quoted strings,
-  unquoted keys, hex / Infinity / NaN literals) is rejected by
-  the parser.
+  canonical form.
+- **Lenient JSON5-style input.** JSON / JSONC files are read with
+  `jsonc-parser`'s default (lenient) options, so some JSON5 syntax
+  loads instead of erroring: single-quoted strings, unquoted keys,
+  missing commas, hex (`0xFF`), unary-plus (`+5`) and bare-decimal
+  (`.5`, `5.`) numbers, `\x41`-style string escapes, and
+  `Infinity` / `NaN` literals. Untouched text is preserved
+  byte-for-byte. Values are moved as plain JSON: `Infinity` /
+  `-Infinity` / `NaN` become the *strings* `"Infinity"` /
+  `"-Infinity"` / `"NaN"` (not numbers), so avoid them in synced
+  fields. Output written for replaced values is always standard
+  JSON.
 - **TOML inline tables** are read-only for arrays-of-objects
   selectors (`inline = [{...}]`); writes go into `[[arrays]]`
   form.

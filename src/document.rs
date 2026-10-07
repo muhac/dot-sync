@@ -930,8 +930,11 @@ fn set_in_inline_descend(table: &mut InlineTable, segments: &[Segment], item: It
 // What's not:
 // - Original string-escape sequences when a string value is *replaced*
 //   (jsonc-parser re-emits canonical escapes for the new value)
-// - JSON5 forms beyond JSONC (single-quoted strings, unquoted keys,
-//   hex / Infinity / NaN literals, etc.)
+//
+// Input leniency: `ParseOptions::default()` also accepts JSON5 forms
+// (single-quoted strings, unquoted keys, hex / unary-plus / bare-decimal
+// numbers, `\x` escapes, Infinity / NaN). `Infinity` / `NaN` surface
+// through `to_serde_value()` as strings, not numbers.
 //
 // Limitations explicitly accepted in v1:
 // - Floats are not supported as selector values; `[k=1.5]` is rejected
