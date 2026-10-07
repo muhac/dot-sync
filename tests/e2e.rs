@@ -2040,8 +2040,8 @@ fn completions_bash_emits_non_empty_script() {
         .args(["completions", "bash"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("_dot-sync()"))
-        .stdout(predicate::str::contains("complete -F _dot-sync"));
+        .stdout(predicate::str::contains("_dot__sync()"))
+        .stdout(predicate::str::contains("complete -F _dot__sync"));
 }
 
 #[test]
