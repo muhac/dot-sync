@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
-dirs = "6"
+dirs = "7"
 gix-config = "0.58"
 # Direct dep on gix-hash with `sha1` so the empty-`Kind` enum in
 # gix-hash 0.25.0 (gated behind sha1/sha256 features) gets a variant
