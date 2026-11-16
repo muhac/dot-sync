@@ -415,8 +415,9 @@ mod tests {
     #[test]
     fn fresh_state_has_no_selection_and_top_level_expanded() {
         let s = fixture();
-        for i in 0..s.nodes.len() {
-            assert!(!s.selected[i]);
+        assert_eq!(s.selected.len(), s.nodes.len());
+        for &selected in &s.selected {
+            assert!(!selected);
         }
         // Top-level containers expanded; deeper containers collapsed.
         let tui = idx_of(&s, "tui");
